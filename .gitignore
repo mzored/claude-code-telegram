@@ -147,3 +147,24 @@ sessions/
 backups/
 uploads/
 config/mcp.json
+# Secrets / local overrides (belt and braces — never commit real credentials)
+.env.*
+!.env.example
+.envrc
+.direnv/
+secrets.*
+credentials.json
+service-account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+.netrc
+id_rsa*
+id_ed25519*
+*.sqlite
+*.sqlite3
+*.bak
+*.orig
+.claude/settings.local.json
