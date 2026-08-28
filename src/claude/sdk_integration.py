@@ -322,6 +322,7 @@ class ClaudeSDKManager:
             options = ClaudeAgentOptions(
                 max_turns=self.config.claude_max_turns,
                 model=self.config.claude_model or None,
+                effort=self.config.claude_effort or None,
                 max_budget_usd=self.config.claude_max_cost_per_request,
                 cwd=str(working_directory),
                 allowed_tools=sdk_allowed_tools,
