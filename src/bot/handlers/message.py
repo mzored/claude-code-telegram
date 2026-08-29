@@ -279,6 +279,14 @@ def _format_error_message(error: Exception | str) -> str:
 
 def _format_process_error(error_str: str) -> str:
     """Format a Claude process/SDK error with the actual details."""
+    if "control request timeout" in error_str.lower():
+        # CLI did not finish starting up in time; retries are already exhausted.
+        return (
+            "❌ <b>Claude took too long to start</b>\n\n"
+            "Try again — it usually works on the second attempt.\n"
+            "If it keeps happening, use /new for a fresh session."
+        )
+
     safe_error = escape_html(error_str)
     if len(safe_error) > 500:
         safe_error = safe_error[:500] + "..."
