@@ -265,14 +265,26 @@ class ClaudeSDKManager:
         else:
             logger.info("No API key provided, using existing Claude CLI authentication")
 
+        # The SDK waits this long (ms) for the CLI subprocess to answer the
+        # `initialize` control request; its default of 60s is tight for a cold
+        # start with plugins behind a proxy.
+        os.environ.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "120000")
+
     def _is_retryable_error(self, exc: BaseException) -> bool:
         """Return True for transient errors that warrant a retry.
         asyncio.TimeoutError is intentional (user-configured timeout) — not retried.
-        Only non-MCP CLIConnectionError is considered transient.
+        Transient: non-MCP CLIConnectionError, and control-protocol timeouts during
+        CLI startup.
         """
         if isinstance(exc, CLIConnectionError):
             msg = str(exc).lower()
             return "mcp" not in msg  # "server" alone is too broad
+        # The SDK raises a bare Exception when the CLI subprocess does not answer a
+        # control request in time (claude_agent_sdk/_internal/query.py: "Control
+        # request timeout: initialize"). There is no dedicated exception type, so
+        # the message is the only signal. A slow cold start is transient.
+        if "control request timeout" in str(exc).lower():
+            return True
         return False
 
     async def execute_command(
@@ -502,13 +514,16 @@ class ClaudeSDKManager:
                     except asyncio.CancelledError:
                         pass
                     raise  # timeout — don't retry
-                except CLIConnectionError as exc:
+                except Exception as exc:
+                    # Single place where the retry policy is applied, so that
+                    # untyped SDK errors cannot bypass it.
                     if self._is_retryable_error(exc) and attempt < max_attempts - 1:
                         last_exc = exc
                         logger.warning(
-                            "Transient connection error, will retry",
+                            "Transient error, will retry",
                             attempt=attempt + 1,
                             error=str(exc),
+                            error_type=type(exc).__name__,
                         )
                         continue
                     raise  # non-retryable or attempts exhausted
