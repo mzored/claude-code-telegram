@@ -15,6 +15,20 @@ from .session import SessionManager
 
 logger = structlog.get_logger()
 
+# Sent back into the same session when a run stops at the turn/budget limit
+# before writing an answer.
+CONTINUE_PROMPT = (
+    "You stopped at the turn limit without answering. Continue from where you "
+    "left off and give the final answer to the original request. "
+    "Do not start over."
+)
+
+# Shown when even the continuation produced nothing.
+LIMIT_REACHED_MSG = (
+    "⚠️ Hit the turn limit ({num_turns}) before producing an answer. "
+    'Say "continue" and I will finish the job.'
+)
+
 
 class ClaudeIntegration:
     """Main integration point for Claude Code."""
@@ -120,6 +134,33 @@ class ClaudeIntegration:
                 else:
                     raise
 
+            # A run that stopped at the turn/budget limit without an answer is
+            # not a finished task.  Resume the same session once so the user
+            # gets a real reply instead of silence.
+            auto_continued = False
+            if (
+                self.config.claude_auto_continue_on_max_turns
+                and response.stopped_at_limit
+                and not response.content.strip()
+                and not response.interrupted
+                and (interrupt_event is None or not interrupt_event.is_set())
+            ):
+                auto_continued = True
+                logger.warning(
+                    "Run stopped at limit without an answer, auto-continuing",
+                    subtype=response.subtype,
+                    num_turns=response.num_turns,
+                    session_id=response.session_id,
+                    user_id=user_id,
+                )
+                await self._notify_stream(on_stream, "Hit the turn limit, continuing…")
+                response = await self._continue_after_limit(
+                    first=response,
+                    working_directory=working_directory,
+                    stream_callback=on_stream,
+                    interrupt_event=interrupt_event,
+                )
+
             # Update session (assigns real session_id for new sessions)
             await self.session_manager.update_session(session, response)
 
@@ -139,6 +180,10 @@ class ClaudeIntegration:
                 duration_ms=response.duration_ms,
                 num_turns=response.num_turns,
                 is_error=response.is_error,
+                subtype=response.subtype,
+                stopped_at_limit=response.stopped_at_limit,
+                content_length=len(response.content),
+                auto_continued=auto_continued,
             )
 
             return response
@@ -151,6 +196,66 @@ class ClaudeIntegration:
                 session_id=session.session_id,
             )
             raise
+
+    async def _notify_stream(
+        self,
+        on_stream: Optional[Callable[[StreamUpdate], Any]],
+        text: str,
+    ) -> None:
+        """Show a progress note to the user without failing the run."""
+        if on_stream is None:
+            return
+        try:
+            result = on_stream(StreamUpdate(type="assistant", content=text))
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as e:  # progress is best-effort
+            logger.debug("Progress notification failed", error=str(e))
+
+    async def _continue_after_limit(
+        self,
+        first: ClaudeResponse,
+        working_directory: Path,
+        stream_callback: Optional[Callable] = None,
+        interrupt_event: Optional[asyncio.Event] = None,
+    ) -> ClaudeResponse:
+        """Resume a run that stopped at a limit, once, and merge the results.
+
+        Never recurses: the merged response is returned as-is, whatever the
+        second attempt produced.
+        """
+        try:
+            second = await self._execute(
+                prompt=CONTINUE_PROMPT,
+                working_directory=working_directory,
+                session_id=first.session_id or None,
+                continue_session=bool(first.session_id),
+                stream_callback=stream_callback,
+                interrupt_event=interrupt_event,
+            )
+        except Exception as e:
+            logger.warning(
+                "Auto-continue after limit failed",
+                error=str(e),
+                session_id=first.session_id,
+            )
+            first.content = LIMIT_REACHED_MSG.format(num_turns=first.num_turns)
+            return first
+
+        merged_content = "\n\n".join(
+            part for part in (first.content.strip(), second.content.strip()) if part
+        )
+        total_turns = first.num_turns + second.num_turns
+        if not merged_content:
+            merged_content = LIMIT_REACHED_MSG.format(num_turns=total_turns)
+
+        second.content = merged_content
+        second.cost = first.cost + second.cost
+        second.duration_ms = first.duration_ms + second.duration_ms
+        second.num_turns = total_turns
+        second.tools_used = first.tools_used + second.tools_used
+        second.session_id = second.session_id or first.session_id
+        return second
 
     async def _execute(
         self,

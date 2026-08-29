@@ -42,8 +42,13 @@ from .monitor import _is_claude_internal_path, check_bash_directory_boundary
 
 logger = structlog.get_logger()
 
-# Fallback message when Claude produces no text but did use tools.
-TASK_COMPLETED_MSG = "✅ Task completed. Tools used: {tools_summary}"
+# Shown when Claude finished without producing any text and without hitting a
+# limit.  A list of tool names is not an answer, so it goes to the log instead.
+NO_ANSWER_MSG = "⚠️ Claude finished without writing an answer."
+
+# ResultMessage.subtype prefixes that mean "stopped early because of a limit"
+# rather than "finished the task".
+LIMIT_SUBTYPE_PREFIXES = ("error_max_turns", "error_max_budget")
 
 
 @dataclass
@@ -59,6 +64,8 @@ class ClaudeResponse:
     error_type: Optional[str] = None
     tools_used: List[Dict[str, Any]] = field(default_factory=list)
     interrupted: bool = False
+    subtype: Optional[str] = None
+    stopped_at_limit: bool = False
 
 
 @dataclass
@@ -517,11 +524,17 @@ class ClaudeSDKManager:
             tools_used: List[Dict[str, Any]] = []
             claude_session_id = None
             result_content = None
+            result_subtype: Optional[str] = None
+            result_is_error = False
+            result_num_turns: Optional[int] = None
             for message in messages:
                 if isinstance(message, ResultMessage):
                     cost = getattr(message, "total_cost_usd", 0.0) or 0.0
                     claude_session_id = getattr(message, "session_id", None)
                     result_content = getattr(message, "result", None)
+                    result_subtype = getattr(message, "subtype", None)
+                    result_is_error = bool(getattr(message, "is_error", False))
+                    result_num_turns = getattr(message, "num_turns", None)
                     current_time = asyncio.get_event_loop().time()
                     for msg in messages:
                         if isinstance(msg, AssistantMessage):
@@ -566,10 +579,12 @@ class ClaudeSDKManager:
                     previous_session_id=session_id,
                 )
 
-            # Use ResultMessage.result if available, fall back to message extraction
-            if result_content is not None:
-                content = str(result_content).strip()
-            else:
+            # Use ResultMessage.result when it actually carries text.  When the
+            # run stops early (turn/budget limit, execution error) the SDK
+            # returns an empty result, and the real answer — if any — is in the
+            # assistant messages, so always fall back to those.
+            content = str(result_content).strip() if result_content is not None else ""
+            if not content:
                 content_parts = []
                 for msg in messages:
                     if isinstance(msg, AssistantMessage):
@@ -582,30 +597,63 @@ class ClaudeSDKManager:
                             content_parts.append(str(msg_content))
                 content = "\n".join(content_parts).strip()
 
-            if not content and tools_used:
-                tool_names = [
-                    tool.get("name", "")
-                    for tool in tools_used
-                    if isinstance(tool.get("name"), str) and tool.get("name")
-                ]
-                unique_tool_names = list(dict.fromkeys(tool_names))
-                tools_summary = ", ".join(unique_tool_names) or "unknown"
-                content = TASK_COMPLETED_MSG.format(tools_summary=tools_summary)
+            stopped_at_limit = bool(
+                result_subtype and result_subtype.startswith(LIMIT_SUBTYPE_PREFIXES)
+            )
+
+            num_turns = (
+                result_num_turns
+                if isinstance(result_num_turns, int)
+                else len(
+                    [
+                        m
+                        for m in messages
+                        if isinstance(m, (UserMessage, AssistantMessage))
+                    ]
+                )
+            )
+
+            if not content:
+                logger.warning(
+                    "Claude returned no text content",
+                    subtype=result_subtype,
+                    is_error=result_is_error,
+                    stopped_at_limit=stopped_at_limit,
+                    num_turns=num_turns,
+                    message_count=len(messages),
+                    result_repr=repr(result_content)[:200],
+                    tools=list(
+                        dict.fromkeys(
+                            t.get("name", "") for t in tools_used if t.get("name")
+                        )
+                    ),
+                )
+                # When we stopped at a limit the facade decides what to do
+                # (auto-continue); otherwise say plainly that there is no answer.
+                if not stopped_at_limit:
+                    content = NO_ANSWER_MSG
+
+            logger.info(
+                "Claude SDK run finished",
+                subtype=result_subtype,
+                is_error=result_is_error,
+                stopped_at_limit=stopped_at_limit,
+                num_turns=num_turns,
+                message_count=len(messages),
+                content_length=len(content),
+            )
 
             return ClaudeResponse(
                 content=content,
                 session_id=final_session_id,
                 cost=cost,
                 duration_ms=duration_ms,
-                num_turns=len(
-                    [
-                        m
-                        for m in messages
-                        if isinstance(m, (UserMessage, AssistantMessage))
-                    ]
-                ),
+                num_turns=num_turns,
+                is_error=result_is_error,
                 tools_used=tools_used,
                 interrupted=interrupted,
+                subtype=result_subtype,
+                stopped_at_limit=stopped_at_limit,
             )
 
         except asyncio.TimeoutError:

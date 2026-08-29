@@ -17,6 +17,7 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import StreamEvent
 
 from src.claude.sdk_integration import (
+    NO_ANSWER_MSG,
     ClaudeResponse,
     ClaudeSDKManager,
     StreamUpdate,
@@ -213,6 +214,65 @@ class TestClaudeSDKManager:
             )
 
         assert response.content == "Extracted from messages"
+
+    async def test_execute_command_falls_back_on_empty_result(self, sdk_manager):
+        """An empty ResultMessage.result must not hide the assistant's text."""
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("Real answer"),
+            _make_result_message(
+                result="", subtype="error_max_turns", is_error=True, num_turns=40
+            ),
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            response = await sdk_manager.execute_command(
+                prompt="Test prompt",
+                working_directory=Path("/test"),
+            )
+
+        assert response.content == "Real answer"
+        assert response.stopped_at_limit is True
+        assert response.subtype == "error_max_turns"
+        assert response.is_error is True
+        assert response.num_turns == 40
+
+    async def test_execute_command_limit_without_text_leaves_content_empty(
+        self, sdk_manager
+    ):
+        """Stopping at the limit with no text defers the decision to the facade."""
+        mock_factory = _mock_client_factory(
+            _make_result_message(result="", subtype="error_max_turns", is_error=True),
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            response = await sdk_manager.execute_command(
+                prompt="Test prompt",
+                working_directory=Path("/test"),
+            )
+
+        assert response.content == ""
+        assert response.stopped_at_limit is True
+
+    async def test_execute_command_no_text_without_limit_says_so(self, sdk_manager):
+        """No text and no limit: say it plainly, never list tools as an answer."""
+        mock_factory = _mock_client_factory(
+            _make_result_message(result=None),
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            response = await sdk_manager.execute_command(
+                prompt="Test prompt",
+                working_directory=Path("/test"),
+            )
+
+        assert response.content == NO_ANSWER_MSG
+        assert response.stopped_at_limit is False
 
     async def test_execute_command_with_streaming(self, sdk_manager):
         """Test command execution with streaming callback."""

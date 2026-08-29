@@ -64,8 +64,13 @@ DISABLE_TOOL_VALIDATION=false
 # Authentication
 ANTHROPIC_API_KEY=sk-ant-api03-...    # Optional: API key for SDK (uses CLI auth if omitted)
 
-# Maximum conversation turns before requiring new session
-CLAUDE_MAX_TURNS=10
+# Maximum agent turns per request. Agentic work with MCP tools routinely
+# needs 20-40; too low a value stops the run before Claude writes an answer.
+CLAUDE_MAX_TURNS=40
+
+# When a run stops at the turn/budget limit without an answer, resume the same
+# session once to get one instead of returning nothing.
+CLAUDE_AUTO_CONTINUE_ON_MAX_TURNS=true
 
 # Timeout for Claude operations in seconds
 CLAUDE_TIMEOUT_SECONDS=300
