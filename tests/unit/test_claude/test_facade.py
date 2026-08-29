@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.claude.facade import ClaudeIntegration
+from src.claude.facade import LIMIT_REACHED_MSG, ClaudeIntegration
 from src.claude.session import ClaudeSession, SessionManager
 from src.config.settings import Settings
 
@@ -24,6 +24,9 @@ def _make_mock_response(session_id: str = "new-session-id") -> MagicMock:
     resp.tools_used = []
     resp.is_error = False
     resp.content = "ok"
+    resp.subtype = "success"
+    resp.stopped_at_limit = False
+    resp.interrupted = False
     return resp
 
 
@@ -294,3 +297,80 @@ class TestEmptySessionIdWarning:
 
         # Session ID should be empty on the response
         assert not result.session_id
+
+
+class TestAutoContinueAfterLimit:
+    """A run that stops at the turn limit without an answer is resumed once."""
+
+    @staticmethod
+    def _limited_response(session_id: str = "sess-1") -> MagicMock:
+        resp = _make_mock_response(session_id=session_id)
+        resp.content = ""
+        resp.subtype = "error_max_turns"
+        resp.stopped_at_limit = True
+        resp.num_turns = 40
+        return resp
+
+    async def test_continues_once_and_merges(self, facade):
+        """The second run happens in the same session and its text is used."""
+        project = Path("/test/project")
+
+        second = _make_mock_response(session_id="sess-1")
+        second.content = "The real answer"
+        second.num_turns = 5
+
+        with patch.object(
+            facade,
+            "_execute",
+            side_effect=[self._limited_response(), second],
+        ) as execute:
+            result = await facade.run_command(
+                prompt="hello",
+                working_directory=project,
+                user_id=321,
+            )
+
+        assert execute.call_count == 2
+        assert execute.call_args_list[1].kwargs["session_id"] == "sess-1"
+        assert execute.call_args_list[1].kwargs["continue_session"] is True
+        assert result.content == "The real answer"
+        assert result.num_turns == 45
+
+    async def test_reports_limit_when_continuation_is_also_empty(self, facade):
+        """No answer even after continuing: say so, never a list of tools."""
+        project = Path("/test/project")
+
+        second = _make_mock_response(session_id="sess-1")
+        second.content = ""
+        second.num_turns = 2
+
+        with patch.object(
+            facade,
+            "_execute",
+            side_effect=[self._limited_response(), second],
+        ):
+            result = await facade.run_command(
+                prompt="hello",
+                working_directory=project,
+                user_id=321,
+            )
+
+        assert result.content == LIMIT_REACHED_MSG.format(num_turns=42)
+
+    async def test_disabled_by_config(self, facade):
+        """With the setting off, no second run is made."""
+        facade.config.claude_auto_continue_on_max_turns = False
+        project = Path("/test/project")
+
+        with patch.object(
+            facade,
+            "_execute",
+            side_effect=[self._limited_response()],
+        ) as execute:
+            await facade.run_command(
+                prompt="hello",
+                working_directory=project,
+                user_id=321,
+            )
+
+        assert execute.call_count == 1

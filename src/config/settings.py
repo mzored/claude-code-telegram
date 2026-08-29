@@ -88,6 +88,13 @@ class Settings(BaseSettings):
     claude_max_turns: int = Field(
         DEFAULT_CLAUDE_MAX_TURNS, description="Max conversation turns"
     )
+    claude_auto_continue_on_max_turns: bool = Field(
+        True,
+        description=(
+            "When a run stops at the turn/budget limit without an answer, "
+            "resume the same session once to get one"
+        ),
+    )
     claude_timeout_seconds: int = Field(
         DEFAULT_CLAUDE_TIMEOUT_SECONDS, description="Claude timeout"
     )
