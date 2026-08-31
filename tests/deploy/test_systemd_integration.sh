@@ -59,13 +59,23 @@ systemd-analyze verify "${units[@]/#//etc/systemd/system/}"
 systemctl daemon-reload
 systemctl start assist-ai-bot.service
 
-properties=$(systemctl show assist-ai-bot.service \
-    --property=ActiveState,SubState,MainPID,NRestarts,FragmentPath,NeedDaemonReload)
+properties=
+for _ in {1..20}; do
+    properties=$(systemctl show assist-ai-bot.service \
+        --property=ActiveState,SubState,MainPID,NRestarts,FragmentPath,NeedDaemonReload)
+    main_pid=$(sed -n 's/^MainPID=//p' <<<"$properties")
+    if [[ $main_pid =~ ^[1-9][0-9]*$ ]] \
+        && [[ $(readlink -f "/proc/$main_pid/cwd") == "$test_home/.local/lib/assist-ai/releases/slot-a" ]] \
+        && tr '\0' '\n' <"/proc/$main_pid/cmdline" | grep -Fxq "$test_home/.local/lib/assist-ai/releases/slot-a/.venv/bin/python"; then
+        break
+    fi
+    sleep 0.5
+done
+
 grep -Fxq 'ActiveState=active' <<<"$properties"
 grep -Fxq 'SubState=running' <<<"$properties"
 grep -Fxq 'NeedDaemonReload=no' <<<"$properties"
 grep -Fxq 'FragmentPath=/etc/systemd/system/assist-ai-bot.service' <<<"$properties"
-main_pid=$(sed -n 's/^MainPID=//p' <<<"$properties")
 [[ $(readlink -f "/proc/$main_pid/cwd") == "$test_home/.local/lib/assist-ai/releases/slot-a" ]]
 tr '\0' '\n' <"/proc/$main_pid/cmdline" | grep -Fxq "$test_home/.local/lib/assist-ai/releases/slot-a/.venv/bin/python"
 
