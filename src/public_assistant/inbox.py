@@ -492,7 +492,7 @@ class Unit2Store(Unit1Store):
         subject = self.subject_ref(
             message.connection_id, message.conversation_id, message.sender_id
         )
-        request_id = (
+        default_request_id = (
             "REQ-"
             + uuid.uuid5(
                 uuid.UUID("4641cd62-c11d-4167-9218-e713060cb7d5"),
@@ -502,8 +502,15 @@ class Unit2Store(Unit1Store):
             .upper()
         )
         now = self.now()
-        alert = f"Assistant Inbox request {request_id} is ready."
         with self.public.transaction() as connection:
+            existing = connection.execute(
+                """SELECT request_id FROM inbox_requests WHERE subject_ref=?
+                   AND connection_id=? AND conversation_id=? AND state='open'
+                   ORDER BY content_updated_at DESC LIMIT 1""",
+                (subject, message.connection_id, message.conversation_id),
+            ).fetchone()
+            request_id = str(existing[0]) if existing is not None else default_request_id
+            alert = f"Assistant Inbox request {request_id} is ready."
             connection.execute(
                 """INSERT INTO inbox_requests VALUES
                    (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
@@ -548,7 +555,11 @@ class Unit2Store(Unit1Store):
 
         if not message_ids:
             return
-        marks = ",".join("?" for _ in message_ids)
+        message_keys = tuple(
+            self.message_key(connection_id, conversation_id, message_id)
+            for message_id in message_ids
+        )
+        marks = ",".join("?" for _ in message_keys)
         with self.public.transaction() as connection:
             # Request identifiers are deterministic from message identity, so derive
             # them in Python rather than retaining a second sender-text mapping.
@@ -574,10 +585,9 @@ class Unit2Store(Unit1Store):
                 )
             connection.execute(
                 f"""DELETE FROM assistant_context WHERE source_update_id IN (
-                    SELECT source_update_id FROM messages WHERE connection_id=?
-                    AND conversation_id=? AND message_id IN ({marks})
+                    SELECT update_id FROM processed_updates WHERE message_key IN ({marks})
                 )""",
-                (connection_id, conversation_id, *message_ids),
+                message_keys,
             )
 
     def due_notifications(self) -> tuple[Notification, ...]:

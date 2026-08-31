@@ -100,8 +100,10 @@ calendar, tasks, files, web access, or ability to contact Misha directly.
 """
 
 _FORBIDDEN_OWNER_CLAIMS = re.compile(
-    r"\bmisha\b.{0,40}\b(read|approved|promised|completed)\b|"
-    r"\b(read|approved|promised|completed)\b.{0,40}\bmisha\b",
+    r"\b(read|approved|promised|completed|authorized|confirmed)\b|"
+    r"\b(миша|misha)\b.{0,60}\b(прочитал|одобрил|выполнил|"
+    r"согласовал|завершил)\b|\b(прочитал|одобрил|выполнил|согласовал|"
+    r"завершил)\b.{0,60}\b(миша|misha)\b",
     re.IGNORECASE,
 )
 

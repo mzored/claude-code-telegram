@@ -176,7 +176,8 @@ class AssistantService(SecretaryService):
             replay_pending = (
                 result == "replayed"
                 and message is not None
-                and self.store.update_outcome(message.update_id) == "received"
+                and self.store.update_outcome(message.update_id)
+                in {"received", "awaiting_consent"}
             )
             reference = (
                 self.store.replace_privacy_reference(
