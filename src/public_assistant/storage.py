@@ -201,10 +201,17 @@ class Unit1Store:
         pseudonym_key: bytes,
         *,
         clock: Callable[[], float] = time.time,
+        authorized_processors: tuple[str, ...] = AUTHORIZED_PROCESSORS,
+        authorized_purposes: tuple[str, ...] = AUTHORIZED_PURPOSES,
+        recover: bool = True,
     ) -> None:
+        if not authorized_processors or not authorized_purposes:
+            raise ValueError("authorized processor and purpose lists cannot be empty")
         self.data_dir = data_dir
         self.pseudonym_key = pseudonym_key
         self.clock = clock
+        self.authorized_processors = authorized_processors
+        self.authorized_purposes = authorized_purposes
         self.pending = SqlCipherDatabase(
             data_dir / "pending.db", pending_key, PENDING_SCHEMA
         )
@@ -215,10 +222,11 @@ class Unit1Store:
         except BaseException:
             self.pending.close()
             raise
-        self.recover_sending_replies()
-        self.recover_pending_expiry_cleanup()
-        self.recover_restrictions()
-        self.recover_transfers()
+        if recover:
+            self.recover_sending_replies()
+            self.recover_pending_expiry_cleanup()
+            self.recover_restrictions()
+            self.recover_transfers()
 
     def now(self) -> int:
         return int(self.clock())
@@ -904,8 +912,8 @@ class Unit1Store:
                     control.subject_ref,
                     control.privacy_policy_version,
                     expected_processing_version,
-                    json.dumps(AUTHORIZED_PROCESSORS),
-                    json.dumps(AUTHORIZED_PURPOSES),
+                    json.dumps(self.authorized_processors),
+                    json.dumps(self.authorized_purposes),
                     now,
                 ),
             )
@@ -955,8 +963,8 @@ class Unit1Store:
                         row["subject_ref"],
                         row["privacy_policy_version"],
                         row["processing_authorization_version"],
-                        json.dumps(AUTHORIZED_PROCESSORS),
-                        json.dumps(AUTHORIZED_PURPOSES),
+                        json.dumps(self.authorized_processors),
+                        json.dumps(self.authorized_purposes),
                         now,
                     ),
                 )

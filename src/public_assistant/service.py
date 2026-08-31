@@ -189,12 +189,17 @@ class SecretaryService:
             ],
         ]
         reply = self.store.create_reply(
-            message, "consent_disclosure", DISCLOSURE[lang], keyboard
+            message, "consent_disclosure", self._consent_disclosure(lang), keyboard
         )
         self.store.set_update_outcome(
             message.update_id, "awaiting_consent", reply.reply_id
         )
         return ProcessingResult("awaiting_consent", reply)
+
+    def _consent_disclosure(self, language: str) -> str:
+        """Expose a narrow override point for a later, narrower processor scope."""
+
+        return DISCLOSURE[language]
 
     def _maintenance_reply(self, message: InboundMessage) -> ReplyRecord:
         lang = _language(message.text)

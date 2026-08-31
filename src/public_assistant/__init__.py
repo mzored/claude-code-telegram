@@ -1,7 +1,8 @@
 """Isolated Telegram Business public assistant.
 
-This package intentionally has no dependency on the private Claude agent,
-model clients, or provider integrations. Delivery Unit 1 is deterministic.
+This package has no dependency on the private Claude agent or external-action
+integrations. Delivery Unit 2 adds one consent-gated, tool-free OpenAI
+Responses boundary for bounded conversation and request capture.
 """
 
 from src.public_assistant.config import PublicAssistantConfig

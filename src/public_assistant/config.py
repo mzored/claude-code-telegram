@@ -13,6 +13,9 @@ class PublicAssistantConfigurationError(ValueError):
     """Raised before network or database access when isolation is invalid."""
 
 
+PUBLISHED_CONTENT_RETENTION_SECONDS = 90 * 24 * 60 * 60
+
+
 def _required(environment: Mapping[str, str], name: str) -> str:
     value = environment.get(name, "").strip()
     if not value:
@@ -26,6 +29,17 @@ def _positive_int(environment: Mapping[str, str], name: str) -> int:
         value = int(raw)
     except ValueError as exc:
         raise PublicAssistantConfigurationError(f"{name} must be an integer") from exc
+    if value <= 0:
+        raise PublicAssistantConfigurationError(f"{name} must be positive")
+    return value
+
+
+def _positive_float(environment: Mapping[str, str], name: str) -> float:
+    raw = _required(environment, name)
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise PublicAssistantConfigurationError(f"{name} must be a number") from exc
     if value <= 0:
         raise PublicAssistantConfigurationError(f"{name} must be positive")
     return value
@@ -136,7 +150,7 @@ class PublicAssistantConfig:
     processing_authorization_version: str
     pending_ttl_seconds: int = 24 * 60 * 60
     reply_window_seconds: int = 24 * 60 * 60
-    retention_seconds: int = 90 * 24 * 60 * 60
+    retention_seconds: int = PUBLISHED_CONTENT_RETENTION_SECONDS
     rate_limit_count: int = 20
     rate_limit_window_seconds: int = 60
 
@@ -249,12 +263,17 @@ class BackupConfig:
     backup_dir: Path
     public_database_key_file: Path
     backup_database_key_file: Path
+    backup_retention_seconds: int = PUBLISHED_CONTENT_RETENTION_SECONDS
 
     @classmethod
     def from_environment(
         cls, environment: Mapping[str, str] | None = None
     ) -> "BackupConfig":
         env = os.environ if environment is None else environment
+        if env.get("PUBLIC_ASSISTANT_BACKUP_DATABASE_KEY", "").strip():
+            raise PublicAssistantConfigurationError(
+                "credential values are forbidden in environment variables; use files"
+            )
         data, backup = validate_separate_roots(
             Path(_required(env, "PUBLIC_ASSISTANT_DATA_DIR")),
             Path(_required(env, "PUBLIC_ASSISTANT_BACKUP_DIR")),
@@ -267,9 +286,112 @@ class BackupConfig:
             data,
             backup,
         )
+        retention = _positive_int(env, "PUBLIC_ASSISTANT_BACKUP_RETENTION_SECONDS")
+        if retention > PUBLISHED_CONTENT_RETENTION_SECONDS:
+            raise PublicAssistantConfigurationError(
+                "backup retention cannot exceed the published content retention"
+            )
         return cls(
             data_dir=data,
             backup_dir=backup,
             public_database_key_file=credential_paths[0],
             backup_database_key_file=credential_paths[1],
+            backup_retention_seconds=retention,
+        )
+
+
+@dataclass(frozen=True)
+class Unit2Config:
+    """Unit 2 model, Inbox, alert, and retention limits."""
+
+    openai_api_key_file: Path
+    model: str
+    owner_alert_chat_id: int
+    timeout_seconds: float
+    max_output_tokens: int
+    max_context_items: int
+    max_context_characters: int
+    daily_call_limit: int
+    daily_input_token_limit: int
+    daily_output_token_limit: int
+    daily_cost_microusd_limit: int
+    input_microusd_per_million: int
+    output_microusd_per_million: int
+    concurrency_limit: int
+    backup_retention_seconds: int
+
+    def read_openai_api_key(self) -> str:
+        return read_credential(self.openai_api_key_file, "OpenAI API key")
+
+    @classmethod
+    def from_environment(
+        cls,
+        base: PublicAssistantConfig,
+        environment: Mapping[str, str] | None = None,
+    ) -> "Unit2Config":
+        env = os.environ if environment is None else environment
+        if env.get("PUBLIC_ASSISTANT_OPENAI_API_KEY", "").strip():
+            raise PublicAssistantConfigurationError(
+                "OpenAI credential values are forbidden in environment variables; use files"
+            )
+        path = _credential_path(env, "PUBLIC_ASSISTANT_OPENAI_API_KEY_FILE")
+        validate_credential_paths(
+            (
+                base.bot_token_file,
+                base.pending_database_key_file,
+                base.public_database_key_file,
+                base.pseudonym_key_file,
+                path,
+            ),
+            base.data_dir,
+            base.backup_dir,
+        )
+        retention = _positive_int(env, "PUBLIC_ASSISTANT_BACKUP_RETENTION_SECONDS")
+        if retention > base.retention_seconds:
+            raise PublicAssistantConfigurationError(
+                "backup retention cannot exceed the published content retention"
+            )
+        owner_alert_chat_id = _positive_int(env, "PUBLIC_ASSISTANT_OWNER_ALERT_CHAT_ID")
+        if owner_alert_chat_id != base.owner_id:
+            raise PublicAssistantConfigurationError(
+                "owner alert chat must be the configured owner"
+            )
+        return cls(
+            openai_api_key_file=path,
+            model=_required(env, "PUBLIC_ASSISTANT_OPENAI_MODEL"),
+            owner_alert_chat_id=owner_alert_chat_id,
+            timeout_seconds=_positive_float(
+                env, "PUBLIC_ASSISTANT_MODEL_TIMEOUT_SECONDS"
+            ),
+            max_output_tokens=_positive_int(
+                env, "PUBLIC_ASSISTANT_MODEL_MAX_OUTPUT_TOKENS"
+            ),
+            max_context_items=_positive_int(
+                env, "PUBLIC_ASSISTANT_MODEL_MAX_CONTEXT_ITEMS"
+            ),
+            max_context_characters=_positive_int(
+                env, "PUBLIC_ASSISTANT_MODEL_MAX_CONTEXT_CHARACTERS"
+            ),
+            daily_call_limit=_positive_int(
+                env, "PUBLIC_ASSISTANT_MODEL_DAILY_CALL_LIMIT"
+            ),
+            daily_input_token_limit=_positive_int(
+                env, "PUBLIC_ASSISTANT_MODEL_DAILY_INPUT_TOKEN_LIMIT"
+            ),
+            daily_output_token_limit=_positive_int(
+                env, "PUBLIC_ASSISTANT_MODEL_DAILY_OUTPUT_TOKEN_LIMIT"
+            ),
+            daily_cost_microusd_limit=_positive_int(
+                env, "PUBLIC_ASSISTANT_MODEL_DAILY_COST_MICROUSD_LIMIT"
+            ),
+            input_microusd_per_million=_positive_int(
+                env, "PUBLIC_ASSISTANT_MODEL_INPUT_MICROUSD_PER_MILLION"
+            ),
+            output_microusd_per_million=_positive_int(
+                env, "PUBLIC_ASSISTANT_MODEL_OUTPUT_MICROUSD_PER_MILLION"
+            ),
+            concurrency_limit=_positive_int(
+                env, "PUBLIC_ASSISTANT_MODEL_CONCURRENCY_LIMIT"
+            ),
+            backup_retention_seconds=retention,
         )

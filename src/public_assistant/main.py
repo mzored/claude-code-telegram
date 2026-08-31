@@ -1,4 +1,4 @@
-"""Dedicated process entry point for Delivery Unit 1."""
+"""Dedicated process entry point for Public Assistant Delivery Unit 2."""
 
 from __future__ import annotations
 
@@ -9,10 +9,15 @@ import os
 import re
 import sys
 
-from src.public_assistant.config import PublicAssistantConfig
+from src.public_assistant.config import (
+    PublicAssistantConfig,
+    PublicAssistantConfigurationError,
+    Unit2Config,
+)
+from src.public_assistant.conversation import AssistantService
+from src.public_assistant.inbox import Unit2Store
+from src.public_assistant.model import OpenAIResponsesModel
 from src.public_assistant.privacy_log import PrivacyLog
-from src.public_assistant.service import SecretaryService
-from src.public_assistant.storage import Unit1Store
 from src.public_assistant.telegram_adapter import (
     DurablePollingRunner,
     build_application,
@@ -82,15 +87,32 @@ def _run() -> None:
     """Validate keys and stores before constructing a Telegram client."""
 
     config = PublicAssistantConfig.from_environment()
+    unit2_config = Unit2Config.from_environment(config)
     credentials = config.load_runtime_credentials()
-    store = Unit1Store(
+    openai_api_key = unit2_config.read_openai_api_key()
+    if openai_api_key.encode() in {
+        credentials.bot_token.encode(),
+        credentials.pending_database_key.encode(),
+        credentials.public_database_key.encode(),
+        credentials.pseudonym_key,
+    }:
+        raise PublicAssistantConfigurationError(
+            "OpenAI credential material must differ from runtime credentials"
+        )
+    store = Unit2Store(
         config.data_dir,
         credentials.pending_database_key,
         credentials.public_database_key,
         credentials.pseudonym_key,
     )
     log = PrivacyLog(credentials.pseudonym_key, logging.getLogger("public_assistant"))
-    service = SecretaryService(config, store, logger=log)
+    model = OpenAIResponsesModel(
+        openai_api_key,
+        unit2_config.model,
+        timeout_seconds=unit2_config.timeout_seconds,
+        max_output_tokens=unit2_config.max_output_tokens,
+    )
+    service = AssistantService(config, unit2_config, store, model, logger=log)
     application, adapter = build_application(
         config, service, store, credentials.bot_token
     )

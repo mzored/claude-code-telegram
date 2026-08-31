@@ -22,6 +22,7 @@ from telegram.ext import (
 )
 
 from src.public_assistant.config import PublicAssistantConfig
+from src.public_assistant.inbox import Unit2Store
 from src.public_assistant.service import (
     DefiniteDeliveryError,
     RetryableDeliveryError,
@@ -279,6 +280,9 @@ class TelegramBusinessAdapter:
             connection_id=connection_id,
             origin_message_id=message.message_id,
         )
+        reference = None
+        if result.startswith("accepted:"):
+            result, reference = "accepted", result.split(":", 1)[1]
         answers = {
             "accepted": "Processing enabled.",
             "declined": "Processing declined.",
@@ -288,9 +292,10 @@ class TelegramBusinessAdapter:
             "stale_version": "A new confirmation is required.",
             "replayed": "This control was already used.",
         }
-        await self._answer_callback(
-            query, answers.get(result, "This control is unavailable.")
-        )
+        answer = answers.get(result, "This control is unavailable.")
+        if reference is not None:
+            answer = f"Processing enabled. Save privacy reference: {reference}"
+        await self._answer_callback(query, answer)
 
     async def _answer_callback(self, query: Any, text: str) -> None:
         """Treat Telegram's definite answer rejection as terminal UI feedback."""
@@ -359,6 +364,39 @@ class TelegramBusinessAdapter:
             except TransientConnectionError:
                 self.logger.warning("reply authority observation deferred")
                 break
+        await self.deliver_due_notifications(bot)
+
+    async def deliver_due_notifications(self, bot: Any) -> None:
+        """Deliver fixed Inbox alerts directly, without any private-agent path."""
+
+        if not isinstance(self.store, Unit2Store):
+            return
+        unit2_config = getattr(self.service, "unit2_config", None)
+        if unit2_config is None:
+            return
+        for notification in self.store.due_notifications():
+            expected = f"Assistant Inbox request {notification.request_id} is ready."
+            if notification.text != expected:
+                if self.store.mark_notification_sending(notification.notification_id):
+                    self.store.finish_notification(
+                        notification.notification_id, "failed"
+                    )
+                continue
+            if not self.store.mark_notification_sending(notification.notification_id):
+                continue
+            try:
+                await bot.send_message(
+                    chat_id=unit2_config.owner_alert_chat_id,
+                    text=expected,
+                )
+            except (BadRequest, Forbidden):
+                self.store.finish_notification(notification.notification_id, "failed")
+            except Exception:
+                self.store.finish_notification(
+                    notification.notification_id, "uncertain"
+                )
+            else:
+                self.store.finish_notification(notification.notification_id, "sent")
 
     async def dispatch(self, update: Update, bot: Any) -> None:
         """Dedicated sequential dispatcher whose exceptions are never swallowed."""
