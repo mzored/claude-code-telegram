@@ -930,6 +930,7 @@ def test_responses_adapter_forbids_hosted_state_and_tools() -> None:
                         "turn_kind": "answer",
                         "missing_information": [],
                         "request_patch": None,
+                        "task_candidate": None,
                     }
                 ),
                 usage=SimpleNamespace(input_tokens=7, output_tokens=4),
@@ -978,6 +979,7 @@ def test_responses_adapter_rejects_schema_valid_owner_claims(
                         "turn_kind": "answer",
                         "missing_information": [],
                         "request_patch": None,
+                        "task_candidate": None,
                     }
                 ),
                 usage=SimpleNamespace(input_tokens=7, output_tokens=4),

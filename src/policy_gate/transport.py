@@ -35,8 +35,10 @@ CONTROLLER_OPERATIONS = frozenset(
         "stage_owner_exact_action",
         "external_intent_execution_started",
         "prepare_external_admin",
+        "prepare_public_task_exact",
         "prepare_admin",
         "confirm_external_admin",
+        "confirm_public_task_exact",
         "confirm_admin",
         "set_breaker",
     }

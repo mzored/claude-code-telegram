@@ -10,6 +10,7 @@ from src.external_read import (
     ExternalReadError,
     ExternalRecordRef,
     ExternalSourceMetadata,
+    PublicTaskCandidateEnvelope,
     external_link_identity,
 )
 from src.policy_gate.types import (
@@ -97,6 +98,27 @@ class ControllerGateClient(Protocol):
         external_link: ExternalActionLink,
     ) -> bool: ...
 
+    def prepare_public_task_exact(
+        self,
+        request_reference: TrustedReference,
+        binding: ActionBinding,
+        candidate_link: ExternalActionLink,
+        owner_id: int,
+        control_chat_id: int,
+        preview_message_id: int,
+        ttl_seconds: int = 300,
+    ) -> PreparedIntent: ...
+
+    def confirm_public_task_exact(
+        self,
+        intent_id: str,
+        owner_id: int,
+        control_chat_id: int,
+        preview_message_id: int,
+        binding: ActionBinding,
+        candidate_link: ExternalActionLink,
+    ) -> AdminResult: ...
+
 
 class PrivateControllerService:
     """Resolve identity locally; the interpreter can propose scope only."""
@@ -167,6 +189,98 @@ class PrivateControllerService:
         if self.external_reads is None:
             raise ValueError("external inspection is disabled")
         return self.external_reads
+
+    @staticmethod
+    def _public_task_binding(
+        candidate: PublicTaskCandidateEnvelope,
+    ) -> ActionBinding:
+        metadata = candidate.metadata
+        return ActionBinding.create(
+            subject_id=metadata.subject_id,
+            connection_id=metadata.connection_id,
+            conversation_id=metadata.conversation_id,
+            update_id=metadata.update_id,
+            request_id=metadata.request_id,
+            operation=Operation.TASK_CREATE,
+            arguments=dict(candidate.arguments),
+            processing_authorization_version=metadata.processing_authorization_version,
+            processing_authorization_revision=(
+                metadata.processing_authorization_revision
+            ),
+            processor_purpose="external task creation",
+            origin=ActionOrigin.PUBLIC_SENDER,
+        )
+
+    @staticmethod
+    def _public_task_link(
+        reference: ExternalRecordRef, candidate: PublicTaskCandidateEnvelope
+    ) -> ExternalActionLink:
+        if candidate.metadata.reference != reference:
+            raise PermissionError("public task candidate reference changed")
+        return ExternalActionLink(
+            external_link_identity(
+                reference.reference_hash(), candidate.payload_digest
+            ),
+            candidate.payload_digest,
+        )
+
+    def prepare_public_task(
+        self,
+        run_id: str,
+        reference: ExternalRecordRef,
+        *,
+        preview_message_id: int,
+    ) -> PreparedIntent:
+        """Prepare exactly the brokered candidate from one fresh owner control."""
+
+        self._require_fresh_external_owner(run_id)
+        self.runs.claim_external_control(run_id)
+        candidate = self._external_reads().public_task_candidate(reference)
+        binding = self._public_task_binding(candidate)
+        candidate_link = self._public_task_link(reference, candidate)
+        prepared = self.gate.prepare_public_task_exact(
+            TrustedReference("request", candidate.metadata.request_id),
+            binding,
+            candidate_link,
+            self.owner_id,
+            self.control_chat_id,
+            preview_message_id,
+        )
+        self.runs.link_external_intent(
+            prepared.intent_id, run_id, reference, candidate.metadata
+        )
+        return prepared
+
+    def confirm_public_task(
+        self,
+        run_id: str,
+        intent_id: str,
+        reference: ExternalRecordRef,
+        *,
+        preview_message_id: int,
+    ) -> AdminResult:
+        """Re-read a current envelope before spending the exact one-use grant."""
+
+        confirmation = self.runs.require_second_fresh_control(intent_id, run_id)
+        if (
+            confirmation.source is not RunSource.TELEGRAM
+            or confirmation.resumed_session
+        ):
+            raise PermissionError("public task control requires a fresh owner message")
+        self.runs.claim_external_control(run_id)
+        candidate = self._external_reads().public_task_candidate(reference)
+        self.runs.require_external_source_link(intent_id, reference, candidate.metadata)
+        result = self.gate.confirm_public_task_exact(
+            intent_id,
+            self.owner_id,
+            self.control_chat_id,
+            preview_message_id,
+            self._public_task_binding(candidate),
+            self._public_task_link(reference, candidate),
+        )
+        if self._external_result_is_terminal(result):
+            self.runs.mark_external_terminal(intent_id)
+        return result
 
     def inspect_external(
         self, run_id: str, reference: ExternalRecordRef

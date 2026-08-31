@@ -6,7 +6,9 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Protocol
+from typing import Mapping, Protocol
+
+from src.policy_gate.types import digest
 
 
 class ExternalSource(str, Enum):
@@ -205,6 +207,34 @@ class ExternalInspection:
             raise ValueError("external inspection summary is too large")
 
 
+@dataclass(frozen=True)
+class PublicTaskCandidateEnvelope:
+    """Minimized task proposal available only through the owner-read broker."""
+
+    candidate_id: str
+    metadata: ExternalSourceMetadata
+    arguments: Mapping[str, str | None]
+    payload_digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.candidate_id, str)
+            or not _OPAQUE_METADATA.fullmatch(self.candidate_id)
+            or set(self.arguments) != {"title", "due_date"}
+            or not isinstance(self.arguments["title"], str)
+            or not self.arguments["title"].strip()
+            or (
+                self.arguments["due_date"] is not None
+                and not isinstance(self.arguments["due_date"], str)
+            )
+            or not isinstance(self.payload_digest, str)
+            or not _SHA256_HEX.fullmatch(self.payload_digest)
+            or self.payload_digest != digest(dict(self.arguments))
+            or self.metadata.source_digest != self.payload_digest
+        ):
+            raise ValueError("public task candidate envelope is invalid")
+
+
 class ExternalReadClient(Protocol):
     """The controller receives summaries and metadata, never record bodies."""
 
@@ -213,6 +243,10 @@ class ExternalReadClient(Protocol):
     def validate_for_prepare(
         self, reference: ExternalRecordRef
     ) -> ExternalSourceMetadata: ...
+
+    def public_task_candidate(
+        self, reference: ExternalRecordRef
+    ) -> PublicTaskCandidateEnvelope: ...
 
 
 __all__ = [
@@ -224,6 +258,7 @@ __all__ = [
     "ExternalRecordRef",
     "ExternalSource",
     "ExternalSourceMetadata",
+    "PublicTaskCandidateEnvelope",
     "EXTERNAL_SUMMARY_PREFIX",
     "external_link_identity",
     "source_digest",

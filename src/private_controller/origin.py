@@ -381,10 +381,22 @@ class RunOriginLedger:
                    VALUES (?, unixepoch())""",
                 (subject_hash,),
             )
+            intent_ids = tuple(
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT intent_id FROM external_intent_links WHERE subject_hash=?",
+                    (subject_hash,),
+                ).fetchall()
+            )
             connection.execute(
                 "DELETE FROM external_intent_links WHERE subject_hash=?",
                 (subject_hash,),
             )
+            for intent_id in intent_ids:
+                connection.execute(
+                    "DELETE FROM controller_intent_runs WHERE intent_id=?",
+                    (intent_id,),
+                )
 
     def has_external_link(self, intent_id: str) -> bool:
         return (

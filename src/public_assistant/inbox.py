@@ -152,6 +152,7 @@ def erase_subject_from_public_store(
             "privacy_references",
             "privacy_previews",
             "public_action_intents",
+            "public_task_candidates",
             "integration_processing_receipts",
             "meeting_offer_controls",
             "consents",

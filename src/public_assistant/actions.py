@@ -14,6 +14,7 @@ from src.policy_gate.types import (
     ActionSchema,
     MeetingOptionsResult,
     Operation,
+    canonical_json,
 )
 from src.private_controller.erasure import (
     ExternalIntentLinkEraser,
@@ -363,6 +364,10 @@ DRY_RUN_ACCEPTED = {
     "en": "The requested action passed the dry-run policy check. No external provider was contacted.",
     "ru": "Запрошенное действие прошло проверку в тестовом режиме. Внешний сервис не вызывался.",
 }
+TODOIST_SUCCEEDED = {
+    "en": "The task was created in the configured external requests list.",
+    "ru": "Задача создана в настроенном списке внешних запросов.",
+}
 
 MEETING_OPTIONS_PROMPT = {
     "en": "Choose one of these available times.",
@@ -461,8 +466,6 @@ class ActionAssistantService(AssistantService):
             discovery = self.coordinator.discover(message)
         except Exception:
             return self._process_without_actions(message)
-        if not discovery.schemas:
-            return self._process_without_actions(message)
         if not self.store.has_active_consent(
             message.connection_id,
             message.conversation_id,
@@ -559,20 +562,55 @@ class ActionAssistantService(AssistantService):
                 discovery,
             )
             if action_result.outcome in {"verified_success", "replayed_success"}:
-                text = DRY_RUN_ACCEPTED[_language(message.text)]
+                text = (
+                    TODOIST_SUCCEEDED[_language(message.text)]
+                    if turn.action_proposal.operation is Operation.TASK_CREATE
+                    else DRY_RUN_ACCEPTED[_language(message.text)]
+                )
                 reply = self._assistant_reply(message, text)
                 self.store.add_assistant_context(
                     message, text, self.config.retention_seconds
                 )
-                self.store.set_update_outcome(
-                    message.update_id, "dry_run_action_validated", reply.reply_id
+                outcome = (
+                    "todoist_task_created"
+                    if turn.action_proposal.operation is Operation.TASK_CREATE
+                    else "dry_run_action_validated"
                 )
-                return ProcessingResult("dry_run_action_validated", reply)
+                self.store.set_update_outcome(
+                    message.update_id, outcome, reply.reply_id
+                )
+                return ProcessingResult(outcome, reply)
             return self._fallback_request(message, "action_denied")
 
         request_id = None
         reply_text = turn.reply_text
-        if turn.turn_kind == "request":
+        if turn.turn_kind == "task":
+            if turn.task_candidate is None:
+                return self._fallback_request(message, "model_fallback")
+            # Persist only model-minimized typed fields: capture is neither a
+            # Gate action nor a provider request.  Direct-owner control later
+            # resolves this immutable public candidate through its isolated
+            # broker and creates the exact binding in Gate atomically.
+            candidate_content = canonical_json(
+                {
+                    "due_date": turn.task_candidate.due_date,
+                    "title": turn.task_candidate.title,
+                }
+            )
+            request_id = self.store.upsert_request(
+                message, candidate_content, self.config.retention_seconds
+            )
+            self.store.upsert_public_task_candidate(
+                message,
+                request_id,
+                title=turn.task_candidate.title,
+                due_date=turn.task_candidate.due_date,
+                retention_seconds=self.config.retention_seconds,
+            )
+            # An unavailable current receipt leaves the typed Inbox record and
+            # owner alert intact, but never creates an executable public action.
+            reply_text = REQUEST_CONFIRMED[_language(message.text)]
+        elif turn.turn_kind == "request":
             if turn.request_patch is None:
                 self.store.finish_model_call(reservation, None, self.unit2_config)
                 return self._fallback_request(message, "model_fallback")
@@ -589,7 +627,11 @@ class ActionAssistantService(AssistantService):
         self.store.add_assistant_context(
             message, reply_text, self.config.retention_seconds
         )
-        outcome = "request_captured" if request_id is not None else turn.turn_kind
+        outcome = (
+            "task_inbox_captured"
+            if turn.turn_kind == "task" and request_id is not None
+            else "request_captured" if request_id is not None else turn.turn_kind
+        )
         self.store.set_update_outcome(message.update_id, outcome, reply.reply_id)
         return ProcessingResult(outcome, reply)
 
