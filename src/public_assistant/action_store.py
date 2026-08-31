@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import time
 import uuid
 from dataclasses import dataclass
@@ -43,6 +44,31 @@ CREATE TABLE IF NOT EXISTS integration_processing_receipts (
         ('pending_activation', 'active', 'pending_revocation', 'revoked')),
     changed_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS meeting_offer_controls (
+    control_id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    options_action_id TEXT NOT NULL,
+    offer_ref TEXT NOT NULL,
+    connection_id TEXT NOT NULL,
+    conversation_id INTEGER NOT NULL,
+    sender_id INTEGER NOT NULL,
+    subject_ref TEXT NOT NULL,
+    processing_authorization_version TEXT NOT NULL,
+    processing_authorization_revision INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    consumed_at INTEGER,
+    schedule_action_id TEXT,
+    selection_update_id INTEGER,
+    origin_reply_id TEXT,
+    origin_message_id INTEGER,
+    CHECK(
+        (schedule_action_id IS NULL AND selection_update_id IS NULL)
+        OR (schedule_action_id IS NOT NULL AND selection_update_id IS NOT NULL)
+    ),
+    UNIQUE(options_action_id, offer_ref, control_id)
+);
+CREATE INDEX IF NOT EXISTS idx_meeting_offer_controls_subject
+    ON meeting_offer_controls(subject_ref, expires_at);
 """
 
 
@@ -59,6 +85,16 @@ class IntegrationAuthorization:
     version: str
     revision: int
     processor_purposes: Mapping[str, tuple[str, ...]]
+
+
+@dataclass(frozen=True)
+class MeetingOfferControl:
+    """One sender-bound Telegram callback carrying no Calendar detail."""
+
+    callback_data: str
+    start_at: int
+    end_at: int
+    duration_minutes: int
 
 
 class Unit3Store(Unit2Store):
@@ -341,6 +377,209 @@ class Unit3Store(Unit2Store):
             )
         return binding
 
+    def create_meeting_offer_controls(
+        self,
+        message: InboundMessage,
+        binding: ActionBinding,
+        slots: tuple[tuple[str, int, int, int], ...],
+        retention_seconds: int,
+    ) -> tuple[MeetingOfferControl, ...]:
+        """Persist one sender-bound callback for each Gate-produced offer.
+
+        The public store keeps an opaque offer reference and a token hash.  It
+        never receives Calendar event data, free/busy responses, or a provider
+        credential.
+        """
+
+        if (
+            binding.operation is not Operation.MEETING_OPTIONS
+            or binding.subject_id
+            != self.subject_ref(
+                message.connection_id, message.conversation_id, message.sender_id
+            )
+            or not binding.verify()
+            or retention_seconds <= 0
+        ):
+            raise ValueError("meeting offer control binding is invalid")
+        if any(
+            not isinstance(offer_ref, str)
+            or not offer_ref.startswith("OFR-")
+            or not isinstance(start_at, int)
+            or not isinstance(end_at, int)
+            or end_at <= start_at
+            or not isinstance(duration_minutes, int)
+            or duration_minutes <= 0
+            for offer_ref, start_at, end_at, duration_minutes in slots
+        ):
+            raise ValueError("meeting offer slots are invalid")
+        now = self.now()
+        expires_at = now + min(retention_seconds, 60 * 60)
+        controls: list[MeetingOfferControl] = []
+        with self.public.transaction() as connection:
+            action = connection.execute(
+                """SELECT subject_ref, operation, processing_authorization_version,
+                          processing_authorization_revision
+                   FROM public_action_intents WHERE action_id=?""",
+                (binding.action_id,),
+            ).fetchone()
+            if (
+                action is None
+                or str(action["subject_ref"]) != binding.subject_id
+                or str(action["operation"]) != Operation.MEETING_OPTIONS.value
+                or str(action["processing_authorization_version"])
+                != binding.processing_authorization_version
+                or int(action["processing_authorization_revision"])
+                != binding.processing_authorization_revision
+            ):
+                raise ValueError("meeting offer action is not durable")
+            for offer_ref, start_at, end_at, duration_minutes in slots:
+                token = secrets.token_urlsafe(18)
+                callback_data = f"pa:mo:{token}"
+                connection.execute(
+                    """INSERT INTO meeting_offer_controls(
+                           control_id, token_hash, options_action_id, offer_ref,
+                           connection_id, conversation_id, sender_id, subject_ref,
+                           processing_authorization_version,
+                           processing_authorization_revision, expires_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        uuid.uuid4().hex,
+                        self.digest("meeting_offer_control", token),
+                        binding.action_id,
+                        offer_ref,
+                        message.connection_id,
+                        message.conversation_id,
+                        message.sender_id,
+                        binding.subject_id,
+                        binding.processing_authorization_version,
+                        binding.processing_authorization_revision,
+                        expires_at,
+                    ),
+                )
+                controls.append(
+                    MeetingOfferControl(
+                        callback_data, start_at, end_at, duration_minutes
+                    )
+                )
+        return tuple(controls)
+
+    def prepare_meeting_selection(
+        self,
+        token: str,
+        *,
+        actor_id: int,
+        conversation_id: int,
+        connection_id: str,
+        origin_message_id: int,
+        callback_update_id: int,
+    ) -> ActionBinding | None:
+        """Consume a delivered offer control into one immutable schedule binding.
+
+        Replays return the same binding.  A click cannot change the offer,
+        identity, receipt revision, or action origin.
+        """
+
+        if (
+            not token.startswith("pa:mo:")
+            or callback_update_id < 0
+            or origin_message_id < 0
+        ):
+            return None
+        now = self.now()
+        token_hash = self.digest("meeting_offer_control", token[6:])
+        with self.public.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM meeting_offer_controls WHERE token_hash=?", (token_hash,)
+            ).fetchone()
+            if row is None or any(
+                (
+                    int(row["sender_id"]) != actor_id,
+                    int(row["conversation_id"]) != conversation_id,
+                    str(row["connection_id"]) != connection_id,
+                    row["origin_reply_id"] is None,
+                    row["origin_message_id"] is None,
+                    int(row["origin_message_id"]) != origin_message_id,
+                )
+            ):
+                return None
+            selection_update_id = row["selection_update_id"]
+            if (
+                row["schedule_action_id"] is not None
+                and selection_update_id is not None
+            ):
+                return ActionBinding.create(
+                    subject_id=str(row["subject_ref"]),
+                    connection_id=str(row["connection_id"]),
+                    conversation_id=int(row["conversation_id"]),
+                    update_id=int(selection_update_id),
+                    request_id="SEL-" + str(row["control_id"]),
+                    operation=Operation.MEETING_SCHEDULE,
+                    arguments={"offer_ref": str(row["offer_ref"])},
+                    processing_authorization_version=str(
+                        row["processing_authorization_version"]
+                    ),
+                    processing_authorization_revision=int(
+                        row["processing_authorization_revision"]
+                    ),
+                    processor_purpose=_PURPOSES[Operation.MEETING_SCHEDULE],
+                )
+            if row["consumed_at"] is not None or int(row["expires_at"]) <= now:
+                return None
+            binding = ActionBinding.create(
+                subject_id=str(row["subject_ref"]),
+                connection_id=str(row["connection_id"]),
+                conversation_id=int(row["conversation_id"]),
+                update_id=callback_update_id,
+                request_id="SEL-" + str(row["control_id"]),
+                operation=Operation.MEETING_SCHEDULE,
+                arguments={"offer_ref": str(row["offer_ref"])},
+                processing_authorization_version=str(
+                    row["processing_authorization_version"]
+                ),
+                processing_authorization_revision=int(
+                    row["processing_authorization_revision"]
+                ),
+                processor_purpose=_PURPOSES[Operation.MEETING_SCHEDULE],
+            )
+            existing = connection.execute(
+                """SELECT action_id, arguments_json FROM public_action_intents
+                   WHERE source_update_id=?""",
+                (callback_update_id,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["action_id"]) != binding.action_id or str(
+                    existing["arguments_json"]
+                ) != canonical_json(dict(binding.arguments)):
+                    return None
+            else:
+                connection.execute(
+                    """INSERT INTO public_action_intents VALUES
+                       (?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL, ?, ?, ?)""",
+                    (
+                        binding.action_id,
+                        callback_update_id,
+                        binding.subject_id,
+                        binding.request_id,
+                        binding.operation.value,
+                        canonical_json(dict(binding.arguments)),
+                        binding.processing_authorization_version,
+                        binding.processing_authorization_revision,
+                        binding.processor_purpose,
+                        now,
+                        now,
+                        now + 90 * 24 * 60 * 60,
+                    ),
+                )
+            cursor = connection.execute(
+                """UPDATE meeting_offer_controls SET consumed_at=?,
+                   schedule_action_id=?, selection_update_id=?
+                   WHERE token_hash=? AND consumed_at IS NULL""",
+                (now, binding.action_id, callback_update_id, token_hash),
+            )
+            if int(cursor.rowcount) != 1:
+                return None
+            return binding
+
     def request_id_for_update(self, update_id: int) -> str | None:
         row = self.public.execute(
             "SELECT request_id FROM inbox_requests WHERE source_update_id=?",
@@ -366,6 +605,7 @@ class Unit3Store(Unit2Store):
             "replayed_success": "succeeded",
             "definite_failure": "definite_failure",
             "uncertain": "uncertain",
+            "awaiting_owner_confirmation": "prepared",
         }.get(result.outcome, "denied")
         with self.public.transaction() as connection:
             connection.execute(
@@ -387,7 +627,11 @@ class Unit3Store(Unit2Store):
                    AND state IN ('succeeded', 'definite_failure', 'denied')""",
                 (self.now(),),
             )
-        return max(int(cursor.rowcount), 0)
+            controls = connection.execute(
+                "DELETE FROM meeting_offer_controls WHERE expires_at<=?",
+                (self.now(),),
+            )
+        return max(int(cursor.rowcount), 0) + max(int(controls.rowcount), 0)
 
     def expire_public(self, retention_seconds: int) -> int:
         return super().expire_public(retention_seconds) + self.expire_unit3()

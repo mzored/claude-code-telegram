@@ -262,6 +262,40 @@ class TelegramBusinessAdapter:
         ):
             await self._answer_callback(query, "This control is unavailable.")
             return
+        if query.data.startswith("pa:mo:"):
+            if not await self._refresh_connection(context.bot, connection_id):
+                await self._answer_callback(query, "This control is unavailable.")
+                return
+            if not self.store.connection_can_reply(
+                connection_id, self.config.owner_id
+            ) or self.store.is_taken_over(connection_id, message.chat.id):
+                await self._answer_callback(query, "This control is unavailable.")
+                return
+            handler = getattr(self.service, "handle_meeting_offer", None)
+            if not callable(handler):
+                await self._answer_callback(query, "This control is unavailable.")
+                return
+            result = handler(
+                query.data,
+                actor_id=query.from_user.id,
+                conversation_id=message.chat.id,
+                connection_id=connection_id,
+                origin_message_id=message.message_id,
+                callback_update_id=update.update_id,
+            )
+            answers = {
+                "verified_success": "Meeting selected.",
+                "replayed_success": "Meeting was already selected.",
+                "awaiting_owner_confirmation": (
+                    "Selection recorded. It needs owner confirmation."
+                ),
+                "uncertain": "The selection is being checked before retrying.",
+                "definite_failure": "That time is no longer available.",
+            }
+            await self._answer_callback(
+                query, answers.get(result, "This control is unavailable.")
+            )
+            return
         control = self.store.resolve_control(
             query.data,
             query.from_user.id,

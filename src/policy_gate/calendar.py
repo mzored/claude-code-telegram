@@ -15,13 +15,21 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Mapping, Protocol, Sequence
-from urllib.parse import urlencode
+from urllib.error import HTTPError
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 FIXED_EVENT_SUMMARY = "Reserved via public assistant"
 FIXED_EVENT_DESCRIPTION = (
     "Created by the public assistant; contains no sender or request data."
+)
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+GOOGLE_CALENDAR_SCOPES = frozenset(
+    {
+        "https://www.googleapis.com/auth/calendar.events",
+        "https://www.googleapis.com/auth/calendar.events.freebusy",
+    }
 )
 
 
@@ -70,6 +78,24 @@ class CalendarCredentials:
     client_secret: str
     refresh_token: str
     token_uri: str
+    scopes: tuple[str, ...] = tuple(sorted(GOOGLE_CALENDAR_SCOPES))
+
+    def __post_init__(self) -> None:
+        if (
+            not all(
+                isinstance(value, str) and value
+                for value in (
+                    self.client_id,
+                    self.client_secret,
+                    self.refresh_token,
+                    self.token_uri,
+                )
+            )
+            or self.token_uri != GOOGLE_TOKEN_ENDPOINT
+            or frozenset(self.scopes) != GOOGLE_CALENDAR_SCOPES
+            or len(self.scopes) != len(GOOGLE_CALENDAR_SCOPES)
+        ):
+            raise CalendarConfigurationError("Calendar credentials are invalid")
 
     @classmethod
     def from_json(cls, value: str) -> "CalendarCredentials":
@@ -82,13 +108,29 @@ class CalendarCredentials:
         if (
             not isinstance(parsed, dict)
             or set(parsed)
-            != {"client_id", "client_secret", "refresh_token", "token_uri"}
-            or any(not isinstance(item, str) or not item for item in parsed.values())
+            != {"client_id", "client_secret", "refresh_token", "token_uri", "scopes"}
+            or any(
+                not isinstance(parsed.get(field), str) or not parsed[field]
+                for field in (
+                    "client_id",
+                    "client_secret",
+                    "refresh_token",
+                    "token_uri",
+                )
+            )
+            or not isinstance(parsed["scopes"], list)
+            or any(
+                not isinstance(scope, str) or not scope for scope in parsed["scopes"]
+            )
         ):
             raise CalendarConfigurationError("Calendar credential fields are invalid")
-        if not str(parsed["token_uri"]).startswith("https://"):
-            raise CalendarConfigurationError("Calendar token URI must be HTTPS")
-        return cls(**parsed)
+        return cls(
+            client_id=str(parsed["client_id"]),
+            client_secret=str(parsed["client_secret"]),
+            refresh_token=str(parsed["refresh_token"]),
+            token_uri=str(parsed["token_uri"]),
+            scopes=tuple(str(scope) for scope in parsed["scopes"]),
+        )
 
 
 HttpJson = Callable[[str, str, bytes | None, Mapping[str, str]], Mapping[str, object]]
@@ -130,9 +172,20 @@ class GoogleCalendarApi:
             {"Content-Type": "application/x-www-form-urlencoded"},
         )
         token = value.get("access_token")
-        if not isinstance(token, str) or not token:
+        scope = value.get("scope")
+        if (
+            not isinstance(token, str)
+            or not token
+            or not isinstance(scope, str)
+            or frozenset(scope.split()) != GOOGLE_CALENDAR_SCOPES
+        ):
             raise ValueError("Calendar token refresh failed")
         return token
+
+    def validate_startup(self) -> None:
+        """Verify the fixed refresh grant and exact least-privilege scope."""
+
+        self._access_token()
 
     def _request(
         self, method: str, path: str, body: Mapping[str, object] | None = None
@@ -167,7 +220,11 @@ class GoogleCalendarApi:
         busy: list[BusyInterval] = []
         for calendar_id in calendar_ids:
             item = calendars.get(calendar_id)
-            if not isinstance(item, dict) or not isinstance(item.get("busy"), list):
+            if (
+                not isinstance(item, dict)
+                or "errors" in item
+                or not isinstance(item.get("busy"), list)
+            ):
                 raise ValueError("Calendar free/busy response is invalid")
             for interval in item["busy"]:
                 if (
@@ -176,16 +233,19 @@ class GoogleCalendarApi:
                     or not isinstance(interval.get("end"), str)
                 ):
                     raise ValueError("Calendar busy interval is invalid")
-                start = int(
-                    datetime.fromisoformat(
+                try:
+                    start_value = datetime.fromisoformat(
                         interval["start"].replace("Z", "+00:00")
-                    ).timestamp()
-                )
-                end = int(
-                    datetime.fromisoformat(
+                    )
+                    end_value = datetime.fromisoformat(
                         interval["end"].replace("Z", "+00:00")
-                    ).timestamp()
-                )
+                    )
+                except ValueError as exc:
+                    raise ValueError("Calendar busy interval is invalid") from exc
+                if start_value.tzinfo is None or end_value.tzinfo is None:
+                    raise ValueError("Calendar busy interval is invalid")
+                start = int(start_value.timestamp())
+                end = int(end_value.timestamp())
                 if end <= start:
                     raise ValueError("Calendar busy interval is invalid")
                 busy.append(BusyInterval(start, end))
@@ -194,7 +254,7 @@ class GoogleCalendarApi:
     def insert_private_block(self, calendar_id: str, event: CalendarEvent) -> None:
         self._request(
             "POST",
-            f"/calendars/{calendar_id}/events?sendUpdates=none",
+            f"/calendars/{quote(calendar_id, safe='')}/events?sendUpdates=none",
             {
                 "id": event.event_id,
                 "summary": FIXED_EVENT_SUMMARY,
@@ -211,29 +271,51 @@ class GoogleCalendarApi:
         )
 
     def get_event(self, calendar_id: str, event_id: str) -> CalendarEvent | None:
-        value = self._request("GET", f"/calendars/{calendar_id}/events/{event_id}")
+        try:
+            value = self._request(
+                "GET",
+                f"/calendars/{quote(calendar_id, safe='')}/events/"
+                f"{quote(event_id, safe='')}",
+            )
+        except HTTPError as exc:
+            if exc.code == 404:
+                return None
+            raise
         start = value.get("start")
         end = value.get("end")
         if (
-            not isinstance(start, dict)
+            value.get("id") != event_id
+            or value.get("summary") != FIXED_EVENT_SUMMARY
+            or value.get("description") != FIXED_EVENT_DESCRIPTION
+            or value.get("visibility") != "private"
+            or value.get("transparency") != "opaque"
+            or value.get("attendees") not in (None, [])
+            or value.get("location") not in (None, "")
+            or value.get("conferenceData") is not None
+            or value.get("extendedProperties") is not None
+            or value.get("attachments") not in (None, [])
+            or value.get("recurrence") not in (None, [])
+            or value.get("hangoutLink") is not None
+            or value.get("eventType") not in (None, "default")
+            or value.get("status") not in (None, "confirmed")
+            or not isinstance(start, dict)
             or not isinstance(end, dict)
             or not isinstance(start.get("dateTime"), str)
             or not isinstance(end.get("dateTime"), str)
         ):
             return None
-        return CalendarEvent(
-            event_id,
-            int(
-                datetime.fromisoformat(
-                    start["dateTime"].replace("Z", "+00:00")
-                ).timestamp()
-            ),
-            int(
-                datetime.fromisoformat(
-                    end["dateTime"].replace("Z", "+00:00")
-                ).timestamp()
-            ),
-        )
+        try:
+            starts_at = datetime.fromisoformat(start["dateTime"].replace("Z", "+00:00"))
+            ends_at = datetime.fromisoformat(end["dateTime"].replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if starts_at.tzinfo is None or ends_at.tzinfo is None:
+            return None
+        start_at = int(starts_at.timestamp())
+        end_at = int(ends_at.timestamp())
+        if end_at <= start_at:
+            return None
+        return CalendarEvent(event_id, start_at, end_at)
 
 
 @dataclass(frozen=True)
@@ -257,7 +339,21 @@ class CalendarPolicy:
     def __post_init__(self) -> None:
         if not self.enabled:
             return
-        if not self.booking_calendar_id or not self.availability_calendar_ids:
+        identifiers = (self.booking_calendar_id, *self.availability_calendar_ids)
+        if (
+            not self.booking_calendar_id
+            or not self.availability_calendar_ids
+            or any(
+                not isinstance(identifier, str)
+                or not identifier
+                or len(identifier) > 512
+                or any(
+                    character.isspace() or ord(character) < 32
+                    for character in identifier
+                )
+                for identifier in identifiers
+            )
+        ):
             raise CalendarConfigurationError("Calendar IDs are required when enabled")
         if self.booking_calendar_id not in self.availability_calendar_ids:
             raise CalendarConfigurationError("booking calendar must be rechecked")
@@ -355,9 +451,10 @@ def candidate_blocks(
     current = start
     while current + duration <= finish:
         instant = _valid_local_instants(current, policy.zone)
-        if instant:
+        end_instant = _valid_local_instants(current + duration, policy.zone)
+        if instant and end_instant:
             start_at = int((instant[0] - before).timestamp())
-            end_at = int((instant[0] + duration + after).timestamp())
+            end_at = int((end_instant[0] + after).timestamp())
             if start_at >= earliest and end_at > start_at and end_at >= latest:
                 result.append(BusyInterval(start_at, end_at))
         current += timedelta(minutes=policy.grid_minutes)

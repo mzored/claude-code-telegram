@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Callable, Mapping, Protocol, Sequence
 
 from src.policy_gate.types import (
@@ -18,7 +19,11 @@ from src.private_controller.erasure import (
     ExternalIntentLinkEraseRequest,
 )
 from src.private_controller.origin import external_subject_hash
-from src.public_assistant.action_store import IntegrationAuthorization, Unit3Store
+from src.public_assistant.action_store import (
+    IntegrationAuthorization,
+    MeetingOfferControl,
+    Unit3Store,
+)
 from src.public_assistant.config import PublicAssistantConfig, Unit2Config
 from src.public_assistant.conversation import (
     _ABUSE,
@@ -35,7 +40,7 @@ from src.public_assistant.model import (
 )
 from src.public_assistant.privacy_log import PrivacyLog
 from src.public_assistant.service import _language
-from src.public_assistant.types import InboundMessage, ProcessingResult
+from src.public_assistant.types import InboundMessage, ProcessingResult, ReplyRecord
 
 
 class PublicGateClient(Protocol):
@@ -75,6 +80,14 @@ class PublicGateClient(Protocol):
 class ActionDiscovery:
     authorization: IntegrationAuthorization | None
     schemas: tuple[ActionSchema, ...]
+
+
+@dataclass(frozen=True)
+class MeetingOptionsDelivery:
+    """Gate-produced slots plus durable Telegram callback controls."""
+
+    result: MeetingOptionsResult
+    controls: tuple[MeetingOfferControl, ...] = ()
 
 
 class ActionCoordinator:
@@ -194,6 +207,15 @@ class ActionCoordinator:
         retention_seconds: int,
         discovery: ActionDiscovery,
     ) -> ActionResult:
+        if proposal.operation is Operation.MEETING_OPTIONS:
+            delivery = self.meeting_options(
+                message,
+                request_id,
+                proposal,
+                retention_seconds,
+                discovery,
+            )
+            return ActionResult(delivery.result.outcome, delivery.result.action_id)
         if discovery.authorization is None:
             return ActionResult("denied", "")
         if proposal.operation not in {action.operation for action in discovery.schemas}:
@@ -233,10 +255,120 @@ class ActionCoordinator:
             self.store.finish_action(result)
             return result
 
+    def meeting_options(
+        self,
+        message: InboundMessage,
+        request_id: str,
+        proposal: ActionProposal,
+        retention_seconds: int,
+        discovery: ActionDiscovery,
+    ) -> MeetingOptionsDelivery:
+        """Ask Gate for options, then bind each returned offer to one callback."""
+
+        denied = MeetingOptionsResult("denied", "")
+        if (
+            discovery.authorization is None
+            or proposal.operation is not Operation.MEETING_OPTIONS
+            or proposal.operation
+            not in {action.operation for action in discovery.schemas}
+        ):
+            return MeetingOptionsDelivery(denied)
+        subject = self.store.subject_ref(
+            message.connection_id, message.conversation_id, message.sender_id
+        )
+        with self._subject_lock(subject):
+            if not self._current_authorization(message, discovery):
+                return MeetingOptionsDelivery(denied)
+            binding = self.store.prepare_action(
+                message,
+                request_id,
+                proposal.operation,
+                proposal.arguments,
+                discovery.authorization.version,
+                discovery.authorization.revision,
+                retention_seconds,
+            )
+            self.gate.register_subject(
+                binding.subject_id,
+                {"request": request_id, "action": binding.action_id},
+            )
+            if not self._current_authorization(
+                message, discovery
+            ) or not self.gate.stage_action(binding):
+                self.store.finish_action(ActionResult("denied", binding.action_id))
+                return MeetingOptionsDelivery(
+                    MeetingOptionsResult("denied", binding.action_id)
+                )
+            if not self._current_authorization(message, discovery):
+                self.store.finish_action(ActionResult("denied", binding.action_id))
+                return MeetingOptionsDelivery(
+                    MeetingOptionsResult("denied", binding.action_id)
+                )
+            result = self.gate.meeting_options(binding)
+            self.store.finish_action(ActionResult(result.outcome, binding.action_id))
+            if result.outcome != "verified_success":
+                return MeetingOptionsDelivery(result)
+            controls = self.store.create_meeting_offer_controls(
+                message, binding, result.slots, retention_seconds
+            )
+            return MeetingOptionsDelivery(result, controls)
+
+    def select_meeting_offer(
+        self,
+        token: str,
+        *,
+        actor_id: int,
+        conversation_id: int,
+        connection_id: str,
+        origin_message_id: int,
+        callback_update_id: int,
+    ) -> ActionResult:
+        """Turn a delivered callback into a staged exact action.
+
+        Gate makes the only authority decision.  A denied direct claim stays
+        staged for the established controller exact-confirmation path.
+        """
+
+        binding = self.store.prepare_meeting_selection(
+            token,
+            actor_id=actor_id,
+            conversation_id=conversation_id,
+            connection_id=connection_id,
+            origin_message_id=origin_message_id,
+            callback_update_id=callback_update_id,
+        )
+        if binding is None:
+            return ActionResult("denied", "")
+        with self._subject_lock(binding.subject_id):
+            self.gate.register_subject(
+                binding.subject_id,
+                {"action": binding.action_id},
+            )
+            if not self.gate.stage_action(binding):
+                result = ActionResult("denied", binding.action_id)
+                self.store.finish_action(result)
+                return result
+            result = self.gate.submit_action(binding)
+            if result.outcome == "denied":
+                pending = ActionResult("awaiting_owner_confirmation", binding.action_id)
+                self.store.finish_action(pending)
+                return pending
+            self.store.finish_action(result)
+            return result
+
 
 DRY_RUN_ACCEPTED = {
     "en": "The requested action passed the dry-run policy check. No external provider was contacted.",
     "ru": "Запрошенное действие прошло проверку в тестовом режиме. Внешний сервис не вызывался.",
+}
+
+MEETING_OPTIONS_PROMPT = {
+    "en": "Choose one of these available times.",
+    "ru": "Выберите один из доступных вариантов времени.",
+}
+MEETING_OPTIONS_EMPTY = {
+    "en": "I could not find an available time in that window.",
+    "ru": "В этом диапазоне не нашлось свободного времени.",
 }
 
 
@@ -389,6 +521,34 @@ class ActionAssistantService(AssistantService):
                 self.config.processing_authorization_version,
             ):
                 return ProcessingResult("consent_stopped")
+            if turn.action_proposal.operation is Operation.MEETING_OPTIONS:
+                delivery = self.coordinator.meeting_options(
+                    message,
+                    self.store.action_request_id(message),
+                    turn.action_proposal,
+                    self.config.retention_seconds,
+                    discovery,
+                )
+                if delivery.result.outcome == "verified_success":
+                    language = _language(message.text)
+                    if delivery.controls:
+                        text = MEETING_OPTIONS_PROMPT[language]
+                        reply = self._meeting_options_reply(
+                            message, text, delivery.controls
+                        )
+                        outcome = "meeting_options_offered"
+                    else:
+                        text = MEETING_OPTIONS_EMPTY[language]
+                        reply = self._assistant_reply(message, text)
+                        outcome = "meeting_options_empty"
+                    self.store.add_assistant_context(
+                        message, text, self.config.retention_seconds
+                    )
+                    self.store.set_update_outcome(
+                        message.update_id, outcome, reply.reply_id
+                    )
+                    return ProcessingResult(outcome, reply)
+                return self._fallback_request(message, "action_denied")
             action_result = self.coordinator.submit(
                 message,
                 self.store.action_request_id(message),
@@ -430,3 +590,74 @@ class ActionAssistantService(AssistantService):
         outcome = "request_captured" if request_id is not None else turn.turn_kind
         self.store.set_update_outcome(message.update_id, outcome, reply.reply_id)
         return ProcessingResult(outcome, reply)
+
+    @staticmethod
+    def _meeting_option_label(control: MeetingOfferControl) -> str:
+        start = datetime.fromtimestamp(control.start_at, UTC)
+        end = datetime.fromtimestamp(control.end_at, UTC)
+        return f"{start:%a %d %b %H:%M} to {end:%H:%M} UTC"
+
+    def _meeting_options_reply(
+        self,
+        message: InboundMessage,
+        text: str,
+        controls: tuple[MeetingOfferControl, ...],
+    ) -> ReplyRecord:
+        language = _language(message.text)
+        revoke, delete = self.store.create_maintenance_controls(
+            message,
+            self.config.privacy_policy_version,
+            self.config.processing_authorization_version,
+            self.config.pending_ttl_seconds,
+        )
+        keyboard: list[list[dict[str, str]]] = [
+            [
+                {
+                    "text": self._meeting_option_label(control),
+                    "callback_data": control.callback_data,
+                }
+            ]
+            for control in controls
+        ]
+        keyboard.extend(
+            [
+                [
+                    {
+                        "text": "Revoke" if language == "en" else "Отозвать",
+                        "callback_data": revoke,
+                    },
+                    {
+                        "text": "Delete data" if language == "en" else "Удалить данные",
+                        "callback_data": delete,
+                    },
+                ],
+                [
+                    {
+                        "text": "Privacy" if language == "en" else "Конфиденциальность",
+                        "url": self.config.privacy_url,
+                    }
+                ],
+            ]
+        )
+        return self.store.create_reply(message, "meeting_options", text, keyboard)
+
+    def handle_meeting_offer(
+        self,
+        token: str,
+        *,
+        actor_id: int,
+        conversation_id: int,
+        connection_id: str,
+        origin_message_id: int,
+        callback_update_id: int,
+    ) -> str:
+        """Handle a delivered, sender-bound Calendar option callback."""
+
+        return self.coordinator.select_meeting_offer(
+            token,
+            actor_id=actor_id,
+            conversation_id=conversation_id,
+            connection_id=connection_id,
+            origin_message_id=origin_message_id,
+            callback_update_id=callback_update_id,
+        ).outcome

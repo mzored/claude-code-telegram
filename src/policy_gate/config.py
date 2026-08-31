@@ -39,6 +39,18 @@ def _uid(environment: Mapping[str, str], name: str) -> int:
     return value
 
 
+def _bounded_integer(
+    environment: Mapping[str, str], name: str, *, minimum: int, maximum: int
+) -> int:
+    try:
+        value = int(environment.get(name, ""))
+    except ValueError as exc:
+        raise GateConfigurationError(f"{name} must be numeric") from exc
+    if not minimum <= value <= maximum:
+        raise GateConfigurationError(f"{name} is outside its allowed range")
+    return value
+
+
 def _read_owner_file(path: Path, label: str, minimum_bytes: int) -> str:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -111,6 +123,26 @@ class GateConfig:
             raise GateConfigurationError("POLICY_GATE_CALENDAR_ENABLED must be 0 or 1")
         calendar = CalendarPolicy()
         if enabled_raw == "1":
+            calendar_credential_file = _absolute(
+                env, "POLICY_GATE_CALENDAR_CREDENTIAL_FILE"
+            ).resolve()
+            if (
+                calendar_credential_file == data_dir
+                or calendar_credential_file.is_relative_to(data_dir)
+                or calendar_credential_file == repository
+                or calendar_credential_file.is_relative_to(repository)
+                or calendar_credential_file == key_file
+            ):
+                raise GateConfigurationError(
+                    "Calendar credential must stay outside data, repository, and key paths"
+                )
+            working_day_values = tuple(
+                _bounded_integer({"day": item.strip()}, "day", minimum=0, maximum=6)
+                for item in env.get("POLICY_GATE_CALENDAR_WORKING_DAYS", "").split(",")
+                if item.strip()
+            )
+            if len(set(working_day_values)) != len(working_day_values):
+                raise GateConfigurationError("Calendar working days must be distinct")
             try:
                 calendar = CalendarPolicy(
                     enabled=True,
@@ -125,9 +157,38 @@ class GateConfig:
                         if item.strip()
                     ),
                     timezone=env.get("POLICY_GATE_CALENDAR_TIMEZONE", "").strip(),
-                    credential_file=_absolute(
-                        env, "POLICY_GATE_CALENDAR_CREDENTIAL_FILE"
-                    ).resolve(),
+                    working_days=frozenset(working_day_values),
+                    working_hour_start=_bounded_integer(
+                        env,
+                        "POLICY_GATE_CALENDAR_WORK_START_HOUR",
+                        minimum=0,
+                        maximum=23,
+                    ),
+                    working_hour_end=_bounded_integer(
+                        env, "POLICY_GATE_CALENDAR_WORK_END_HOUR", minimum=1, maximum=24
+                    ),
+                    grid_minutes=_bounded_integer(
+                        env, "POLICY_GATE_CALENDAR_GRID_MINUTES", minimum=1, maximum=60
+                    ),
+                    before_buffer_minutes=_bounded_integer(
+                        env,
+                        "POLICY_GATE_CALENDAR_BEFORE_BUFFER_MINUTES",
+                        minimum=0,
+                        maximum=240,
+                    ),
+                    after_buffer_minutes=_bounded_integer(
+                        env,
+                        "POLICY_GATE_CALENDAR_AFTER_BUFFER_MINUTES",
+                        minimum=0,
+                        maximum=240,
+                    ),
+                    offer_ttl_seconds=_bounded_integer(
+                        env,
+                        "POLICY_GATE_CALENDAR_OFFER_TTL_SECONDS",
+                        minimum=1,
+                        maximum=3600,
+                    ),
+                    credential_file=calendar_credential_file,
                 )
             except CalendarConfigurationError as exc:
                 raise GateConfigurationError(

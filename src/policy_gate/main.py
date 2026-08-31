@@ -75,11 +75,12 @@ def run() -> None:
     if controller_pid <= 0:
         raise ValueError("POLICY_GATE_CONTROLLER_PID must be a positive integer")
     store = GateStore(config.data_dir / "gate.db", config.read_database_key())
-    calendar_api = (
-        GoogleCalendarApi(config.read_calendar_credentials())
-        if config.calendar.enabled
-        else None
-    )
+    calendar_api = None
+    if config.calendar.enabled:
+        calendar_api = GoogleCalendarApi(config.read_calendar_credentials())
+        # Enabled mode fails before binding the IPC listener unless the fixed
+        # refresh grant proves the exact Calendar scopes we require.
+        calendar_api.validate_startup()
     policy = PolicyConfig(
         enabled_operations=(
             frozenset({Operation.MEETING_OPTIONS, Operation.MEETING_SCHEDULE})
