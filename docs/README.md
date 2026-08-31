@@ -10,7 +10,9 @@ Quick links to every doc in this project. Start with the [README](../README.md) 
 | [Configuration](configuration.md) | Full environment variable reference, feature flags, and Pydantic Settings internals |
 | [Available Tools](tools.md) | The 16 tools Claude can use, allowlist/disallowlist config, and ToolMonitor behaviour |
 | [Development](development.md) | Local dev setup, running tests, linting, project structure, and contribution workflow |
-| [Systemd Setup](../SYSTEMD_SETUP.md) | Running the bot as a persistent systemd user service |
+| [Fork Workflow](fork-workflow.md) | Local macOS development and fork remote policy |
+| [Deployment](deployment.md) | Deploy-only mybots setup, exact-commit deploys, and rollback |
+| [Systemd Setup](../SYSTEMD_SETUP.md) | Pointer to the tracked production unit and deployment guide |
 
 ## Project
 

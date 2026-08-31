@@ -1,0 +1,19 @@
+[Unit]
+Description=assist-ai-bot (claude-code-telegram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/assist-ai/bot
+ExecStart=%h/projects/assist-ai/bot/.venv/bin/python -m src.main
+Restart=on-failure
+RestartSec=10
+MemoryHigh=300M
+MemoryMax=400M
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
