@@ -199,6 +199,39 @@ class PolicyGateService:
             )
         return True
 
+    def stage_owner_exact_action(
+        self, request_reference: TrustedReference, binding: ActionBinding
+    ) -> bool:
+        """Stage one owner-authored Unit 4 task from an existing request reference.
+
+        The controller cannot register arbitrary subjects or stage a generic public
+        proposal. This narrow method binds one task-create action to the already
+        registered request before reusing the normal immutable candidate path.
+        """
+
+        if (
+            request_reference.kind != "request"
+            or binding.operation is not Operation.TASK_CREATE
+            or binding.request_id != request_reference.value
+            or not binding.verify()
+            or not self._validate_arguments(binding)
+        ):
+            return False
+        try:
+            subject_id = self._resolve(request_reference)
+        except ValueError:
+            return False
+        if subject_id != binding.subject_id:
+            return False
+        try:
+            self.register_subject(
+                binding.subject_id,
+                {"action": binding.action_id},
+            )
+        except ValueError:
+            return False
+        return self.stage_action(binding)
+
     def _hydrate_exact_draft(
         self, reference: TrustedReference, subject_id: str, draft: AdminDraft
     ) -> AdminDraft:
@@ -696,6 +729,39 @@ class PolicyGateService:
                     )
             return AdminResult("executed", action_result)
         return AdminResult("applied")
+
+    def exact_intent_execution_started(
+        self,
+        intent_id: str,
+        owner_id: int,
+        control_chat_id: int,
+        preview_message_id: int,
+    ) -> bool:
+        """Report only whether one exact intent crossed its immutable commit point."""
+
+        row = self.store.database.execute(
+            """SELECT kind, payload_json, state, owner_id, control_chat_id,
+                      preview_message_id
+               FROM administration_intents WHERE intent_id=?""",
+            (intent_id,),
+        ).fetchone()
+        if row is None or (
+            int(row["owner_id"]) != owner_id
+            or int(row["control_chat_id"]) != control_chat_id
+            or int(row["preview_message_id"]) != preview_message_id
+            or str(row["kind"]) != AdminKind.GRANT.value
+            or str(row["state"]) not in {"executing", "applied"}
+        ):
+            return False
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return (
+            isinstance(payload, dict)
+            and payload.get("scope") == Scope.EXACT.value
+            and isinstance(payload.get("exact_binding"), dict)
+        )
 
     def subject_blocked(self, subject_id: str) -> bool:
         row = self.store.database.execute(

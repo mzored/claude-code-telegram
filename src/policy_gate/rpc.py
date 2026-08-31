@@ -432,6 +432,30 @@ class GateRpcDispatcher:
                 fields = _object(payload, frozenset({"subject_id"}))
                 return self.service.erase_subject(_text(fields["subject_id"]))
         elif request.role == "controller":
+            if operation == "stage_owner_exact_action":
+                fields = _object(payload, frozenset({"request_reference", "binding"}))
+                return self.service.stage_owner_exact_action(
+                    _reference_from_wire(fields["request_reference"]),
+                    _action_from_wire(fields["binding"]),
+                )
+            if operation == "exact_intent_execution_started":
+                fields = _object(
+                    payload,
+                    frozenset(
+                        {
+                            "intent_id",
+                            "owner_id",
+                            "control_chat_id",
+                            "preview_message_id",
+                        }
+                    ),
+                )
+                return self.service.exact_intent_execution_started(
+                    _text(fields["intent_id"]),
+                    owner_id=_integer(fields["owner_id"]),
+                    control_chat_id=_integer(fields["control_chat_id"]),
+                    preview_message_id=_integer(fields["preview_message_id"]),
+                )
             if operation == "prepare_admin":
                 fields = _object(
                     payload,
@@ -870,6 +894,42 @@ class ControllerGateRpcClient(_GateRpcClient):
                     "control_chat_id": control_chat_id,
                     "preview_message_id": preview_message_id,
                     "ttl_seconds": ttl_seconds,
+                },
+            )
+        )
+
+    def stage_owner_exact_action(
+        self, request_reference: TrustedReference, binding: ActionBinding
+    ) -> bool:
+        """Stage the one exact Unit 4 action the controller may prepare."""
+
+        return _boolean(
+            self._call(
+                "stage_owner_exact_action",
+                {
+                    "request_reference": _reference_to_wire(request_reference),
+                    "binding": _action_to_wire(binding),
+                },
+            )
+        )
+
+    def exact_intent_execution_started(
+        self,
+        intent_id: str,
+        owner_id: int,
+        control_chat_id: int,
+        preview_message_id: int,
+    ) -> bool:
+        """Check recovery state without exposing an intent payload."""
+
+        return _boolean(
+            self._call(
+                "exact_intent_execution_started",
+                {
+                    "intent_id": intent_id,
+                    "owner_id": owner_id,
+                    "control_chat_id": control_chat_id,
+                    "preview_message_id": preview_message_id,
                 },
             )
         )

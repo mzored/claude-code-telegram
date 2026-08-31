@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
+from src.external_read import ExternalRecord, ExternalRecordRef, ExternalSource
 from src.policy_gate.types import ActionBinding, ActionResult, Operation, canonical_json
 from src.public_assistant.inbox import Unit2Store
 from src.public_assistant.types import InboundMessage
@@ -229,6 +230,37 @@ class Unit3Store(Unit2Store):
             str(row["version"]),
             int(row["revision"]),
             purposes,
+        )
+
+    def resolve_external_inbox(
+        self, reference: ExternalRecordRef
+    ) -> ExternalRecord | None:
+        """Resolve one unexpired Inbox body for the isolated Unit 4 broker only."""
+
+        if reference.source is not ExternalSource.INBOX:
+            return None
+        row = self.public.execute(
+            """SELECT inbox.request_id, inbox.subject_ref, inbox.connection_id,
+                      inbox.conversation_id, inbox.source_update_id, inbox.body,
+                      receipt.version, receipt.revision
+               FROM inbox_requests AS inbox
+               JOIN integration_processing_receipts AS receipt
+                 ON receipt.subject_ref=inbox.subject_ref AND receipt.state='active'
+               WHERE inbox.request_id=? AND inbox.state='open' AND inbox.expires_at>?""",
+            (reference.value, self.now()),
+        ).fetchone()
+        if row is None:
+            return None
+        return ExternalRecord.create(
+            reference,
+            subject_id=str(row["subject_ref"]),
+            connection_id=str(row["connection_id"]),
+            conversation_id=int(row["conversation_id"]),
+            update_id=int(row["source_update_id"]),
+            request_id=str(row["request_id"]),
+            processing_authorization_version=str(row["version"]),
+            processing_authorization_revision=int(row["revision"]),
+            content=str(row["body"]),
         )
 
     def active_erasure_subjects(self) -> tuple[str, ...]:

@@ -1,6 +1,7 @@
 """Test Claude SDK integration."""
 
 import asyncio
+import json
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -157,6 +158,61 @@ class TestClaudeSDKManager:
             # Restore original env var
             if original_api_key:
                 os.environ["ANTHROPIC_API_KEY"] = original_api_key
+
+    def test_sdk_rechecks_unit4_todoist_lockdown_before_constructing_client(
+        self, tmp_path
+    ):
+        config = Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            private_controller_enabled=True,
+            private_controller_owner_id=123,
+            private_controller_control_chat_id=123,
+            private_controller_gate_socket_path=tmp_path / "gate.sock",
+            private_controller_external_read_enabled=True,
+            private_controller_external_read_socket_path=tmp_path / "external.sock",
+            private_controller_todoist_adapter_enabled=True,
+            allowed_users=[123],
+            claude_allowed_tools=["Read", "Grep"],
+        )
+        object.__setattr__(config, "disable_tool_validation", True)
+
+        with pytest.raises(ValueError, match="disable_tool_validation"):
+            ClaudeSDKManager(config)
+
+    async def test_sdk_rejects_a_direct_todoist_mcp_file_changed_after_startup(
+        self, tmp_path
+    ):
+        mcp_path = tmp_path / "mcp.json"
+        mcp_path.write_text(
+            json.dumps({"mcpServers": {"safe": {"command": "safe-mcp"}}}),
+            encoding="utf-8",
+        )
+        config = Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            private_controller_enabled=True,
+            private_controller_owner_id=123,
+            private_controller_control_chat_id=123,
+            private_controller_gate_socket_path=tmp_path / "gate.sock",
+            private_controller_external_read_enabled=True,
+            private_controller_external_read_socket_path=tmp_path / "external.sock",
+            private_controller_todoist_adapter_enabled=True,
+            allowed_users=[123],
+            claude_allowed_tools=["Read", "Grep"],
+            enable_mcp=True,
+            mcp_config_path=mcp_path,
+        )
+        manager = ClaudeSDKManager(config)
+        mcp_path.write_text(
+            json.dumps({"mcpServers": {"todoist": {"command": "direct"}}}),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="direct Todoist MCP"):
+            await manager.execute_command("safe", tmp_path)
 
     async def test_execute_command_success(self, sdk_manager):
         """Test successful command execution."""

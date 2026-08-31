@@ -110,6 +110,44 @@ def test_private_controller_is_disabled_by_default_and_requires_one_owner_chat(
         )
 
 
+def test_external_read_requires_the_filtered_adapter_and_no_direct_todoist_path(
+    tmp_path,
+):
+    base = {
+        "telegram_bot_token": "test:token",
+        "telegram_bot_username": "testbot",
+        "approved_directory": tmp_path,
+        "private_controller_enabled": True,
+        "private_controller_owner_id": 123,
+        "private_controller_control_chat_id": 123,
+        "private_controller_gate_socket_path": tmp_path / "gate.sock",
+        "private_controller_external_read_enabled": True,
+        "private_controller_external_read_socket_path": tmp_path / "external.sock",
+        "private_controller_todoist_adapter_enabled": True,
+        "allowed_users": [123],
+        "claude_allowed_tools": ["Read", "Grep"],
+    }
+    settings = Settings(**base)
+    assert settings.private_controller_external_read_enabled is True
+    with pytest.raises(ValueError, match="disable_tool_validation"):
+        Settings(**base, disable_tool_validation=True)
+    with pytest.raises(ValueError, match="direct Todoist Claude tools"):
+        Settings(**{**base, "claude_allowed_tools": ["Read", "TodoRead"]})
+    with pytest.raises(ValueError, match="filtered Todoist adapter"):
+        Settings(**{**base, "private_controller_todoist_adapter_enabled": False})
+    direct_mcp = tmp_path / "direct-todoist.json"
+    direct_mcp.write_text(
+        '{"mcpServers":{"todoist":{"command":"todoist-mcp"}}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="direct Todoist MCP"):
+        Settings(
+            **base,
+            enable_mcp=True,
+            mcp_config_path=direct_mcp,
+        )
+
+
 def test_security_relaxation_settings_defaults_and_overrides():
     """Security relaxation settings should default to False and be configurable."""
     with tempfile.TemporaryDirectory() as tmp_dir:

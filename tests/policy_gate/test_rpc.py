@@ -266,3 +266,98 @@ def test_mocked_gate_process_enforces_rpc_and_peer_boundary(tmp_path: Path) -> N
             assert results.get(timeout=3) == 1
         except Empty:
             pytest.fail("Policy Gate process did not report executor calls")
+
+
+def test_exact_external_stage_is_controller_only_and_preserves_binding(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    stop = context.Event()
+    results = context.Queue()
+    with tempfile.TemporaryDirectory(
+        prefix="pg-u4-", dir=str(Path("/tmp").resolve())
+    ) as run_dir:
+        socket_path = (Path(run_dir) / "g.sock").resolve(strict=False)
+        process = context.Process(
+            target=_serve_gate_process,
+            args=(
+                str(socket_path),
+                str(tmp_path / "rpc-gate-u4.db"),
+                os.getpid(),
+                os.getgid(),
+                ready,
+                stop,
+                results,
+            ),
+        )
+        process.start()
+        try:
+            assert ready.wait(10), "Policy Gate did not bind its Unix socket"
+            public = PublicGateRpcClient(socket_path)
+            public.register_subject(
+                "subject-u4",
+                {"request": "REQ-EXTERNAL-RPC-A"},
+            )
+            assert public.activate_receipt(
+                "subject-u4",
+                "integration-v2",
+                2,
+                {"Todoist": ("external task creation",)},
+            )
+            binding = ActionBinding.create(
+                subject_id="subject-u4",
+                connection_id="connection-u4",
+                conversation_id=202002,
+                update_id=41,
+                request_id="REQ-EXTERNAL-RPC-A",
+                operation=Operation.TASK_CREATE,
+                arguments={"title": "Owner-only exact task", "due_date": None},
+                processing_authorization_version="integration-v2",
+                processing_authorization_revision=2,
+                processor_purpose="external task creation",
+            )
+            rejected_public = {
+                "version": 1,
+                "role": "public",
+                "operation": "stage_owner_exact_action",
+                "payload": {
+                    "request_reference": {
+                        "kind": "request",
+                        "value": "REQ-EXTERNAL-RPC-A",
+                    },
+                    "binding": binding.as_dict(),
+                },
+            }
+            assert _raw_request(
+                socket_path,
+                canonical_json(rejected_public).encode("utf-8") + b"\n",
+            ) == {"error": "unauthorized", "ok": False}
+
+            controller = ControllerGateRpcClient(socket_path)
+            assert controller.stage_owner_exact_action(
+                TrustedReference("request", "REQ-EXTERNAL-RPC-A"), binding
+            )
+            preview = controller.prepare_admin(
+                TrustedReference("action", binding.action_id),
+                AdminDraft(AdminKind.GRANT, scope=Scope.EXACT),
+                owner_id=101001,
+                control_chat_id=101001,
+                preview_message_id=90,
+            )
+            result = controller.confirm_admin(
+                preview.intent_id,
+                owner_id=101001,
+                control_chat_id=101001,
+                preview_message_id=90,
+            )
+            assert result.outcome == "executed"
+            controller.close()
+        finally:
+            stop.set()
+            process.join(10)
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+        assert process.exitcode == 0
+        assert results.get(timeout=3) == 1

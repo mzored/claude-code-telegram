@@ -45,6 +45,31 @@ def _positive_float(environment: Mapping[str, str], name: str) -> float:
     return value
 
 
+def _strict_bool(
+    environment: Mapping[str, str], name: str, *, default: bool = False
+) -> bool:
+    raw = environment.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().casefold()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise PublicAssistantConfigurationError(f"{name} must be true or false")
+
+
+def _nonnegative_int(environment: Mapping[str, str], name: str) -> int:
+    raw = _required(environment, name)
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise PublicAssistantConfigurationError(f"{name} must be an integer") from exc
+    if value < 0:
+        raise PublicAssistantConfigurationError(f"{name} must be non-negative")
+    return value
+
+
 def _credential_path(environment: Mapping[str, str], name: str) -> Path:
     path = Path(_required(environment, name))
     if not path.is_absolute():
@@ -434,3 +459,68 @@ class Unit3Config:
                 "Policy Gate socket must stay outside public data"
             )
         return cls(True, socket_path)
+
+
+@dataclass(frozen=True)
+class Unit4Config:
+    """Optional Public Assistant-owned broker, disabled until deployment enables it."""
+
+    enabled: bool = False
+    socket_path: Path | None = None
+    controller_uid: int | None = None
+    controller_pid: int | None = None
+    client_gid: int | None = None
+    processor_authorized: bool = False
+
+    @classmethod
+    def from_environment(
+        cls,
+        base: PublicAssistantConfig,
+        environment: Mapping[str, str] | None = None,
+    ) -> "Unit4Config":
+        env = os.environ if environment is None else environment
+        enabled = _strict_bool(env, "PUBLIC_ASSISTANT_EXTERNAL_READ_ENABLED")
+        names = (
+            "PUBLIC_ASSISTANT_EXTERNAL_READ_SOCKET_PATH",
+            "PUBLIC_ASSISTANT_EXTERNAL_READ_CONTROLLER_UID",
+            "PUBLIC_ASSISTANT_EXTERNAL_READ_CONTROLLER_PID",
+            "PUBLIC_ASSISTANT_EXTERNAL_READ_CLIENT_GID",
+            "PUBLIC_ASSISTANT_EXTERNAL_READ_PROCESSOR_AUTHORIZED",
+        )
+        if not enabled:
+            if any(env.get(name, "").strip() for name in names):
+                raise PublicAssistantConfigurationError(
+                    "external read settings require the Unit 4 boundary to be enabled"
+                )
+            return cls()
+        socket_path = Path(_required(env, "PUBLIC_ASSISTANT_EXTERNAL_READ_SOCKET_PATH"))
+        if not socket_path.is_absolute():
+            raise PublicAssistantConfigurationError(
+                "external read socket must be absolute"
+            )
+        socket_path = socket_path.resolve(strict=False)
+        if socket_path == base.data_dir or socket_path.is_relative_to(base.data_dir):
+            raise PublicAssistantConfigurationError(
+                "external read socket must stay outside public data"
+            )
+        processor_authorized = _strict_bool(
+            env, "PUBLIC_ASSISTANT_EXTERNAL_READ_PROCESSOR_AUTHORIZED"
+        )
+        if processor_authorized:
+            raise PublicAssistantConfigurationError(
+                "current processor authorization does not cover external inspection"
+            )
+        return cls(
+            enabled=True,
+            socket_path=socket_path,
+            controller_uid=_nonnegative_int(
+                env, "PUBLIC_ASSISTANT_EXTERNAL_READ_CONTROLLER_UID"
+            ),
+            controller_pid=_positive_int(
+                env, "PUBLIC_ASSISTANT_EXTERNAL_READ_CONTROLLER_PID"
+            ),
+            client_gid=_nonnegative_int(
+                env, "PUBLIC_ASSISTANT_EXTERNAL_READ_CLIENT_GID"
+            ),
+            processor_authorized=False,
+        )

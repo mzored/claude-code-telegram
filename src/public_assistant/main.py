@@ -8,7 +8,9 @@ import logging
 import os
 import re
 import sys
+import threading
 
+from src.external_read import ExternalSource
 from src.policy_gate.rpc import PublicGateRpcClient
 from src.public_assistant.action_store import Unit3Store
 from src.public_assistant.actions import ActionAssistantService, ActionCoordinator
@@ -17,8 +19,16 @@ from src.public_assistant.config import (
     PublicAssistantConfigurationError,
     Unit2Config,
     Unit3Config,
+    Unit4Config,
 )
 from src.public_assistant.conversation import AssistantService
+from src.public_assistant.external_read import (
+    ExternalReadBroker,
+    ExternalReadBrokerServer,
+    InboxExternalRecordResolver,
+    ModelExternalAnalyzer,
+    MultiplexedExternalRecordResolver,
+)
 from src.public_assistant.inbox import Unit2Store
 from src.public_assistant.model import OpenAIResponsesModel
 from src.public_assistant.privacy_log import PrivacyLog
@@ -93,6 +103,11 @@ def _run() -> None:
     config = PublicAssistantConfig.from_environment()
     unit2_config = Unit2Config.from_environment(config)
     unit3_config = Unit3Config.from_environment(config)
+    unit4_config = Unit4Config.from_environment(config)
+    if unit4_config.enabled and not unit3_config.enabled:
+        raise PublicAssistantConfigurationError(
+            "external read requires the Unit 3 trusted-request boundary"
+        )
     credentials = config.load_runtime_credentials()
     openai_api_key = unit2_config.read_openai_api_key()
     if openai_api_key.encode() in {
@@ -148,9 +163,51 @@ def _run() -> None:
     application, adapter = build_application(
         config, service, store, credentials.bot_token
     )
+    broker: ExternalReadBrokerServer | None = None
+    broker_thread: threading.Thread | None = None
+    broker_stop = threading.Event()
+    if unit4_config.enabled:
+        if not isinstance(store, Unit3Store):
+            raise PublicAssistantConfigurationError(
+                "external read requires Unit 3 store"
+            )
+        if (
+            unit4_config.socket_path is None
+            or unit4_config.controller_uid is None
+            or unit4_config.controller_pid is None
+            or unit4_config.client_gid is None
+        ):
+            raise PublicAssistantConfigurationError(
+                "external read broker is incomplete"
+            )
+        broker = ExternalReadBrokerServer(
+            ExternalReadBroker(
+                MultiplexedExternalRecordResolver(
+                    {ExternalSource.INBOX: InboxExternalRecordResolver(store)}
+                ),
+                ModelExternalAnalyzer(model),
+                processor_authorized=unit4_config.processor_authorized,
+            ),
+            unit4_config.socket_path,
+            controller_uid=unit4_config.controller_uid,
+            controller_pid=unit4_config.controller_pid,
+            client_gid=unit4_config.client_gid,
+        )
+        broker_thread = threading.Thread(
+            target=broker.serve_forever,
+            args=(broker_stop,),
+            name="public-external-read-broker",
+            daemon=True,
+        )
+        broker_thread.start()
     try:
         asyncio.run(DurablePollingRunner(application, adapter, store).run())
     finally:
+        broker_stop.set()
+        if broker is not None:
+            broker.close()
+        if broker_thread is not None:
+            broker_thread.join(timeout=2)
         store.close()
 
 

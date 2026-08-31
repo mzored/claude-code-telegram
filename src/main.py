@@ -30,6 +30,7 @@ from src.private_controller.interpreter import DeterministicIntentInterpreter
 from src.private_controller.origin import RunOriginLedger, origin_ledger_key
 from src.private_controller.service import PrivateControllerService
 from src.projects import ProjectThreadManager, load_project_registry
+from src.public_assistant.external_read import ExternalReadRpcClient
 from src.scheduler.scheduler import JobScheduler
 from src.security.audit import AuditLogger, InMemoryAuditStorage
 from src.security.auth import (
@@ -195,12 +196,22 @@ async def create_application(config: Settings) -> Dict[str, Any]:
             or config.private_controller_control_chat_id is None
         ):
             raise ConfigurationError("Private controller owner boundary is missing")
+        external_reads = None
+        if config.private_controller_external_read_enabled:
+            if config.private_controller_external_read_socket_path is None:
+                raise ConfigurationError(
+                    "Private controller external-read socket is missing"
+                )
+            external_reads = ExternalReadRpcClient(
+                config.private_controller_external_read_socket_path
+            )
         private_controller = PrivateControllerService(
             ControllerGateRpcClient(config.private_controller_gate_socket_path),
             run_origins,
             DeterministicIntentInterpreter(),
             config.private_controller_owner_id,
             config.private_controller_control_chat_id,
+            external_reads=external_reads,
         )
 
     # --- Event bus and agentic platform components ---
@@ -234,6 +245,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "claude_integration": claude_integration,
         "storage": storage,
         "event_bus": event_bus,
+        "private_controller": private_controller,
         "project_registry": None,
         "project_threads_manager": None,
     }

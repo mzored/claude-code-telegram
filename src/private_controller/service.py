@@ -2,15 +2,31 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Callable, Protocol
 
+from src.external_read import (
+    ExternalInspection,
+    ExternalReadClient,
+    ExternalReadError,
+    ExternalRecordRef,
+    ExternalSourceMetadata,
+)
 from src.policy_gate.types import (
+    ActionBinding,
     AdminDraft,
+    AdminKind,
     AdminResult,
+    Operation,
     PreparedIntent,
+    Scope,
     TrustedReference,
 )
-from src.private_controller.origin import RunOrigin, RunOriginLedger
+from src.private_controller.origin import (
+    PersistedRun,
+    RunOrigin,
+    RunOriginLedger,
+    RunSource,
+)
 
 
 class IntentInterpreter(Protocol):
@@ -40,6 +56,18 @@ class ControllerGateClient(Protocol):
         preview_message_id: int,
     ) -> AdminResult: ...
 
+    def stage_owner_exact_action(
+        self, request_reference: TrustedReference, binding: ActionBinding
+    ) -> bool: ...
+
+    def exact_intent_execution_started(
+        self,
+        intent_id: str,
+        owner_id: int,
+        control_chat_id: int,
+        preview_message_id: int,
+    ) -> bool: ...
+
 
 class PrivateControllerService:
     """Resolve identity locally; the interpreter can propose scope only."""
@@ -51,6 +79,8 @@ class PrivateControllerService:
         interpreter: IntentInterpreter,
         owner_id: int,
         control_chat_id: int,
+        *,
+        external_reads: ExternalReadClient | None = None,
     ) -> None:
         if owner_id <= 0 or control_chat_id <= 0:
             raise ValueError("one explicit owner and control chat are required")
@@ -59,15 +89,9 @@ class PrivateControllerService:
         self.interpreter = interpreter
         self.owner_id = owner_id
         self.control_chat_id = control_chat_id
+        self.external_reads = external_reads
 
-    def prepare(
-        self,
-        run_id: str,
-        reference: TrustedReference,
-        instruction: str,
-        *,
-        preview_message_id: int,
-    ) -> PreparedIntent:
+    def _require_fresh_direct_owner(self, run_id: str) -> PersistedRun:
         run = self.runs.require(run_id)
         if (
             run.origin is not RunOrigin.DIRECT_OWNER
@@ -77,9 +101,25 @@ class PrivateControllerService:
             or run.actor_id != self.owner_id
             or run.chat_id != self.control_chat_id
         ):
-            raise PermissionError(
-                "only a fresh direct-owner run may draft administration"
-            )
+            raise PermissionError("only a fresh direct-owner run may use this control")
+        return run
+
+    def _require_fresh_external_owner(self, run_id: str) -> None:
+        """Accept only a new Telegram command, never a session or callback path."""
+
+        run = self._require_fresh_direct_owner(run_id)
+        if run.source is not RunSource.TELEGRAM or run.resumed_session:
+            raise PermissionError("external control requires a fresh owner message")
+
+    def prepare(
+        self,
+        run_id: str,
+        reference: TrustedReference,
+        instruction: str,
+        *,
+        preview_message_id: int,
+    ) -> PreparedIntent:
+        self._require_fresh_direct_owner(run_id)
         if not instruction.strip():
             raise ValueError("owner instruction is empty")
         draft = self.interpreter.draft(instruction)
@@ -93,13 +133,143 @@ class PrivateControllerService:
         self.runs.link_intent(prepared.intent_id, run_id)
         return prepared
 
+    def _external_reads(self) -> ExternalReadClient:
+        if self.external_reads is None:
+            raise ValueError("external inspection is disabled")
+        return self.external_reads
+
+    def inspect_external(
+        self, run_id: str, reference: ExternalRecordRef
+    ) -> ExternalInspection:
+        """Inspect one exact hostile record without invoking the private agent."""
+
+        self._require_fresh_external_owner(run_id)
+        self.runs.claim_external_control(run_id)
+        return self._external_reads().inspect(reference)
+
+    @staticmethod
+    def _owner_task_arguments(title: str) -> dict[str, object]:
+        if not isinstance(title, str):
+            raise ValueError("owner task title is invalid")
+        normalized = title.strip()
+        if not normalized or len(normalized) > 200:
+            raise ValueError("owner task title is invalid")
+        return {"title": normalized, "due_date": None}
+
+    def _exact_external_binding(
+        self, metadata: ExternalSourceMetadata, title: str
+    ) -> ActionBinding:
+        return ActionBinding.create(
+            subject_id=metadata.subject_id,
+            connection_id=metadata.connection_id,
+            conversation_id=metadata.conversation_id,
+            update_id=metadata.update_id,
+            request_id=metadata.request_id,
+            operation=Operation.TASK_CREATE,
+            arguments=self._owner_task_arguments(title),
+            processing_authorization_version=metadata.processing_authorization_version,
+            processing_authorization_revision=(
+                metadata.processing_authorization_revision
+            ),
+            processor_purpose="external task creation",
+        )
+
+    def prepare_external(
+        self,
+        run_id: str,
+        reference: ExternalRecordRef,
+        owner_task_title: str,
+        *,
+        preview_message_id: int,
+        crash_hook: Callable[[str], None] | None = None,
+    ) -> PreparedIntent:
+        """Stage exactly one owner-authored task from current trusted metadata."""
+
+        self._require_fresh_external_owner(run_id)
+        self.runs.claim_external_control(run_id)
+        metadata = self._external_reads().validate_for_prepare(reference)
+        if metadata.reference != reference:
+            raise PermissionError("external source reference is invalid")
+        binding = self._exact_external_binding(metadata, owner_task_title)
+        if not self.gate.stage_owner_exact_action(
+            TrustedReference("request", metadata.request_id), binding
+        ):
+            raise PermissionError("exact external action was rejected")
+        prepared = self.gate.prepare_admin(
+            TrustedReference("action", binding.action_id),
+            AdminDraft(AdminKind.GRANT, scope=Scope.EXACT),
+            owner_id=self.owner_id,
+            control_chat_id=self.control_chat_id,
+            preview_message_id=preview_message_id,
+        )
+        if crash_hook is not None:
+            crash_hook("after_gate_preview")
+        self.runs.link_external_intent(
+            prepared.intent_id,
+            run_id,
+            reference,
+            metadata,
+        )
+        return prepared
+
     def confirm(
-        self, run_id: str, intent_id: str, preview_message_id: int
+        self,
+        run_id: str,
+        intent_id: str,
+        preview_message_id: int,
+        *,
+        external_reference: ExternalRecordRef | None = None,
     ) -> AdminResult:
-        self.runs.require_second_fresh_control(intent_id, run_id)
-        return self.gate.confirm_admin(
+        confirmation = self.runs.require_second_fresh_control(intent_id, run_id)
+        external_intent = self.runs.has_external_link(intent_id)
+        if external_intent:
+            if external_reference is None:
+                raise PermissionError("external source reference is required")
+            if (
+                confirmation.source is not RunSource.TELEGRAM
+                or confirmation.resumed_session
+            ):
+                raise PermissionError("external control requires a fresh owner message")
+            self.runs.claim_external_control(run_id)
+            try:
+                metadata = self._external_reads().validate_for_prepare(
+                    external_reference
+                )
+                self.runs.require_external_source_link(
+                    intent_id,
+                    external_reference,
+                    metadata,
+                )
+            except (ExternalReadError, PermissionError) as source_error:
+                # Once Gate committed the exact immutable intent, a retry resumes
+                # its journal. It never rebuilds or reparses a source record.
+                try:
+                    execution_started = self.gate.exact_intent_execution_started(
+                        intent_id,
+                        self.owner_id,
+                        self.control_chat_id,
+                        preview_message_id,
+                    )
+                except Exception:
+                    raise source_error from None
+                if not execution_started:
+                    raise source_error
+        elif external_reference is not None:
+            raise PermissionError("administration intent is not an external action")
+        result = self.gate.confirm_admin(
             intent_id,
             owner_id=self.owner_id,
             control_chat_id=self.control_chat_id,
             preview_message_id=preview_message_id,
         )
+        if external_intent and (
+            result.outcome == "applied"
+            or (
+                result.outcome == "executed"
+                and result.action_result is not None
+                and result.action_result.outcome
+                in {"verified_success", "replayed_success"}
+            )
+        ):
+            self.runs.mark_external_terminal(intent_id)
+        return result

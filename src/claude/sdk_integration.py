@@ -256,6 +256,9 @@ class ClaudeSDKManager:
         """Initialize SDK manager with configuration."""
         self.config = config
         self.security_validator = security_validator
+        # Settings validates this too, but the SDK owns the last line of defense.
+        # A mutated or hand-built config must not reopen direct Todoist reads.
+        self.config.assert_external_read_lockdown()
 
         # Set up environment for Claude Code SDK if API key is provided
         # If no API key is provided, the SDK will use existing CLI authentication
@@ -298,6 +301,7 @@ class ClaudeSDKManager:
         images: Optional[List[Dict[str, str]]] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
+        self.config.assert_external_read_lockdown()
         start_time = asyncio.get_event_loop().time()
 
         logger.info(
@@ -823,8 +827,18 @@ class ClaudeSDKManager:
         try:
             with open(config_path) as f:
                 config_data = json.load(f)
+            if self.config.private_controller_external_read_enabled:
+                encoded = json.dumps(config_data, sort_keys=True).casefold()
+                if (
+                    "todoist" in encoded
+                    or "todo read" in encoded
+                    or "todo write" in encoded
+                ):
+                    raise ValueError(
+                        "external read forbids direct Todoist MCP configuration"
+                    )
             return config_data.get("mcpServers", {})
-        except (json.JSONDecodeError, OSError) as e:
+        except (json.JSONDecodeError, OSError, ValueError) as e:
             logger.error(
                 "Failed to load MCP config", path=str(config_path), error=str(e)
             )
