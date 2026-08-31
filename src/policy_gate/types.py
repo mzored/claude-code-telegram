@@ -387,6 +387,15 @@ class ActionResult:
 
 
 @dataclass(frozen=True)
+class MeetingOptionsResult:
+    """Safe Calendar output.  Busy data never crosses the Gate boundary."""
+
+    outcome: str
+    action_id: str
+    slots: tuple[tuple[str, int, int, int], ...] = ()
+
+
+@dataclass(frozen=True)
 class ActionSchema:
     operation: Operation
     arguments_schema: Mapping[str, object]

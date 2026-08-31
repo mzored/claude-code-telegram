@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from src.policy_gate.calendar import (
+    CalendarConfigurationError,
+    CalendarCredentials,
+    CalendarPolicy,
+)
+
 
 class GateConfigurationError(ValueError):
     """Policy Gate cannot start with an unsafe local boundary."""
@@ -66,6 +72,7 @@ class GateConfig:
     public_uid: int
     controller_uid: int
     client_gid: int
+    calendar: CalendarPolicy = CalendarPolicy()
 
     @classmethod
     def from_environment(
@@ -99,6 +106,33 @@ class GateConfig:
             raise GateConfigurationError(
                 "public and controller processes need separate UIDs"
             )
+        enabled_raw = env.get("POLICY_GATE_CALENDAR_ENABLED", "0").strip()
+        if enabled_raw not in {"0", "1"}:
+            raise GateConfigurationError("POLICY_GATE_CALENDAR_ENABLED must be 0 or 1")
+        calendar = CalendarPolicy()
+        if enabled_raw == "1":
+            try:
+                calendar = CalendarPolicy(
+                    enabled=True,
+                    booking_calendar_id=env.get(
+                        "POLICY_GATE_CALENDAR_BOOKING_ID", ""
+                    ).strip(),
+                    availability_calendar_ids=tuple(
+                        item.strip()
+                        for item in env.get(
+                            "POLICY_GATE_CALENDAR_AVAILABILITY_IDS", ""
+                        ).split(",")
+                        if item.strip()
+                    ),
+                    timezone=env.get("POLICY_GATE_CALENDAR_TIMEZONE", "").strip(),
+                    credential_file=_absolute(
+                        env, "POLICY_GATE_CALENDAR_CREDENTIAL_FILE"
+                    ).resolve(),
+                )
+            except CalendarConfigurationError as exc:
+                raise GateConfigurationError(
+                    "Calendar configuration is invalid"
+                ) from exc
         return cls(
             data_dir,
             key_file,
@@ -106,7 +140,20 @@ class GateConfig:
             public_uid,
             controller_uid,
             client_gid,
+            calendar,
         )
 
     def read_database_key(self) -> str:
         return _read_owner_file(self.database_key_file, "Policy Gate database key", 32)
+
+    def read_calendar_credentials(self) -> CalendarCredentials:
+        if not self.calendar.enabled or self.calendar.credential_file is None:
+            raise GateConfigurationError("Calendar is disabled")
+        try:
+            return CalendarCredentials.from_json(
+                _read_owner_file(
+                    self.calendar.credential_file, "Calendar credential", 32
+                )
+            )
+        except CalendarConfigurationError as exc:
+            raise GateConfigurationError("Calendar credential is invalid") from exc

@@ -10,6 +10,7 @@ from src.policy_gate.types import (
     ActionBinding,
     ActionResult,
     ActionSchema,
+    MeetingOptionsResult,
     Operation,
 )
 from src.private_controller.erasure import (
@@ -48,6 +49,8 @@ class PublicGateClient(Protocol):
     ) -> tuple[Operation, ...]: ...
 
     def submit_action(self, binding: ActionBinding) -> ActionResult: ...
+
+    def meeting_options(self, binding: ActionBinding) -> MeetingOptionsResult: ...
 
     def stage_action(self, binding: ActionBinding) -> bool: ...
 

@@ -23,6 +23,7 @@ PUBLIC_OPERATIONS = frozenset(
         "stage_action",
         "allowed_actions",
         "submit_action",
+        "meeting_options",
         "activate_receipt",
         "revoke_receipt",
         "erase_subject",

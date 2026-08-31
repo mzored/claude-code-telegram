@@ -26,6 +26,7 @@ from src.policy_gate.types import (
     AdminResult,
     ExternalActionConfirmation,
     ExternalActionLink,
+    MeetingOptionsResult,
     Operation,
     PreparedIntent,
     Scope,
@@ -189,6 +190,7 @@ _ACTION_KEYS = frozenset(
 )
 _LEGACY_PUBLIC_ACTION_KEYS = _ACTION_KEYS - frozenset({"origin"})
 _ACTION_RESULT_KEYS = frozenset({"outcome", "action_id"})
+_MEETING_OPTIONS_RESULT_KEYS = frozenset({"outcome", "action_id", "slots"})
 _EXTERNAL_LINK_KEYS = frozenset({"link_identity", "source_digest"})
 _EXTERNAL_CONFIRMATION_KEYS = frozenset({"link", "confirmation_sequence"})
 _DRAFT_KEYS = frozenset(
@@ -264,6 +266,33 @@ def _action_result_from_wire(value: object) -> ActionResult:
     return ActionResult(
         outcome=_text(fields["outcome"]),
         action_id=_text(fields["action_id"], allow_empty=True),
+    )
+
+
+def _meeting_options_result_to_wire(result: MeetingOptionsResult) -> dict[str, object]:
+    return {
+        "outcome": result.outcome,
+        "action_id": result.action_id,
+        "slots": [list(slot) for slot in result.slots],
+    }
+
+
+def _meeting_options_result_from_wire(value: object) -> MeetingOptionsResult:
+    fields = _object(value, _MEETING_OPTIONS_RESULT_KEYS)
+    slots_value = fields["slots"]
+    if not isinstance(slots_value, list):
+        raise GateRpcProtocolError("meeting options response is invalid")
+    slots: list[tuple[str, int, int, int]] = []
+    for item in slots_value:
+        if not isinstance(item, list) or len(item) != 4:
+            raise GateRpcProtocolError("meeting options response is invalid")
+        slots.append(
+            (_text(item[0]), _integer(item[1]), _integer(item[2]), _integer(item[3]))
+        )
+    return MeetingOptionsResult(
+        _text(fields["outcome"]),
+        _text(fields["action_id"], allow_empty=True),
+        tuple(slots),
     )
 
 
@@ -462,6 +491,13 @@ class GateRpcDispatcher:
                 fields = _object(payload, frozenset({"binding"}))
                 return _action_result_to_wire(
                     self.service.submit_action(
+                        _action_from_wire(fields["binding"], allow_legacy_public=True)
+                    )
+                )
+            if operation == "meeting_options":
+                fields = _object(payload, frozenset({"binding"}))
+                return _meeting_options_result_to_wire(
+                    self.service.meeting_options(
                         _action_from_wire(fields["binding"], allow_legacy_public=True)
                     )
                 )
@@ -910,6 +946,11 @@ class PublicGateRpcClient(_GateRpcClient):
     def submit_action(self, binding: ActionBinding) -> ActionResult:
         return _action_result_from_wire(
             self._call("submit_action", {"binding": _action_to_wire(binding)})
+        )
+
+    def meeting_options(self, binding: ActionBinding) -> MeetingOptionsResult:
+        return _meeting_options_result_from_wire(
+            self._call("meeting_options", {"binding": _action_to_wire(binding)})
         )
 
     def stage_action(self, binding: ActionBinding) -> bool:
