@@ -58,23 +58,22 @@ fake_ssh="$tmp_dir/fake-ssh"
 cat >"$fake_ssh" <<'EOF'
 #!/usr/bin/env bash
 cat >/dev/null
+printf '%s\n' "$1" >"${FAKE_SSH_HOST_FILE}"
 printf '%s\n' "DEPLOYED_SHA=${FAKE_DEPLOYED_SHA}"
 EOF
 chmod +x "$fake_ssh"
 
 git -C "$tmp_dir/work" reset -q --hard "$base_sha"
-expect_failure env DEPLOY_HOST=test DEPLOY_LOCAL_REPO="$tmp_dir/work" \
-    SSH_BIN="$fake_ssh" FAKE_DEPLOYED_SHA=ffffffffffffffffffffffffffffffffffffffff \
-    "$root/ops/deploy.sh" deploy "$base_sha"
-
-expect_failure env DEPLOY_HOST=-oProxyCommand=bad DEPLOY_LOCAL_REPO="$tmp_dir/work" \
-    SSH_BIN="$fake_ssh" FAKE_DEPLOYED_SHA="$base_sha" \
+expect_failure env DEPLOY_LOCAL_REPO="$tmp_dir/work" SSH_BIN="$fake_ssh" \
+    FAKE_SSH_HOST_FILE="$tmp_dir/host" FAKE_DEPLOYED_SHA=ffffffffffffffffffffffffffffffffffffffff \
     "$root/ops/deploy.sh" deploy "$base_sha"
 
 matching_output=$(
-    env DEPLOY_HOST=test DEPLOY_LOCAL_REPO="$tmp_dir/work" SSH_BIN="$fake_ssh" \
-        FAKE_DEPLOYED_SHA="$base_sha" "$root/ops/deploy.sh" rollback "$base_sha"
+    env DEPLOY_HOST=wrong-host DEPLOY_LOCAL_REPO="$tmp_dir/work" SSH_BIN="$fake_ssh" \
+        FAKE_SSH_HOST_FILE="$tmp_dir/host" FAKE_DEPLOYED_SHA="$base_sha" \
+        "$root/ops/deploy.sh" rollback "$base_sha"
 )
 grep -Fxq "DEPLOYED_SHA=$base_sha" <<<"$matching_output" || fail "matching handshake failed"
+[[ $(cat "$tmp_dir/host") == mybots ]] || fail "deployment host must be canonical"
 
 echo "deployment preflight and handshake tests passed"

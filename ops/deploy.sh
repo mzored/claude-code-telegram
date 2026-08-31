@@ -6,8 +6,7 @@ sha=${2:-}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd "$script_dir/.." && pwd)
 local_repo=${DEPLOY_LOCAL_REPO:-$repo_dir}
-deploy_host=${DEPLOY_HOST:-mybots}
-deploy_repo=${DEPLOY_REPO:-/home/mzored/projects/assist-ai/bot}
+deploy_host=mybots
 ssh_bin=${SSH_BIN:-ssh}
 
 if [[ $action != deploy && $action != rollback ]]; then
@@ -18,11 +17,6 @@ fi
 # shellcheck source=ops/deploy-common.sh
 source "$script_dir/deploy-common.sh"
 validate_sha "$sha"
-validate_repo_path "$deploy_repo"
-if [[ -z $deploy_host || $deploy_host == -* ]]; then
-    echo "error: invalid deployment host" >&2
-    exit 1
-fi
 cd "$local_repo"
 require_clean_checkout
 git fetch --quiet origin main
@@ -30,7 +24,7 @@ require_nondivergent_checkout
 require_origin_commit "$sha"
 
 output=$(
-    "$ssh_bin" "$deploy_host" bash -s -- "$action" "$sha" "$deploy_repo" \
+    "$ssh_bin" "$deploy_host" bash -s -- "$action" "$sha" \
         < "$script_dir/remote-deploy.sh"
 )
 printf '%s\n' "$output"

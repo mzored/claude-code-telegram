@@ -43,6 +43,7 @@ check-lock:
 
 test-deploy:
 	bash tests/deploy/test_deploy.sh
+	bash tests/deploy/test_host_automation.sh
 
 check: check-lock lint test test-deploy
 

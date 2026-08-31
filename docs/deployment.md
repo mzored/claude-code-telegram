@@ -6,8 +6,11 @@ is copied back into Git.
 
 ## One-time host installation
 
-The host must already have Linux, Python 3.11, Poetry, Claude Code authentication, and
-a clean clone at `/home/mzored/projects/assist-ai/bot`. Create `.env` from
+The host must already have Linux, Python 3.11 or 3.12, Claude Code authentication, and
+a clean clone from `https://github.com/mzored/claude-code-telegram.git` at
+`/home/mzored/projects/assist-ai/bot`. The tracked bootstrap installs Poetry 2.4.1 into
+the checkout cache and creates the service's in-repository `.venv`; no global Poetry is
+needed. Create `.env` from
 `config/env.production.example`, insert production values directly on the host, then
 run:
 
@@ -28,13 +31,17 @@ the full 40-character commit ID from `origin/main`:
 
 ```bash
 git fetch origin main
-DEPLOY_HOST=mybots ./ops/deploy.sh deploy <full-commit-sha>
+./ops/deploy.sh deploy <full-commit-sha>
 ```
 
 The local and remote preflight checks both require clean, non-divergent Git state.
-The host fetches but never pushes, checks out the commit detached, installs only the
-locked production dependencies, installs the tracked unit, restarts the service, and
-returns the running commit. A mismatched handshake fails the deployment.
+The deployment target is always the `mybots` host and its canonical checkout; caller
+arguments cannot select a different host or repository. The host fetches but never
+pushes, checks out the commit detached, installs only the locked production
+dependencies, installs the tracked unit, and confirms that the service remains active
+through a short stabilization period. A failed release restores the previous Git
+checkout, dependencies, unit, and prior enabled and active service state. A mismatched
+handshake fails the deployment.
 
 The first deploy from an older mutable checkout can fail because that checkout has a
 local-only commit or uncommitted file. Preserve or integrate that work before retrying;
@@ -46,7 +53,7 @@ Rollback uses the same safeguards and an earlier full commit ID that remains on
 `origin/main`:
 
 ```bash
-DEPLOY_HOST=mybots ./ops/deploy.sh rollback <full-commit-sha>
+./ops/deploy.sh rollback <full-commit-sha>
 ```
 
 Check the named destination after either operation:
