@@ -7,10 +7,11 @@ import signal
 import threading
 from typing import Protocol
 
+from src.policy_gate.calendar import GoogleCalendarApi
 from src.policy_gate.config import GateConfig
 from src.policy_gate.executors import MockExecutor
 from src.policy_gate.rpc import PolicyGateRpcServer, StopSignal
-from src.policy_gate.service import PolicyGateService
+from src.policy_gate.service import PolicyConfig, PolicyGateService
 from src.policy_gate.store import GateStore
 from src.policy_gate.transport import (
     GatePeerAuthorizer,
@@ -18,6 +19,7 @@ from src.policy_gate.transport import (
     bind_unix_listener,
     remove_bound_socket,
 )
+from src.policy_gate.types import Operation
 
 
 class ReadySignal(Protocol):
@@ -73,7 +75,23 @@ def run() -> None:
     if controller_pid <= 0:
         raise ValueError("POLICY_GATE_CONTROLLER_PID must be a positive integer")
     store = GateStore(config.data_dir / "gate.db", config.read_database_key())
-    service = PolicyGateService(store, MockExecutor())
+    calendar_api = None
+    if config.calendar.enabled:
+        calendar_api = GoogleCalendarApi(config.read_calendar_credentials())
+        # Enabled mode fails before binding the IPC listener unless the fixed
+        # refresh grant proves the exact Calendar scopes we require.
+        calendar_api.validate_startup()
+    policy = PolicyConfig(
+        enabled_operations=(
+            frozenset({Operation.MEETING_OPTIONS, Operation.MEETING_SCHEDULE})
+            if config.calendar.enabled
+            else frozenset()
+        ),
+        calendar=config.calendar,
+    )
+    service = PolicyGateService(
+        store, MockExecutor(), policy=policy, calendar_api=calendar_api
+    )
     stop = threading.Event()
 
     def request_stop(signum: int, frame: object) -> None:

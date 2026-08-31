@@ -11,14 +11,14 @@ from typing import Callable
 from src.encrypted_sqlite import EncryptedStoreError, SqlCipherDatabase
 from src.policy_gate.types import ActionBinding, ActionOrigin, Operation
 
-GATE_SCHEMA_VERSION = 4
+GATE_SCHEMA_VERSION = 5
 
 GATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS gate_schema_meta (
     version INTEGER NOT NULL
 );
 INSERT INTO gate_schema_meta(version)
-SELECT 4 WHERE NOT EXISTS (SELECT 1 FROM gate_schema_meta);
+SELECT 5 WHERE NOT EXISTS (SELECT 1 FROM gate_schema_meta);
 CREATE TABLE IF NOT EXISTS subjects (
     subject_id TEXT PRIMARY KEY,
     blocked INTEGER NOT NULL DEFAULT 0 CHECK(blocked IN (0, 1)),
@@ -181,6 +181,31 @@ CREATE TABLE IF NOT EXISTS quota_events (
         ('reserved', 'succeeded', 'uncertain', 'released')),
     changed_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS calendar_offers (
+    offer_ref TEXT PRIMARY KEY,
+    action_id TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    start_at INTEGER NOT NULL,
+    end_at INTEGER NOT NULL,
+    duration_minutes INTEGER NOT NULL,
+    policy_digest TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    consumed_at INTEGER,
+    FOREIGN KEY(subject_id) REFERENCES subjects(subject_id)
+);
+CREATE INDEX IF NOT EXISTS idx_calendar_offers_subject
+    ON calendar_offers(subject_id, expires_at);
+CREATE TABLE IF NOT EXISTS calendar_reservations (
+    action_id TEXT PRIMARY KEY,
+    subject_id TEXT NOT NULL,
+    booking_calendar_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    start_at INTEGER NOT NULL,
+    end_at INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('succeeded', 'uncertain')),
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(subject_id) REFERENCES subjects(subject_id)
+);
 """
 
 
@@ -218,6 +243,13 @@ class GateStore:
             )
         if version == 3:
             self._migrate_v3_to_v4()
+            version = int(
+                self.database.execute(
+                    "SELECT version FROM gate_schema_meta"
+                ).fetchone()[0]
+            )
+        if version == 4:
+            self._migrate_v4_to_v5()
             version = int(
                 self.database.execute(
                     "SELECT version FROM gate_schema_meta"
@@ -434,6 +466,15 @@ class GateStore:
                         (row["action_id"],),
                     )
             connection.execute("UPDATE gate_schema_meta SET version=4")
+
+    def _migrate_v4_to_v5(self) -> None:
+        """Advance existing Unit 4 databases after idempotent Calendar table creation."""
+
+        # GATE_SCHEMA creates the new tables before the version check.  Keeping
+        # this migration explicit makes an interrupted upgrade distinguishable
+        # from an unsupported database rather than silently treating it as new.
+        with self.database.transaction() as connection:
+            connection.execute("UPDATE gate_schema_meta SET version=5")
 
     def now(self) -> int:
         return int(self._clock())

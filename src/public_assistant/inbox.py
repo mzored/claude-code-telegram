@@ -153,6 +153,7 @@ def erase_subject_from_public_store(
             "privacy_previews",
             "public_action_intents",
             "integration_processing_receipts",
+            "meeting_offer_controls",
             "consents",
             "controls",
             "messages",

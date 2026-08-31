@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from src.policy_gate.calendar import (
+    CalendarConfigurationError,
+    CalendarCredentials,
+    CalendarPolicy,
+)
+
 
 class GateConfigurationError(ValueError):
     """Policy Gate cannot start with an unsafe local boundary."""
@@ -30,6 +36,18 @@ def _uid(environment: Mapping[str, str], name: str) -> int:
         raise GateConfigurationError(f"{name} must be numeric") from exc
     if value <= 0:
         raise GateConfigurationError(f"{name} must be positive")
+    return value
+
+
+def _bounded_integer(
+    environment: Mapping[str, str], name: str, *, minimum: int, maximum: int
+) -> int:
+    try:
+        value = int(environment.get(name, ""))
+    except ValueError as exc:
+        raise GateConfigurationError(f"{name} must be numeric") from exc
+    if not minimum <= value <= maximum:
+        raise GateConfigurationError(f"{name} is outside its allowed range")
     return value
 
 
@@ -66,6 +84,7 @@ class GateConfig:
     public_uid: int
     controller_uid: int
     client_gid: int
+    calendar: CalendarPolicy = CalendarPolicy()
 
     @classmethod
     def from_environment(
@@ -99,6 +118,82 @@ class GateConfig:
             raise GateConfigurationError(
                 "public and controller processes need separate UIDs"
             )
+        enabled_raw = env.get("POLICY_GATE_CALENDAR_ENABLED", "0").strip()
+        if enabled_raw not in {"0", "1"}:
+            raise GateConfigurationError("POLICY_GATE_CALENDAR_ENABLED must be 0 or 1")
+        calendar = CalendarPolicy()
+        if enabled_raw == "1":
+            calendar_credential_file = _absolute(
+                env, "POLICY_GATE_CALENDAR_CREDENTIAL_FILE"
+            ).resolve()
+            if (
+                calendar_credential_file == data_dir
+                or calendar_credential_file.is_relative_to(data_dir)
+                or calendar_credential_file == repository
+                or calendar_credential_file.is_relative_to(repository)
+                or calendar_credential_file == key_file
+            ):
+                raise GateConfigurationError(
+                    "Calendar credential must stay outside data, repository, and key paths"
+                )
+            working_day_values = tuple(
+                _bounded_integer({"day": item.strip()}, "day", minimum=0, maximum=6)
+                for item in env.get("POLICY_GATE_CALENDAR_WORKING_DAYS", "").split(",")
+                if item.strip()
+            )
+            if len(set(working_day_values)) != len(working_day_values):
+                raise GateConfigurationError("Calendar working days must be distinct")
+            try:
+                calendar = CalendarPolicy(
+                    enabled=True,
+                    booking_calendar_id=env.get(
+                        "POLICY_GATE_CALENDAR_BOOKING_ID", ""
+                    ).strip(),
+                    availability_calendar_ids=tuple(
+                        item.strip()
+                        for item in env.get(
+                            "POLICY_GATE_CALENDAR_AVAILABILITY_IDS", ""
+                        ).split(",")
+                        if item.strip()
+                    ),
+                    timezone=env.get("POLICY_GATE_CALENDAR_TIMEZONE", "").strip(),
+                    working_days=frozenset(working_day_values),
+                    working_hour_start=_bounded_integer(
+                        env,
+                        "POLICY_GATE_CALENDAR_WORK_START_HOUR",
+                        minimum=0,
+                        maximum=23,
+                    ),
+                    working_hour_end=_bounded_integer(
+                        env, "POLICY_GATE_CALENDAR_WORK_END_HOUR", minimum=1, maximum=24
+                    ),
+                    grid_minutes=_bounded_integer(
+                        env, "POLICY_GATE_CALENDAR_GRID_MINUTES", minimum=1, maximum=60
+                    ),
+                    before_buffer_minutes=_bounded_integer(
+                        env,
+                        "POLICY_GATE_CALENDAR_BEFORE_BUFFER_MINUTES",
+                        minimum=0,
+                        maximum=240,
+                    ),
+                    after_buffer_minutes=_bounded_integer(
+                        env,
+                        "POLICY_GATE_CALENDAR_AFTER_BUFFER_MINUTES",
+                        minimum=0,
+                        maximum=240,
+                    ),
+                    offer_ttl_seconds=_bounded_integer(
+                        env,
+                        "POLICY_GATE_CALENDAR_OFFER_TTL_SECONDS",
+                        minimum=1,
+                        maximum=3600,
+                    ),
+                    credential_file=calendar_credential_file,
+                )
+            except CalendarConfigurationError as exc:
+                raise GateConfigurationError(
+                    "Calendar configuration is invalid"
+                ) from exc
         return cls(
             data_dir,
             key_file,
@@ -106,7 +201,20 @@ class GateConfig:
             public_uid,
             controller_uid,
             client_gid,
+            calendar,
         )
 
     def read_database_key(self) -> str:
         return _read_owner_file(self.database_key_file, "Policy Gate database key", 32)
+
+    def read_calendar_credentials(self) -> CalendarCredentials:
+        if not self.calendar.enabled or self.calendar.credential_file is None:
+            raise GateConfigurationError("Calendar is disabled")
+        try:
+            return CalendarCredentials.from_json(
+                _read_owner_file(
+                    self.calendar.credential_file, "Calendar credential", 32
+                )
+            )
+        except CalendarConfigurationError as exc:
+            raise GateConfigurationError("Calendar credential is invalid") from exc

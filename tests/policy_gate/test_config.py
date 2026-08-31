@@ -53,3 +53,53 @@ def test_gate_rejects_shared_identity_and_key_inside_data(tmp_path: Path) -> Non
     del missing_group["POLICY_GATE_CLIENT_GID"]
     with pytest.raises(GateConfigurationError, match="CLIENT_GID"):
         GateConfig.from_environment(missing_group)
+
+
+def test_enabled_calendar_requires_complete_distinct_configuration_and_fixed_scopes(
+    tmp_path: Path,
+) -> None:
+    key = credential(tmp_path / "secrets" / "gate-key", "g" * 40)
+    calendar = credential(
+        tmp_path / "secrets" / "calendar.json",
+        """{
+        "client_id":"calendar-client",
+        "client_secret":"calendar-secret",
+        "refresh_token":"calendar-refresh-token",
+        "token_uri":"https://oauth2.googleapis.com/token",
+        "scopes":[
+          "https://www.googleapis.com/auth/calendar.events.owned",
+          "https://www.googleapis.com/auth/calendar.events.freebusy"
+        ]
+        }""",
+    )
+    env = {
+        **environment(tmp_path, key),
+        "POLICY_GATE_CALENDAR_ENABLED": "1",
+        "POLICY_GATE_CALENDAR_BOOKING_ID": "booking",
+        "POLICY_GATE_CALENDAR_AVAILABILITY_IDS": "booking,availability",
+        "POLICY_GATE_CALENDAR_TIMEZONE": "America/New_York",
+        "POLICY_GATE_CALENDAR_WORKING_DAYS": "0,1,2,3,4",
+        "POLICY_GATE_CALENDAR_WORK_START_HOUR": "9",
+        "POLICY_GATE_CALENDAR_WORK_END_HOUR": "18",
+        "POLICY_GATE_CALENDAR_GRID_MINUTES": "30",
+        "POLICY_GATE_CALENDAR_BEFORE_BUFFER_MINUTES": "10",
+        "POLICY_GATE_CALENDAR_AFTER_BUFFER_MINUTES": "10",
+        "POLICY_GATE_CALENDAR_OFFER_TTL_SECONDS": "900",
+        "POLICY_GATE_CALENDAR_CREDENTIAL_FILE": str(calendar),
+    }
+    config = GateConfig.from_environment(env)
+    assert config.calendar.enabled
+    assert config.read_calendar_credentials().scopes == (
+        "https://www.googleapis.com/auth/calendar.events.owned",
+        "https://www.googleapis.com/auth/calendar.events.freebusy",
+    )
+
+    duplicate_day = {**env, "POLICY_GATE_CALENDAR_WORKING_DAYS": "0,0"}
+    with pytest.raises(GateConfigurationError, match="working days"):
+        GateConfig.from_environment(duplicate_day)
+    inside_data = {
+        **env,
+        "POLICY_GATE_CALENDAR_CREDENTIAL_FILE": str(tmp_path / "data" / "calendar"),
+    }
+    with pytest.raises(GateConfigurationError, match="Calendar credential"):
+        GateConfig.from_environment(inside_data)

@@ -10,6 +10,14 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Callable, Mapping
 
+from src.policy_gate.calendar import (
+    CalendarApi,
+    CalendarEvent,
+    CalendarPolicy,
+    candidate_blocks,
+    deterministic_event_id,
+    fresh_offer_ref,
+)
 from src.policy_gate.executors import (
     ExecutionOutcome,
     MockExecutor,
@@ -26,11 +34,13 @@ from src.policy_gate.types import (
     CandidateProvenance,
     ExternalActionConfirmation,
     ExternalActionLink,
+    MeetingOptionsResult,
     Operation,
     PreparedIntent,
     Scope,
     TrustedReference,
     canonical_json,
+    digest,
 )
 
 _PURPOSES: dict[Operation, tuple[str, str]] = {
@@ -62,6 +72,7 @@ class PolicyConfig:
     working_days: frozenset[int] = frozenset({0, 1, 2, 3, 4})
     working_hour_start_utc: int = 9
     working_hour_end_utc: int = 18
+    calendar: CalendarPolicy = CalendarPolicy()
 
 
 class PolicyGateService:
@@ -73,16 +84,27 @@ class PolicyGateService:
         executor: MockExecutor,
         *,
         policy: PolicyConfig | None = None,
+        calendar_api: CalendarApi | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if not getattr(executor, "is_mock", False):
-            raise ValueError("Unit 3 accepts only a declared mock executor")
+            raise ValueError("non-Calendar actions require a declared mock executor")
+        selected_policy = policy or PolicyConfig()
+        if selected_policy.calendar.enabled != (calendar_api is not None):
+            raise ValueError("Calendar adapter and enablement must agree")
+        if selected_policy.calendar.enabled and not {
+            Operation.MEETING_OPTIONS,
+            Operation.MEETING_SCHEDULE,
+        }.issubset(selected_policy.enabled_operations):
+            raise ValueError("enabled Calendar requires both reviewed operations")
         self.store = store
         self.executor = executor
-        self.policy = policy or PolicyConfig()
+        self.policy = selected_policy
+        self.calendar_api = calendar_api
         self._clock = clock
         self._locks_guard = threading.Lock()
         self._action_locks: dict[str, threading.Lock] = {}
+        self._calendar_locks: dict[str, threading.Lock] = {}
         now = self.now()
         with self.store.database.transaction() as connection:
             for operation in Operation:
@@ -107,6 +129,12 @@ class PolicyGateService:
     def _action_lock(self, action_id: str) -> threading.Lock:
         with self._locks_guard:
             return self._action_locks.setdefault(action_id, threading.Lock())
+
+    def _calendar_lock(self) -> threading.Lock:
+        with self._locks_guard:
+            return self._calendar_locks.setdefault(
+                self.policy.calendar.booking_calendar_id, threading.Lock()
+            )
 
     @staticmethod
     def _stored_binding(value: object, *, allow_legacy_public: bool) -> ActionBinding:
@@ -1250,6 +1278,12 @@ class PolicyGateService:
                 "DELETE FROM administration_intents WHERE subject_id=?", (subject_id,)
             )
             connection.execute(
+                "DELETE FROM calendar_offers WHERE subject_id=?", (subject_id,)
+            )
+            connection.execute(
+                "DELETE FROM calendar_reservations WHERE subject_id=?", (subject_id,)
+            )
+            connection.execute(
                 """UPDATE action_journal SET binding_json='{}', updated_at=?
                    WHERE subject_id=?""",
                 (now, subject_id),
@@ -1341,6 +1375,13 @@ class PolicyGateService:
             if subject is None or subject["blocked"]:
                 return ()
             for operation in Operation:
+                # A reservation is created only by a trusted option callback.
+                # It is deliberately never a public-model schema.
+                if (
+                    self.policy.calendar.enabled
+                    and operation is Operation.MEETING_SCHEDULE
+                ):
+                    continue
                 if not self._policy_allows(connection, operation):
                     continue
                 if not self._receipt_allows(
@@ -1363,6 +1404,217 @@ class PolicyGateService:
                         allowed.append(operation)
         return tuple(allowed)
 
+    def meeting_options(self, binding: ActionBinding) -> MeetingOptionsResult:
+        """Return only persisted safe slots for one policy-shaped request."""
+
+        if (
+            not self.policy.calendar.enabled
+            or self.calendar_api is None
+            or binding.operation is not Operation.MEETING_OPTIONS
+            or binding.origin is not ActionOrigin.PUBLIC_SENDER
+            or not binding.verify()
+            or not self._validate_arguments(binding)
+        ):
+            return MeetingOptionsResult(
+                "denied", binding.action_id, timezone=self.policy.calendar.timezone
+            )
+        with self._action_lock(binding.action_id):
+            now = self.now()
+            with self.store.database.transaction() as connection:
+                existing = connection.execute(
+                    """SELECT offer_ref, start_at, end_at, duration_minutes
+                       FROM calendar_offers WHERE action_id=? AND subject_id=?
+                       AND expires_at>? AND consumed_at IS NULL ORDER BY start_at""",
+                    (binding.action_id, binding.subject_id, now),
+                ).fetchall()
+                if existing:
+                    return MeetingOptionsResult(
+                        "verified_success",
+                        binding.action_id,
+                        tuple(
+                            (
+                                str(row["offer_ref"]),
+                                int(row["start_at"]),
+                                int(row["end_at"]),
+                                int(row["duration_minutes"]),
+                            )
+                            for row in existing
+                        ),
+                        self.policy.calendar.timezone,
+                    )
+                if self._authorize_claim(connection, binding) is not None:
+                    return MeetingOptionsResult(
+                        "denied",
+                        binding.action_id,
+                        timezone=self.policy.calendar.timezone,
+                    )
+            args = binding.arguments
+            assert isinstance(args["date"], str)
+            assert isinstance(args["duration_minutes"], int)
+            assert isinstance(args["candidate_count"], int)
+            requested_date = date.fromisoformat(args["date"])
+            blocks = tuple(
+                block
+                for block in candidate_blocks(
+                    self.policy.calendar,
+                    requested_date,
+                    args["duration_minutes"],
+                    now + self.policy.minimum_meeting_notice_seconds,
+                )
+                if block.start_at <= now + self.policy.maximum_meeting_horizon_seconds
+            )
+            if not blocks:
+                return MeetingOptionsResult(
+                    "verified_success",
+                    binding.action_id,
+                    timezone=self.policy.calendar.timezone,
+                )
+            # Provider reads are a quota-bearing capability, not an idempotent
+            # action result.  A cached offer returns above without a new read;
+            # every real free/busy attempt gets an independent durable debit.
+            read_attempt_id = "calendar-read-" + secrets.token_hex(16)
+            with self.store.database.transaction() as connection:
+                if self._authorize_claim(connection, binding) is not None:
+                    return MeetingOptionsResult(
+                        "denied",
+                        binding.action_id,
+                        timezone=self.policy.calendar.timezone,
+                    )
+                connection.execute(
+                    "INSERT INTO quota_events VALUES (?, ?, ?, ?, ?, 'succeeded', ?)",
+                    (
+                        read_attempt_id,
+                        binding.subject_id,
+                        binding.operation.value,
+                        now // 86400,
+                        now // 60,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO action_attempts VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        secrets.token_hex(16),
+                        binding.action_id,
+                        binding.subject_id,
+                        binding.operation.value,
+                        now // 60,
+                        now,
+                    ),
+                )
+            try:
+                busy = self.calendar_api.free_busy(
+                    self.policy.calendar.availability_calendar_ids,
+                    min(item.start_at for item in blocks),
+                    max(item.end_at for item in blocks),
+                )
+            except BaseException:
+                self.set_breaker("reads", True)
+                return MeetingOptionsResult(
+                    "unavailable",
+                    binding.action_id,
+                    timezone=self.policy.calendar.timezone,
+                )
+            available = [
+                block
+                for block in blocks
+                if not any(
+                    item.start_at < block.end_at and item.end_at > block.start_at
+                    for item in busy
+                )
+            ][: args["candidate_count"]]
+            policy_digest = self._calendar_policy_digest(args["duration_minutes"])
+            with self.store.database.transaction() as connection:
+                if (
+                    self._authorize_claim(connection, binding, require_quota=False)
+                    is not None
+                ):
+                    return MeetingOptionsResult(
+                        "denied",
+                        binding.action_id,
+                        timezone=self.policy.calendar.timezone,
+                    )
+                slots: list[tuple[str, int, int, int]] = []
+                for block in available:
+                    offer = fresh_offer_ref()
+                    start_at = (
+                        block.start_at + self.policy.calendar.before_buffer_minutes * 60
+                    )
+                    end_at = (
+                        block.end_at - self.policy.calendar.after_buffer_minutes * 60
+                    )
+                    if end_at - start_at != args["duration_minutes"] * 60:
+                        continue
+                    connection.execute(
+                        "INSERT INTO calendar_offers VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                        (
+                            offer,
+                            binding.action_id,
+                            binding.subject_id,
+                            start_at,
+                            end_at,
+                            args["duration_minutes"],
+                            policy_digest,
+                            now + self.policy.calendar.offer_ttl_seconds,
+                        ),
+                    )
+                    slots.append((offer, start_at, end_at, args["duration_minutes"]))
+            return MeetingOptionsResult(
+                "verified_success",
+                binding.action_id,
+                tuple(slots),
+                self.policy.calendar.timezone,
+            )
+
+    def _calendar_policy_digest(self, duration_minutes: int) -> str:
+        return digest(
+            {
+                "booking": self.policy.calendar.booking_calendar_id,
+                "availability": self.policy.calendar.availability_calendar_ids,
+                "timezone": self.policy.calendar.timezone,
+                "days": sorted(self.policy.calendar.working_days),
+                "hours": [
+                    self.policy.calendar.working_hour_start,
+                    self.policy.calendar.working_hour_end,
+                ],
+                "grid": self.policy.calendar.grid_minutes,
+                "buffers": [
+                    self.policy.calendar.before_buffer_minutes,
+                    self.policy.calendar.after_buffer_minutes,
+                ],
+                "offer_ttl": self.policy.calendar.offer_ttl_seconds,
+                "namespace": self.policy.calendar.namespace,
+                "duration": duration_minutes,
+                "allowed_durations": self.policy.allowed_durations,
+                "minimum_notice": self.policy.minimum_meeting_notice_seconds,
+                "maximum_horizon": self.policy.maximum_meeting_horizon_seconds,
+            }
+        )
+
+    def _calendar_offer(
+        self, connection: Any, binding: ActionBinding, *, include_consumed: bool = False
+    ) -> Any | None:
+        if (
+            not self.policy.calendar.enabled
+            or binding.operation is not Operation.MEETING_SCHEDULE
+        ):
+            return None
+        reference = binding.arguments.get("offer_ref")
+        if not isinstance(reference, str):
+            return None
+        query = """SELECT * FROM calendar_offers WHERE offer_ref=? AND subject_id=?
+                   AND expires_at>?"""
+        if not include_consumed:
+            query += " AND consumed_at IS NULL"
+        offer = connection.execute(
+            query, (reference, binding.subject_id, self.now())
+        ).fetchone()
+        if offer is None or str(offer["policy_digest"]) != self._calendar_policy_digest(
+            int(offer["duration_minutes"])
+        ):
+            return None
+        return offer
+
     def _validate_arguments(self, binding: ActionBinding) -> bool:
         try:
             canonical_json(dict(binding.arguments))
@@ -1383,7 +1635,8 @@ class PolicyGateService:
                 requested_date = date.fromisoformat(args["date"])
             except ValueError:
                 return False
-            today = datetime.fromtimestamp(self.now(), tz=UTC).date()
+            zone = self.policy.calendar.zone if self.policy.calendar.enabled else UTC
+            today = datetime.fromtimestamp(self.now(), tz=zone).date()
             return (
                 today
                 <= requested_date
@@ -1391,6 +1644,13 @@ class PolicyGateService:
                 + timedelta(seconds=self.policy.maximum_meeting_horizon_seconds)
             )
         if binding.operation is Operation.MEETING_SCHEDULE:
+            if self.policy.calendar.enabled:
+                return (
+                    set(args) == {"offer_ref"}
+                    and isinstance(args["offer_ref"], str)
+                    and args["offer_ref"].startswith("OFR-")
+                    and 12 <= len(args["offer_ref"]) <= 128
+                )
             if not (
                 set(args) == {"start_at", "duration_minutes"}
                 and isinstance(args["start_at"], int)
@@ -1433,23 +1693,35 @@ class PolicyGateService:
             <= today + timedelta(days=self.policy.task_due_horizon_days)
         )
 
-    def _constraints_allow(self, delegation: Any, binding: ActionBinding) -> bool:
+    def _constraints_allow(
+        self, delegation: Any, binding: ActionBinding, offer: Any | None = None
+    ) -> bool:
         constraints = json.loads(str(delegation["constraints_json"]))
         args = binding.arguments
         durations = constraints.get("allowed_durations")
-        if durations is not None and args.get("duration_minutes") not in durations:
+        duration = (
+            args.get("duration_minutes")
+            if offer is None
+            else int(offer["duration_minutes"])
+        )
+        if durations is not None and duration not in durations:
             return False
         maximum = constraints.get("max_title_length")
         if maximum is not None and len(str(args.get("title", ""))) > int(maximum):
             return False
+        offered_start = None if offer is None else int(offer["start_at"])
         before = constraints.get("before")
         if before is not None:
-            start_at = args.get("start_at")
+            start_at = (
+                offered_start if offered_start is not None else args.get("start_at")
+            )
             if not isinstance(start_at, int) or start_at >= int(before):
                 return False
         not_before = constraints.get("not_before")
         if not_before is not None:
-            start_at = args.get("start_at")
+            start_at = (
+                offered_start if offered_start is not None else args.get("start_at")
+            )
             if not isinstance(start_at, int) or start_at < int(not_before):
                 return False
         return True
@@ -1519,7 +1791,12 @@ class PolicyGateService:
         return subject_count < limit and global_writes < self.policy.global_daily_writes
 
     def _authorize_claim(
-        self, connection: Any, binding: ActionBinding
+        self,
+        connection: Any,
+        binding: ActionBinding,
+        *,
+        require_unused_offer: bool = True,
+        require_quota: bool = True,
     ) -> Any | None | bool:
         subject = connection.execute(
             "SELECT blocked FROM subjects WHERE subject_id=?", (binding.subject_id,)
@@ -1539,10 +1816,17 @@ class PolicyGateService:
         expected_purpose = _PURPOSES[binding.operation][1]
         if binding.processor_purpose != expected_purpose:
             return False
-        if not self._quota_available(connection, binding.subject_id, binding.operation):
+        if require_quota and not self._quota_available(
+            connection, binding.subject_id, binding.operation
+        ):
             return False
         if binding.operation is Operation.MEETING_OPTIONS:
             return None
+        offer = self._calendar_offer(
+            connection, binding, include_consumed=not require_unused_offer
+        )
+        if self.policy.calendar.enabled and offer is None:
+            return False
         delegations = self._active_delegations(
             connection, binding.subject_id, binding.operation
         )
@@ -1556,10 +1840,51 @@ class PolicyGateService:
                 continue
             if (
                 binding.origin is ActionOrigin.PUBLIC_SENDER
-                and self._constraints_allow(row, binding)
+                and self._constraints_allow(row, binding, offer)
             ):
                 return row
         return False
+
+    def _reservation_is_still_authorized(
+        self, connection: Any, binding: ActionBinding, claim_token: str
+    ) -> bool:
+        """Recheck revocation without re-consuming the already-reserved scope."""
+
+        subject = connection.execute(
+            "SELECT blocked FROM subjects WHERE subject_id=?", (binding.subject_id,)
+        ).fetchone()
+        if (
+            subject is None
+            or subject["blocked"]
+            or not self._policy_allows(connection, binding.operation)
+        ):
+            return False
+        if not self._receipt_allows(
+            connection,
+            binding.subject_id,
+            binding.processing_authorization_version,
+            binding.processing_authorization_revision,
+            binding.operation,
+        ):
+            return False
+        row = connection.execute(
+            """SELECT * FROM delegations WHERE delegation_id=(
+                   SELECT authority_id FROM action_journal
+                   WHERE action_id=? AND state='claimed' AND claim_token=?
+               ) AND status='active' AND (expires_at IS NULL OR expires_at>?)""",
+            (binding.action_id, claim_token, self.now()),
+        ).fetchone()
+        offer = self._calendar_offer(connection, binding, include_consumed=True)
+        if row is None or offer is None:
+            return False
+        if row["scope"] == Scope.EXACT.value:
+            return bool(
+                row["exact_action_id"] == binding.action_id
+                and row["exact_payload_digest"] == binding.payload_digest
+            )
+        return binding.origin is ActionOrigin.PUBLIC_SENDER and self._constraints_allow(
+            row, binding, offer
+        )
 
     def submit_action(
         self,
@@ -1666,6 +1991,13 @@ class PolicyGateService:
                     )
                 if existing["state"] in {"claimed", "uncertain"}:
                     return ActionResult(str(existing["state"]), binding.action_id)
+                if (
+                    self.policy.calendar.enabled
+                    and binding.operation is Operation.MEETING_SCHEDULE
+                    and str(existing["state"]) == "definite_failure"
+                    and str(existing["outcome"]) != "verified_absent"
+                ):
+                    return ActionResult("definite_failure", binding.action_id)
             authority = self._authorize_claim(connection, binding)
             if authority is False:
                 return ActionResult("denied", binding.action_id)
@@ -1673,7 +2005,29 @@ class PolicyGateService:
                 return ActionResult("denied", binding.action_id)
             if authority is not None:
                 authority_id = str(authority["delegation_id"])
-                if authority["remaining_uses"] is not None:
+            if (
+                self.policy.calendar.enabled
+                and binding.operation is Operation.MEETING_SCHEDULE
+            ):
+                # Consume the server-generated offer before consuming a bounded
+                # delegation.  A stale offer therefore cannot burn authority.
+                offer_ref = binding.arguments.get("offer_ref")
+                assert isinstance(offer_ref, str)
+                cursor = connection.execute(
+                    """UPDATE calendar_offers SET consumed_at=? WHERE offer_ref=?
+                       AND subject_id=? AND consumed_at IS NULL AND expires_at>?""",
+                    (now, offer_ref, binding.subject_id, now),
+                )
+                if int(cursor.rowcount) != 1:
+                    return ActionResult("denied", binding.action_id)
+            if authority_id is not None:
+                remaining = connection.execute(
+                    "SELECT remaining_uses FROM delegations WHERE delegation_id=?",
+                    (authority_id,),
+                ).fetchone()
+                if remaining is None:
+                    return ActionResult("denied", binding.action_id)
+                if remaining["remaining_uses"] is not None:
                     cursor = connection.execute(
                         """UPDATE delegations SET remaining_uses=remaining_uses-1
                            WHERE delegation_id=? AND status='active'
@@ -1709,6 +2063,25 @@ class PolicyGateService:
                        claim_token=?, outcome=NULL, updated_at=? WHERE action_id=?""",
                     (authority_id, claim_token, now, binding.action_id),
                 )
+            if (
+                self.policy.calendar.enabled
+                and binding.operation is Operation.MEETING_SCHEDULE
+            ):
+                offer = self._calendar_offer(connection, binding, include_consumed=True)
+                if offer is None:
+                    raise RuntimeError("calendar offer disappeared during claim")
+                self._remember_calendar_reservation_in_transaction(
+                    connection,
+                    binding,
+                    CalendarEvent(
+                        deterministic_event_id(
+                            self.policy.calendar.namespace, binding.action_id
+                        ),
+                        int(offer["start_at"]),
+                        int(offer["end_at"]),
+                    ),
+                    "uncertain",
+                )
             connection.execute(
                 """INSERT INTO quota_events VALUES (?, ?, ?, ?, ?, 'reserved', ?)
                    ON CONFLICT(action_id) DO UPDATE SET state='reserved',
@@ -1735,6 +2108,11 @@ class PolicyGateService:
             )
         if crash_hook is not None:
             crash_hook("after_claim")
+        if (
+            self.policy.calendar.enabled
+            and binding.operation is Operation.MEETING_SCHEDULE
+        ):
+            return self._execute_calendar_schedule(binding, claim_token)
         try:
             outcome = self.executor.execute(binding)
         except BaseException:
@@ -1743,6 +2121,107 @@ class PolicyGateService:
         if not self._finalize(binding.action_id, claim_token, outcome):
             return ActionResult("uncertain", binding.action_id)
         return ActionResult(outcome.value, binding.action_id)
+
+    def _execute_calendar_schedule(
+        self, binding: ActionBinding, claim_token: str
+    ) -> ActionResult:
+        """Final provider recheck and one deterministic anonymous Calendar block."""
+
+        assert self.calendar_api is not None
+        with self._calendar_lock():
+            row = self.store.database.execute(
+                """SELECT start_at, end_at, duration_minutes FROM calendar_offers WHERE offer_ref=?
+                   AND subject_id=?""",
+                (binding.arguments["offer_ref"], binding.subject_id),
+            ).fetchone()
+            if row is None:
+                self._finalize(
+                    binding.action_id, claim_token, ExecutionOutcome.DEFINITE_FAILURE
+                )
+                return ActionResult("denied", binding.action_id)
+            start_at, end_at = int(row["start_at"]), int(row["end_at"])
+            conflict_start = start_at - self.policy.calendar.before_buffer_minutes * 60
+            conflict_end = end_at + self.policy.calendar.after_buffer_minutes * 60
+            event_id = deterministic_event_id(
+                self.policy.calendar.namespace, binding.action_id
+            )
+            event = CalendarEvent(event_id, start_at, end_at)
+            try:
+                busy = self.calendar_api.free_busy(
+                    self.policy.calendar.availability_calendar_ids,
+                    conflict_start,
+                    conflict_end,
+                )
+                if any(
+                    item.start_at < conflict_end and item.end_at > conflict_start
+                    for item in busy
+                ):
+                    self._finalize(
+                        binding.action_id,
+                        claim_token,
+                        ExecutionOutcome.DEFINITE_FAILURE,
+                    )
+                    return ActionResult("definite_failure", binding.action_id)
+                # Revocation may have raced the initial claim while the Gate was
+                # reading free/busy.  Re-read all authority state immediately
+                # before the irreversible provider call.
+                with self.store.database.transaction() as connection:
+                    revoked = not self._reservation_is_still_authorized(
+                        connection, binding, claim_token
+                    )
+                if revoked:
+                    self._finalize(
+                        binding.action_id,
+                        claim_token,
+                        ExecutionOutcome.DEFINITE_FAILURE,
+                    )
+                    return ActionResult("denied", binding.action_id)
+                self.calendar_api.insert_private_block(
+                    self.policy.calendar.booking_calendar_id, event
+                )
+            except BaseException:
+                self._remember_calendar_reservation(binding, event, "uncertain")
+                self._finalize(
+                    binding.action_id, claim_token, ExecutionOutcome.UNCERTAIN
+                )
+                return ActionResult("uncertain", binding.action_id)
+            self._remember_calendar_reservation(binding, event, "succeeded")
+            if not self._finalize(
+                binding.action_id, claim_token, ExecutionOutcome.VERIFIED_SUCCESS
+            ):
+                return ActionResult("uncertain", binding.action_id)
+            return ActionResult("verified_success", binding.action_id)
+
+    def _remember_calendar_reservation(
+        self, binding: ActionBinding, event: CalendarEvent, state: str
+    ) -> None:
+        with self.store.database.transaction() as connection:
+            self._remember_calendar_reservation_in_transaction(
+                connection, binding, event, state
+            )
+
+    def _remember_calendar_reservation_in_transaction(
+        self,
+        connection: Any,
+        binding: ActionBinding,
+        event: CalendarEvent,
+        state: str,
+    ) -> None:
+        connection.execute(
+            """INSERT INTO calendar_reservations VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(action_id) DO UPDATE SET state=excluded.state,
+               updated_at=excluded.updated_at""",
+            (
+                binding.action_id,
+                binding.subject_id,
+                self.policy.calendar.booking_calendar_id,
+                event.event_id,
+                event.start_at,
+                event.end_at,
+                state,
+                self.now(),
+            ),
+        )
 
     def _finalize(
         self, action_id: str, claim_token: str, outcome: ExecutionOutcome
@@ -1829,6 +2308,7 @@ class PolicyGateService:
     def recover_claimed_actions(self) -> int:
         now = self.now()
         cutoff = now - self.policy.claim_lease_seconds
+        calendar_actions: list[tuple[str, ActionOrigin]] = []
         with self.store.database.transaction() as connection:
             rows = connection.execute(
                 """SELECT action_id FROM action_journal
@@ -1847,6 +2327,17 @@ class PolicyGateService:
                     (row["action_id"],),
                 )
             self._open_write_breaker_if_needed(connection, now)
+            if self.policy.calendar.enabled:
+                calendar_actions = [
+                    (str(row["action_id"]), ActionOrigin(str(row["origin"])))
+                    for row in connection.execute(
+                        """SELECT action_id, origin FROM action_journal
+                           WHERE operation=? AND state='uncertain'""",
+                        (Operation.MEETING_SCHEDULE.value,),
+                    ).fetchall()
+                ]
+        for action_id, origin in calendar_actions:
+            self._reconcile_action_for_origin(action_id, origin)
         return len(rows)
 
     def reconcile_action(self, action_id: str) -> ActionResult:
@@ -1895,6 +2386,42 @@ class PolicyGateService:
                     ),
                     action_id,
                 )
+            if (
+                self.policy.calendar.enabled
+                and binding.operation is Operation.MEETING_SCHEDULE
+            ):
+                assert self.calendar_api is not None
+                reservation = self.store.database.execute(
+                    "SELECT * FROM calendar_reservations WHERE action_id=?",
+                    (action_id,),
+                ).fetchone()
+                if reservation is None:
+                    return ActionResult("uncertain", action_id)
+                try:
+                    event = self.calendar_api.get_event(
+                        str(reservation["booking_calendar_id"]),
+                        str(reservation["event_id"]),
+                    )
+                except BaseException:
+                    return ActionResult("uncertain", action_id)
+                if event is None:
+                    offer_ref = binding.arguments.get("offer_ref")
+                    if not isinstance(offer_ref, str):
+                        return ActionResult("uncertain", action_id)
+                    self._resolve_uncertain(
+                        action_id,
+                        success=False,
+                        retry_offer_ref=offer_ref,
+                    )
+                    return ActionResult("definite_failure", action_id)
+                if (
+                    event.event_id != str(reservation["event_id"])
+                    or event.start_at != int(reservation["start_at"])
+                    or event.end_at != int(reservation["end_at"])
+                ):
+                    return ActionResult("uncertain", action_id)
+                self._resolve_uncertain(action_id, success=True)
+                return ActionResult("verified_success", action_id)
             outcome = self.executor.reconcile(binding)
             if outcome is ReconcileOutcome.UNRESOLVED:
                 return ActionResult("uncertain", action_id)
@@ -1937,11 +2464,18 @@ class PolicyGateService:
             return None
         return binding
 
-    def _resolve_uncertain(self, action_id: str, *, success: bool) -> None:
+    def _resolve_uncertain(
+        self,
+        action_id: str,
+        *,
+        success: bool,
+        retry_offer_ref: str | None = None,
+    ) -> None:
         now = self.now()
         with self.store.database.transaction() as connection:
             row = connection.execute(
-                """SELECT authority_id, origin FROM action_journal WHERE action_id=?
+                """SELECT authority_id, origin, subject_id, operation
+                   FROM action_journal WHERE action_id=?
                    AND state='uncertain'""",
                 (action_id,),
             ).fetchone()
@@ -1961,6 +2495,20 @@ class PolicyGateService:
                 "UPDATE quota_events SET state=?, changed_at=? WHERE action_id=?",
                 ("succeeded" if success else "released", now, action_id),
             )
+            if (
+                not success
+                and retry_offer_ref is not None
+                and str(row["operation"]) == Operation.MEETING_SCHEDULE.value
+            ):
+                # A verified 404 is the only path that reopens the exact same
+                # action.  The offer remains subject-bound, unexpired, and
+                # policy-digest checked when the retry claims it again.
+                connection.execute(
+                    """UPDATE calendar_offers SET consumed_at=NULL
+                       WHERE offer_ref=? AND subject_id=? AND consumed_at IS NOT NULL
+                       AND expires_at>?""",
+                    (retry_offer_ref, str(row["subject_id"]), now),
+                )
             authority_id = row["authority_id"]
             if authority_id is None:
                 return

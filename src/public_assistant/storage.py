@@ -1249,6 +1249,14 @@ class Unit1Store:
                     connection.execute(
                         "DELETE FROM deletion_links WHERE subject_ref=?", (subject,)
                     )
+                    if connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                        ("meeting_offer_controls",),
+                    ).fetchone():
+                        connection.execute(
+                            "DELETE FROM meeting_offer_controls WHERE subject_ref=?",
+                            (subject,),
+                        )
         return len(rows)
 
     def stored_message_binding(
@@ -1483,6 +1491,22 @@ class Unit1Store:
                             "UPDATE controls SET origin_reply_id=? WHERE token_hash=?",
                             (reply_id, self.digest("control", token[3:])),
                         )
+                    if (
+                        token
+                        and token.startswith("pa:mo:")
+                        and connection.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                            ("meeting_offer_controls",),
+                        ).fetchone()
+                    ):
+                        connection.execute(
+                            """UPDATE meeting_offer_controls SET origin_reply_id=?
+                               WHERE token_hash=?""",
+                            (
+                                reply_id,
+                                self.digest("meeting_offer_control", token[6:]),
+                            ),
+                        )
         record = self.get_reply(reply_id)
         if record is None:
             raise RuntimeError("durable reply was not created")
@@ -1580,6 +1604,15 @@ class Unit1Store:
                     "UPDATE controls SET origin_message_id=? WHERE origin_reply_id=?",
                     (telegram_message_id, reply_id),
                 )
+                if connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    ("meeting_offer_controls",),
+                ).fetchone():
+                    connection.execute(
+                        """UPDATE meeting_offer_controls SET origin_message_id=?
+                           WHERE origin_reply_id=?""",
+                        (telegram_message_id, reply_id),
+                    )
 
     def recover_sending_replies(self) -> int:
         with self.public.transaction() as connection:
@@ -1629,6 +1662,14 @@ class Unit1Store:
             ):
                 connection.execute(
                     f"DELETE FROM {table} WHERE subject_ref=?", (control.subject_ref,)
+                )
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                ("meeting_offer_controls",),
+            ).fetchone():
+                connection.execute(
+                    "DELETE FROM meeting_offer_controls WHERE subject_ref=?",
+                    (control.subject_ref,),
                 )
             for message_key in message_keys:
                 connection.execute(

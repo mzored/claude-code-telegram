@@ -57,6 +57,47 @@ def test_plaintext_and_newer_schema_are_refused(tmp_path: Path) -> None:
         GateStore(path, GATE_KEY)
 
 
+def test_v4_to_v5_migration_creates_calendar_state_independently(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v4-calendar.db"
+    database = SqlCipherDatabase(path, GATE_KEY, GATE_SCHEMA)
+    try:
+        with database.transaction() as connection:
+            connection.execute("UPDATE gate_schema_meta SET version=4")
+            connection.execute("DROP TABLE calendar_reservations")
+            connection.execute("DROP TABLE calendar_offers")
+    finally:
+        database.close()
+
+    store = GateStore(path, GATE_KEY)
+    try:
+        assert (
+            store.database.execute("SELECT version FROM gate_schema_meta").fetchone()[0]
+            == GATE_SCHEMA_VERSION
+        )
+        tables = {
+            str(row["name"])
+            for row in store.database.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert {"calendar_offers", "calendar_reservations"} <= tables
+    finally:
+        store.close()
+
+    reopened = GateStore(path, GATE_KEY)
+    try:
+        assert (
+            reopened.database.execute(
+                "SELECT version FROM gate_schema_meta"
+            ).fetchone()[0]
+            == GATE_SCHEMA_VERSION
+        )
+    finally:
+        reopened.close()
+
+
 def _legacy_binding(label: str, update_id: int) -> tuple[str, dict[str, object]]:
     fields: dict[str, object] = {
         "subject_id": "subject-a",
