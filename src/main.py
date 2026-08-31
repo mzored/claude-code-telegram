@@ -39,7 +39,10 @@ from src.security.validators import SecurityValidator
 from src.storage.facade import Storage
 from src.storage.session_storage import SQLiteSessionStorage
 
-_TELEGRAM_BOT_TOKEN_IN_URL = re.compile(r"(?<=api\.telegram\.org/bot)[^/\s\"']+")
+_TELEGRAM_BOT_TOKEN_IN_URL = re.compile(
+    r"(?P<prefix>api\.telegram\.org/(?:file/)?bot)[^/\s\"']+",
+    re.IGNORECASE,
+)
 
 
 class TelegramTokenRedactingFormatter(logging.Formatter):
@@ -47,7 +50,7 @@ class TelegramTokenRedactingFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         rendered = super().format(record)
-        return _TELEGRAM_BOT_TOKEN_IN_URL.sub("<redacted>", rendered)
+        return _TELEGRAM_BOT_TOKEN_IN_URL.sub(r"\g<prefix><redacted>", rendered)
 
 
 def setup_logging(debug: bool = False) -> None:
