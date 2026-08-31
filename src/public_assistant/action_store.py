@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 from src.external_read import ExternalRecord, ExternalRecordRef, ExternalSource
-from src.policy_gate.types import ActionBinding, ActionResult, Operation, canonical_json
+from src.policy_gate.types import (
+    ActionBinding,
+    ActionOrigin,
+    ActionResult,
+    Operation,
+    canonical_json,
+)
 from src.public_assistant.inbox import Unit2Store
 from src.public_assistant.types import InboundMessage
 
@@ -579,6 +585,90 @@ class Unit3Store(Unit2Store):
             if int(cursor.rowcount) != 1:
                 return None
             return binding
+
+    def create_meeting_owner_confirmation_request(self, binding: ActionBinding) -> str:
+        """Publish one opaque, owner-confirmable Inbox request for a selection.
+
+        The Inbox/outbox tables are the established public-to-owner notification
+        path.  This request deliberately carries only the immutable action
+        reference: Calendar offer detail remains in Policy Gate.
+        """
+
+        if (
+            binding.operation is not Operation.MEETING_SCHEDULE
+            or binding.origin is not ActionOrigin.PUBLIC_SENDER
+            or not binding.verify()
+        ):
+            raise ValueError("meeting confirmation binding is invalid")
+        now = self.now()
+        request_id = (
+            "REQ-"
+            + self.digest("meeting_confirmation_request", binding.action_id)[
+                :12
+            ].upper()
+        )
+        body = (
+            "Meeting selection requires exact owner confirmation. "
+            f"Action reference: {binding.action_id}."
+        )
+        alert = f"Assistant Inbox request {request_id} is ready."
+        with self.public.transaction() as connection:
+            action = connection.execute(
+                """SELECT subject_ref, request_id, source_update_id, operation,
+                          processing_authorization_version,
+                          processing_authorization_revision, expires_at
+                   FROM public_action_intents WHERE action_id=?""",
+                (binding.action_id,),
+            ).fetchone()
+            if (
+                action is None
+                or str(action["subject_ref"]) != binding.subject_id
+                or str(action["request_id"]) != binding.request_id
+                or int(action["source_update_id"]) != binding.update_id
+                or str(action["operation"]) != Operation.MEETING_SCHEDULE.value
+                or str(action["processing_authorization_version"])
+                != binding.processing_authorization_version
+                or int(action["processing_authorization_revision"])
+                != binding.processing_authorization_revision
+                or int(action["expires_at"]) <= now
+            ):
+                raise ValueError("meeting confirmation action is not durable")
+            connection.execute(
+                """INSERT INTO inbox_requests VALUES
+                   (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+                   ON CONFLICT(request_id) DO UPDATE SET body=excluded.body,
+                   state='open', source_update_id=excluded.source_update_id,
+                   content_updated_at=excluded.content_updated_at,
+                   expires_at=excluded.expires_at""",
+                (
+                    request_id,
+                    binding.subject_id,
+                    binding.connection_id,
+                    binding.conversation_id,
+                    body,
+                    binding.update_id,
+                    now,
+                    now,
+                    int(action["expires_at"]),
+                ),
+            )
+            connection.execute(
+                """INSERT INTO notification_outbox VALUES
+                   (?, ?, ?, 'pending', ?, ?)
+                   ON CONFLICT(request_id) DO UPDATE SET state='pending',
+                   updated_at=excluded.updated_at""",
+                (
+                    uuid.uuid5(
+                        uuid.UUID("cfa8e9d4-01a2-4938-8e65-16ae17fb222b"),
+                        request_id,
+                    ).hex,
+                    request_id,
+                    alert,
+                    now,
+                    now,
+                ),
+            )
+        return request_id
 
     def request_id_for_update(self, update_id: int) -> str | None:
         row = self.public.execute(

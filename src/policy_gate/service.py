@@ -1415,7 +1415,9 @@ class PolicyGateService:
             or not binding.verify()
             or not self._validate_arguments(binding)
         ):
-            return MeetingOptionsResult("denied", binding.action_id)
+            return MeetingOptionsResult(
+                "denied", binding.action_id, timezone=self.policy.calendar.timezone
+            )
         with self._action_lock(binding.action_id):
             now = self.now()
             with self.store.database.transaction() as connection:
@@ -1438,9 +1440,14 @@ class PolicyGateService:
                             )
                             for row in existing
                         ),
+                        self.policy.calendar.timezone,
                     )
                 if self._authorize_claim(connection, binding) is not None:
-                    return MeetingOptionsResult("denied", binding.action_id)
+                    return MeetingOptionsResult(
+                        "denied",
+                        binding.action_id,
+                        timezone=self.policy.calendar.timezone,
+                    )
             args = binding.arguments
             assert isinstance(args["date"], str)
             assert isinstance(args["duration_minutes"], int)
@@ -1457,14 +1464,22 @@ class PolicyGateService:
                 if block.start_at <= now + self.policy.maximum_meeting_horizon_seconds
             )
             if not blocks:
-                return MeetingOptionsResult("verified_success", binding.action_id)
+                return MeetingOptionsResult(
+                    "verified_success",
+                    binding.action_id,
+                    timezone=self.policy.calendar.timezone,
+                )
             # Provider reads are a quota-bearing capability, not an idempotent
             # action result.  A cached offer returns above without a new read;
             # every real free/busy attempt gets an independent durable debit.
             read_attempt_id = "calendar-read-" + secrets.token_hex(16)
             with self.store.database.transaction() as connection:
                 if self._authorize_claim(connection, binding) is not None:
-                    return MeetingOptionsResult("denied", binding.action_id)
+                    return MeetingOptionsResult(
+                        "denied",
+                        binding.action_id,
+                        timezone=self.policy.calendar.timezone,
+                    )
                 connection.execute(
                     "INSERT INTO quota_events VALUES (?, ?, ?, ?, ?, 'succeeded', ?)",
                     (
@@ -1495,7 +1510,11 @@ class PolicyGateService:
                 )
             except BaseException:
                 self.set_breaker("reads", True)
-                return MeetingOptionsResult("unavailable", binding.action_id)
+                return MeetingOptionsResult(
+                    "unavailable",
+                    binding.action_id,
+                    timezone=self.policy.calendar.timezone,
+                )
             available = [
                 block
                 for block in blocks
@@ -1510,14 +1529,22 @@ class PolicyGateService:
                     self._authorize_claim(connection, binding, require_quota=False)
                     is not None
                 ):
-                    return MeetingOptionsResult("denied", binding.action_id)
+                    return MeetingOptionsResult(
+                        "denied",
+                        binding.action_id,
+                        timezone=self.policy.calendar.timezone,
+                    )
                 slots: list[tuple[str, int, int, int]] = []
                 for block in available:
                     offer = fresh_offer_ref()
                     start_at = (
                         block.start_at + self.policy.calendar.before_buffer_minutes * 60
                     )
-                    end_at = start_at + args["duration_minutes"] * 60
+                    end_at = (
+                        block.end_at - self.policy.calendar.after_buffer_minutes * 60
+                    )
+                    if end_at - start_at != args["duration_minutes"] * 60:
+                        continue
                     connection.execute(
                         "INSERT INTO calendar_offers VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
                         (
@@ -1533,7 +1560,10 @@ class PolicyGateService:
                     )
                     slots.append((offer, start_at, end_at, args["duration_minutes"]))
             return MeetingOptionsResult(
-                "verified_success", binding.action_id, tuple(slots)
+                "verified_success",
+                binding.action_id,
+                tuple(slots),
+                self.policy.calendar.timezone,
             )
 
     def _calendar_policy_digest(self, duration_minutes: int) -> str:

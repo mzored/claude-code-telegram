@@ -393,6 +393,7 @@ class MeetingOptionsResult:
     outcome: str
     action_id: str
     slots: tuple[tuple[str, int, int, int], ...] = ()
+    timezone: str = "UTC"
 
 
 @dataclass(frozen=True)

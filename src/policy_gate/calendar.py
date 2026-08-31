@@ -27,7 +27,7 @@ FIXED_EVENT_DESCRIPTION = (
 GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 GOOGLE_CALENDAR_SCOPES = frozenset(
     {
-        "https://www.googleapis.com/auth/calendar.events",
+        "https://www.googleapis.com/auth/calendar.events.owned",
         "https://www.googleapis.com/auth/calendar.events.freebusy",
     }
 )
@@ -35,6 +35,10 @@ GOOGLE_CALENDAR_SCOPES = frozenset(
 
 class CalendarConfigurationError(ValueError):
     """Calendar enablement is incomplete or grants more than the fixed adapter needs."""
+
+
+class CalendarEventMismatchError(ValueError):
+    """A present provider event is not the fixed anonymous reservation body."""
 
 
 @dataclass(frozen=True)
@@ -303,18 +307,18 @@ class GoogleCalendarApi:
             or not isinstance(start.get("dateTime"), str)
             or not isinstance(end.get("dateTime"), str)
         ):
-            return None
+            raise CalendarEventMismatchError("Calendar event mismatch")
         try:
             starts_at = datetime.fromisoformat(start["dateTime"].replace("Z", "+00:00"))
             ends_at = datetime.fromisoformat(end["dateTime"].replace("Z", "+00:00"))
-        except ValueError:
-            return None
+        except ValueError as exc:
+            raise CalendarEventMismatchError("Calendar event mismatch") from exc
         if starts_at.tzinfo is None or ends_at.tzinfo is None:
-            return None
+            raise CalendarEventMismatchError("Calendar event mismatch")
         start_at = int(starts_at.timestamp())
         end_at = int(ends_at.timestamp())
         if end_at <= start_at:
-            return None
+            raise CalendarEventMismatchError("Calendar event mismatch")
         return CalendarEvent(event_id, start_at, end_at)
 
 
@@ -452,7 +456,12 @@ def candidate_blocks(
     while current + duration <= finish:
         instant = _valid_local_instants(current, policy.zone)
         end_instant = _valid_local_instants(current + duration, policy.zone)
-        if instant and end_instant:
+        if (
+            instant
+            and end_instant
+            and int((end_instant[0] - instant[0]).total_seconds())
+            == duration_minutes * 60
+        ):
             start_at = int((instant[0] - before).timestamp())
             end_at = int((end_instant[0] + after).timestamp())
             if start_at >= earliest and end_at > start_at and end_at >= latest:

@@ -67,7 +67,7 @@ def test_enabled_calendar_requires_complete_distinct_configuration_and_fixed_sco
         "refresh_token":"calendar-refresh-token",
         "token_uri":"https://oauth2.googleapis.com/token",
         "scopes":[
-          "https://www.googleapis.com/auth/calendar.events",
+          "https://www.googleapis.com/auth/calendar.events.owned",
           "https://www.googleapis.com/auth/calendar.events.freebusy"
         ]
         }""",
@@ -90,7 +90,7 @@ def test_enabled_calendar_requires_complete_distinct_configuration_and_fixed_sco
     config = GateConfig.from_environment(env)
     assert config.calendar.enabled
     assert config.read_calendar_credentials().scopes == (
-        "https://www.googleapis.com/auth/calendar.events",
+        "https://www.googleapis.com/auth/calendar.events.owned",
         "https://www.googleapis.com/auth/calendar.events.freebusy",
     )
 

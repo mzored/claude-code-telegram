@@ -190,7 +190,7 @@ _ACTION_KEYS = frozenset(
 )
 _LEGACY_PUBLIC_ACTION_KEYS = _ACTION_KEYS - frozenset({"origin"})
 _ACTION_RESULT_KEYS = frozenset({"outcome", "action_id"})
-_MEETING_OPTIONS_RESULT_KEYS = frozenset({"outcome", "action_id", "slots"})
+_MEETING_OPTIONS_RESULT_KEYS = frozenset({"outcome", "action_id", "slots", "timezone"})
 _EXTERNAL_LINK_KEYS = frozenset({"link_identity", "source_digest"})
 _EXTERNAL_CONFIRMATION_KEYS = frozenset({"link", "confirmation_sequence"})
 _DRAFT_KEYS = frozenset(
@@ -274,6 +274,7 @@ def _meeting_options_result_to_wire(result: MeetingOptionsResult) -> dict[str, o
         "outcome": result.outcome,
         "action_id": result.action_id,
         "slots": [list(slot) for slot in result.slots],
+        "timezone": result.timezone,
     }
 
 
@@ -293,6 +294,7 @@ def _meeting_options_result_from_wire(value: object) -> MeetingOptionsResult:
         _text(fields["outcome"]),
         _text(fields["action_id"], allow_empty=True),
         tuple(slots),
+        _text(fields["timezone"]),
     )
 
 

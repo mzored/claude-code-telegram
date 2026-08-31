@@ -12,6 +12,8 @@ from src.policy_gate.calendar import (
     BusyInterval,
     CalendarConfigurationError,
     CalendarCredentials,
+    CalendarEvent,
+    CalendarEventMismatchError,
     CalendarPolicy,
     FakeCalendarApi,
     GoogleCalendarApi,
@@ -38,6 +40,17 @@ class _TimeoutAfterInsert(FakeCalendarApi):
         raise TimeoutError("provider response lost")
 
 
+class _UnresolvedCalendar(_TimeoutAfterInsert):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lookup_calls = 0
+
+    def get_event(self, calendar_id: str, event_id: str) -> CalendarEvent | None:
+        del calendar_id, event_id
+        self.lookup_calls += 1
+        raise TimeoutError("provider lookup unavailable")
+
+
 class _Clock(Protocol):
     value: int
 
@@ -45,12 +58,17 @@ class _Clock(Protocol):
 
 
 def _calendar_gate(
-    tmp_path: Path, clock: _Clock, calendar: FakeCalendarApi
+    tmp_path: Path,
+    clock: _Clock,
+    calendar: FakeCalendarApi,
+    *,
+    unresolved_write_breaker_threshold: int = 3,
 ) -> PolicyGateService:
     policy = PolicyConfig(
         enabled_operations=frozenset(
             {Operation.MEETING_OPTIONS, Operation.MEETING_SCHEDULE}
         ),
+        unresolved_write_breaker_threshold=unresolved_write_breaker_threshold,
         calendar=CalendarPolicy(
             enabled=True,
             booking_calendar_id="booking",
@@ -101,14 +119,14 @@ def _binding(
     )
 
 
-def _grant_schedule(service: PolicyGateService) -> None:
+def _grant_schedule(service: PolicyGateService, *, remaining_uses: int = 1) -> None:
     prepared = service.prepare_admin(
         TrustedReference("managed_chat", "calendar-chat"),
         AdminDraft(
             AdminKind.GRANT,
             operation=Operation.MEETING_SCHEDULE,
             scope=Scope.BOUNDED,
-            remaining_uses=1,
+            remaining_uses=remaining_uses,
         ),
         owner_id=1,
         control_chat_id=1,
@@ -184,6 +202,91 @@ def test_final_conflict_and_timeout_reconcile_without_second_insert(
     assert len(fake.insert_calls) == 1
 
 
+def test_present_mismatched_event_stays_unresolved_and_blocks_erasure(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    credentials = CalendarCredentials(
+        "client", "secret", "refresh", "https://oauth2.googleapis.com/token"
+    )
+
+    def request(method: str, url: str, body: bytes | None, headers: object) -> object:
+        del body, headers
+        if url == "https://oauth2.googleapis.com/token":
+            return {
+                "access_token": "test-token",
+                "scope": " ".join(sorted(GOOGLE_CALENDAR_SCOPES)),
+            }
+        if url.endswith("/freeBusy"):
+            return {
+                "calendars": {
+                    "availability": {"busy": []},
+                    "booking": {"busy": []},
+                }
+            }
+        if method == "POST":
+            raise TimeoutError("provider response lost")
+        if method == "GET":
+            return {
+                "id": url.rsplit("/", 1)[-1],
+                "summary": "different summary",
+                "description": "Created by the public assistant; contains no sender or request data.",
+                "visibility": "private",
+                "transparency": "opaque",
+                "start": {"dateTime": "2026-09-01T12:00:00+00:00"},
+                "end": {"dateTime": "2026-09-01T12:30:00+00:00"},
+            }
+        raise AssertionError("unexpected Calendar request")
+
+    service = _calendar_gate(
+        tmp_path,
+        clock,
+        GoogleCalendarApi(credentials, request_json=request),  # type: ignore[arg-type]
+    )
+    requested = datetime.fromtimestamp(
+        clock.value, ZoneInfo("America/New_York")
+    ).date() + timedelta(days=1)
+    options = _binding(
+        service,
+        clock,
+        Operation.MEETING_OPTIONS,
+        {"date": requested.isoformat(), "duration_minutes": 30, "candidate_count": 1},
+        15,
+    )
+    offer = service.meeting_options(options).slots[0]
+    _grant_schedule(service)
+    schedule = _binding(
+        service, clock, Operation.MEETING_SCHEDULE, {"offer_ref": offer[0]}, 16
+    )
+
+    assert service.submit_action(schedule).outcome == "uncertain"
+    assert service.reconcile_action(schedule.action_id).outcome == "uncertain"
+    journal = service.store.database.execute(
+        "SELECT state, outcome, binding_json FROM action_journal WHERE action_id=?",
+        (schedule.action_id,),
+    ).fetchone()
+    assert journal is not None
+    assert journal["state"] == "uncertain"
+    assert journal["outcome"] == "uncertain"
+    assert str(journal["binding_json"]) != "{}"
+    assert (
+        service.store.remaining_uses("calendar-subject", Operation.MEETING_SCHEDULE)
+        == 0
+    )
+    reservation = service.store.database.execute(
+        "SELECT action_id FROM calendar_reservations WHERE action_id=?",
+        (schedule.action_id,),
+    ).fetchone()
+    assert reservation is not None
+    assert service.erase_subject("calendar-subject") == "pending_reconciliation"
+    assert (
+        service.store.database.execute(
+            "SELECT action_id FROM calendar_reservations WHERE action_id=?",
+            (schedule.action_id,),
+        ).fetchone()
+        is not None
+    )
+
+
 def test_worker_reconciles_a_crash_after_claim_and_retries_only_after_absence(
     tmp_path: Path, clock: _Clock
 ) -> None:
@@ -221,6 +324,144 @@ def test_worker_reconciles_a_crash_after_claim_and_retries_only_after_absence(
     assert service.reconcile_action(schedule.action_id).outcome == "denied"
     assert service.submit_action(schedule).outcome == "verified_success"
     assert len(fake.insert_calls) == 1
+
+
+def test_verified_absence_does_not_reopen_an_expired_offer(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    fake = FakeCalendarApi()
+    service = _calendar_gate(tmp_path, clock, fake)
+    requested = datetime.fromtimestamp(
+        clock.value, ZoneInfo("America/New_York")
+    ).date() + timedelta(days=1)
+    options = _binding(
+        service,
+        clock,
+        Operation.MEETING_OPTIONS,
+        {"date": requested.isoformat(), "duration_minutes": 30, "candidate_count": 1},
+        25,
+    )
+    offer = service.meeting_options(options).slots[0]
+    _grant_schedule(service)
+    schedule = _binding(
+        service, clock, Operation.MEETING_SCHEDULE, {"offer_ref": offer[0]}, 26
+    )
+
+    def crash_after_claim(stage: str) -> None:
+        if stage == "after_claim":
+            raise RuntimeError("simulated process crash")
+
+    with pytest.raises(RuntimeError, match="simulated process crash"):
+        service.submit_action(schedule, crash_hook=crash_after_claim)
+    clock.value += (
+        max(
+            service.policy.claim_lease_seconds,
+            service.policy.calendar.offer_ttl_seconds,
+        )
+        + 1
+    )
+    assert service.recover_claimed_actions() == 1
+    journal = service.store.database.execute(
+        "SELECT state, outcome FROM action_journal WHERE action_id=?",
+        (schedule.action_id,),
+    ).fetchone()
+    assert journal is not None
+    assert tuple(journal) == ("definite_failure", "verified_absent")
+    assert service.submit_action(schedule).outcome == "denied"
+    assert fake.insert_calls == []
+
+
+def test_repeated_unresolved_calendar_lookups_keep_the_write_breaker_open(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    fake = _UnresolvedCalendar()
+    service = _calendar_gate(tmp_path, clock, fake)
+    requested = datetime.fromtimestamp(
+        clock.value, ZoneInfo("America/New_York")
+    ).date() + timedelta(days=1)
+    _grant_schedule(service, remaining_uses=3)
+    schedules: list[ActionBinding] = []
+    for index in range(3):
+        options = _binding(
+            service,
+            clock,
+            Operation.MEETING_OPTIONS,
+            {
+                "date": requested.isoformat(),
+                "duration_minutes": 30,
+                "candidate_count": 1,
+            },
+            40 + index * 2,
+        )
+        offer = service.meeting_options(options).slots[0]
+        schedule = _binding(
+            service,
+            clock,
+            Operation.MEETING_SCHEDULE,
+            {"offer_ref": offer[0]},
+            41 + index * 2,
+        )
+        schedules.append(schedule)
+        assert service.submit_action(schedule).outcome == "uncertain"
+
+    breaker = service.store.database.execute(
+        "SELECT is_open FROM breakers WHERE name='writes'"
+    ).fetchone()
+    assert breaker is not None and int(breaker["is_open"]) == 1
+    assert service.reconcile_action(schedules[0].action_id).outcome == "uncertain"
+    assert service.reconcile_action(schedules[0].action_id).outcome == "uncertain"
+    assert fake.lookup_calls == 2
+    journal = service.store.database.execute(
+        "SELECT state, binding_json FROM action_journal WHERE action_id=?",
+        (schedules[0].action_id,),
+    ).fetchone()
+    assert journal is not None
+    assert tuple(journal)[0] == "uncertain"
+    assert str(journal["binding_json"]) != "{}"
+
+
+def test_verified_absence_allows_clean_subject_erasure(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    fake = FakeCalendarApi()
+    service = _calendar_gate(tmp_path, clock, fake)
+    requested = datetime.fromtimestamp(
+        clock.value, ZoneInfo("America/New_York")
+    ).date() + timedelta(days=1)
+    options = _binding(
+        service,
+        clock,
+        Operation.MEETING_OPTIONS,
+        {"date": requested.isoformat(), "duration_minutes": 30, "candidate_count": 1},
+        50,
+    )
+    offer = service.meeting_options(options).slots[0]
+    _grant_schedule(service)
+    schedule = _binding(
+        service, clock, Operation.MEETING_SCHEDULE, {"offer_ref": offer[0]}, 51
+    )
+
+    def crash_after_claim(stage: str) -> None:
+        if stage == "after_claim":
+            raise RuntimeError("simulated process crash")
+
+    with pytest.raises(RuntimeError, match="simulated process crash"):
+        service.submit_action(schedule, crash_hook=crash_after_claim)
+    clock.value += service.policy.claim_lease_seconds + 1
+    assert service.recover_claimed_actions() == 1
+    assert service.erase_subject("calendar-subject") == "erased"
+    journal = service.store.database.execute(
+        "SELECT binding_json FROM action_journal WHERE action_id=?",
+        (schedule.action_id,),
+    ).fetchone()
+    assert journal is not None and journal["binding_json"] == "{}"
+    assert (
+        service.store.database.execute(
+            "SELECT action_id FROM calendar_reservations WHERE action_id=?",
+            (schedule.action_id,),
+        ).fetchone()
+        is None
+    )
 
 
 def test_calendar_definite_failure_does_not_reclaim_the_same_offer(
@@ -270,6 +511,23 @@ def test_dst_and_event_identifier_are_provider_safe() -> None:
     event_id = deterministic_event_id("calendar-test", "action-test")
     assert event_id == deterministic_event_id("calendar-test", "action-test")
     assert set(event_id) <= set("0123456789abcdefghijklmnopqrstuv")
+
+    lord_howe = CalendarPolicy(
+        enabled=True,
+        booking_calendar_id="booking",
+        availability_calendar_ids=("booking",),
+        timezone="Australia/Lord_Howe",
+        working_days=frozenset({6}),
+        working_hour_start=1,
+        working_hour_end=4,
+        grid_minutes=30,
+        credential_file=Path("/tmp/unit5-calendar-credential.json"),
+    )
+    half_hour_transition = candidate_blocks(lord_howe, date(2026, 10, 4), 60, 0)
+    assert half_hour_transition
+    assert all(
+        block.end_at - block.start_at == 60 * 60 for block in half_hour_transition
+    )
 
 
 def test_google_adapter_has_a_fixed_anonymous_event_body() -> None:
@@ -385,12 +643,10 @@ def test_google_adapter_rejects_missing_scope_calendar_errors_and_risky_recovery
             "extendedProperties": {"private": {"untrusted": "value"}},
         }
 
-    assert (
+    with pytest.raises(CalendarEventMismatchError, match="event mismatch"):
         GoogleCalendarApi(credentials, request_json=risky_event).get_event(  # type: ignore[arg-type]
             "booking", "event-a"
         )
-        is None
-    )
 
 
 def test_calendar_credentials_require_exact_fixed_scope_set() -> None:

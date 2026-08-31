@@ -20,7 +20,7 @@ from src.policy_gate.types import (
     TrustedReference,
 )
 from src.public_assistant.action_store import Unit3Store
-from src.public_assistant.actions import ActionCoordinator
+from src.public_assistant.actions import ActionAssistantService, ActionCoordinator
 from src.public_assistant.config import PublicAssistantConfig
 from src.public_assistant.model import ActionProposal
 from src.public_assistant.telegram_adapter import TelegramBusinessAdapter
@@ -134,7 +134,17 @@ def test_sender_callback_creates_only_an_owner_confirmable_offer_binding(
             coordinator.discover(item),
         )
         assert delivery.result.outcome == "verified_success"
+        assert delivery.result.timezone == "America/New_York"
         assert len(delivery.controls) == 1
+        label = ActionAssistantService._meeting_option_label(
+            delivery.controls[0], delivery.result.timezone
+        )
+        expected_start = datetime.fromtimestamp(
+            delivery.controls[0].start_at, ZoneInfo("America/New_York")
+        )
+        assert f"{expected_start:%H:%M}" in label
+        assert label.endswith("America/New_York")
+        assert not label.endswith("UTC")
         callback = delivery.controls[0].callback_data
         offered_callback(store, item, callback)
 
@@ -158,6 +168,22 @@ def test_sender_callback_creates_only_an_owner_confirmable_offer_binding(
             callback_update_id=91,
         )
         assert selected.outcome == "awaiting_owner_confirmation"
+        notifications = store.due_notifications()
+        assert len(notifications) == 1
+        notification = notifications[0]
+        assert notification.text == (
+            f"Assistant Inbox request {notification.request_id} is ready."
+        )
+        confirmation = store.public.execute(
+            "SELECT body FROM inbox_requests WHERE request_id=?",
+            (notification.request_id,),
+        ).fetchone()
+        assert confirmation is not None
+        assert str(confirmation["body"]) == (
+            "Meeting selection requires exact owner confirmation. "
+            f"Action reference: {selected.action_id}."
+        )
+        assert delivery.result.slots[0][0] not in str(confirmation["body"])
         row = store.public.execute(
             "SELECT arguments_json FROM public_action_intents WHERE action_id=?",
             (selected.action_id,),

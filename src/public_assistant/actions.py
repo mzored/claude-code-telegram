@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Callable, Mapping, Protocol, Sequence
+from zoneinfo import ZoneInfo
 
 from src.policy_gate.types import (
     ActionBinding,
@@ -350,6 +351,7 @@ class ActionCoordinator:
                 return result
             result = self.gate.submit_action(binding)
             if result.outcome == "denied":
+                self.store.create_meeting_owner_confirmation_request(binding)
                 pending = ActionResult("awaiting_owner_confirmation", binding.action_id)
                 self.store.finish_action(pending)
                 return pending
@@ -534,7 +536,7 @@ class ActionAssistantService(AssistantService):
                     if delivery.controls:
                         text = MEETING_OPTIONS_PROMPT[language]
                         reply = self._meeting_options_reply(
-                            message, text, delivery.controls
+                            message, text, delivery.controls, delivery.result.timezone
                         )
                         outcome = "meeting_options_offered"
                     else:
@@ -592,16 +594,18 @@ class ActionAssistantService(AssistantService):
         return ProcessingResult(outcome, reply)
 
     @staticmethod
-    def _meeting_option_label(control: MeetingOfferControl) -> str:
-        start = datetime.fromtimestamp(control.start_at, UTC)
-        end = datetime.fromtimestamp(control.end_at, UTC)
-        return f"{start:%a %d %b %H:%M} to {end:%H:%M} UTC"
+    def _meeting_option_label(control: MeetingOfferControl, timezone: str) -> str:
+        zone = ZoneInfo(timezone)
+        start = datetime.fromtimestamp(control.start_at, zone)
+        end = datetime.fromtimestamp(control.end_at, zone)
+        return f"{start:%a %d %b %H:%M} to {end:%H:%M} {timezone}"
 
     def _meeting_options_reply(
         self,
         message: InboundMessage,
         text: str,
         controls: tuple[MeetingOfferControl, ...],
+        timezone: str,
     ) -> ReplyRecord:
         language = _language(message.text)
         revoke, delete = self.store.create_maintenance_controls(
@@ -613,7 +617,7 @@ class ActionAssistantService(AssistantService):
         keyboard: list[list[dict[str, str]]] = [
             [
                 {
-                    "text": self._meeting_option_label(control),
+                    "text": self._meeting_option_label(control, timezone),
                     "callback_data": control.callback_data,
                 }
             ]
