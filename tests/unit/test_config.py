@@ -73,6 +73,43 @@ def test_allowed_users_parsing_with_spaces():
         assert settings.allowed_users == [123, 456, 789]
 
 
+def test_private_controller_is_disabled_by_default_and_requires_one_owner_chat(
+    tmp_path,
+):
+    base = {
+        "telegram_bot_token": "test:token",
+        "telegram_bot_username": "testbot",
+        "approved_directory": tmp_path,
+    }
+    assert Settings(**base).private_controller_enabled is False
+    with pytest.raises(ValueError, match="explicit owner and control chat"):
+        Settings(**base, private_controller_enabled=True)
+    with pytest.raises(ValueError, match="owner must be an allowed user"):
+        Settings(
+            **base,
+            private_controller_enabled=True,
+            private_controller_owner_id=123,
+            private_controller_control_chat_id=123,
+            private_controller_gate_socket_path=tmp_path / "gate.sock",
+            allowed_users=[456],
+        )
+    enabled = Settings(
+        **base,
+        private_controller_enabled=True,
+        private_controller_owner_id=123,
+        private_controller_control_chat_id=123,
+        private_controller_gate_socket_path=tmp_path / "gate.sock",
+        allowed_users=[123],
+    )
+    assert enabled.private_controller_owner_id == 123
+    assert enabled.private_controller_gate_socket_path == tmp_path / "gate.sock"
+    with pytest.raises(ValueError, match="socket requires"):
+        Settings(
+            **base,
+            private_controller_gate_socket_path=tmp_path / "gate.sock",
+        )
+
+
 def test_security_relaxation_settings_defaults_and_overrides():
     """Security relaxation settings should default to False and be configurable."""
     with tempfile.TemporaryDirectory() as tmp_dir:

@@ -9,10 +9,14 @@ import os
 import re
 import sys
 
+from src.policy_gate.rpc import PublicGateRpcClient
+from src.public_assistant.action_store import Unit3Store
+from src.public_assistant.actions import ActionAssistantService, ActionCoordinator
 from src.public_assistant.config import (
     PublicAssistantConfig,
     PublicAssistantConfigurationError,
     Unit2Config,
+    Unit3Config,
 )
 from src.public_assistant.conversation import AssistantService
 from src.public_assistant.inbox import Unit2Store
@@ -88,6 +92,7 @@ def _run() -> None:
 
     config = PublicAssistantConfig.from_environment()
     unit2_config = Unit2Config.from_environment(config)
+    unit3_config = Unit3Config.from_environment(config)
     credentials = config.load_runtime_credentials()
     openai_api_key = unit2_config.read_openai_api_key()
     if openai_api_key.encode() in {
@@ -99,12 +104,23 @@ def _run() -> None:
         raise PublicAssistantConfigurationError(
             "OpenAI credential material must differ from runtime credentials"
         )
-    store = Unit2Store(
-        config.data_dir,
-        credentials.pending_database_key,
-        credentials.public_database_key,
-        credentials.pseudonym_key,
-    )
+    store: Unit2Store
+    if unit3_config.enabled:
+        if unit3_config.socket_path is None:
+            raise PublicAssistantConfigurationError("Policy Gate socket is missing")
+        store = Unit3Store(
+            config.data_dir,
+            credentials.pending_database_key,
+            credentials.public_database_key,
+            credentials.pseudonym_key,
+        )
+    else:
+        store = Unit2Store(
+            config.data_dir,
+            credentials.pending_database_key,
+            credentials.public_database_key,
+            credentials.pseudonym_key,
+        )
     log = PrivacyLog(credentials.pseudonym_key, logging.getLogger("public_assistant"))
     model = OpenAIResponsesModel(
         openai_api_key,
@@ -112,7 +128,23 @@ def _run() -> None:
         timeout_seconds=unit2_config.timeout_seconds,
         max_output_tokens=unit2_config.max_output_tokens,
     )
-    service = AssistantService(config, unit2_config, store, model, logger=log)
+    service: AssistantService
+    if unit3_config.enabled:
+        assert isinstance(store, Unit3Store)
+        assert unit3_config.socket_path is not None
+        coordinator = ActionCoordinator(
+            store, PublicGateRpcClient(unit3_config.socket_path)
+        )
+        service = ActionAssistantService(
+            config,
+            unit2_config,
+            store,
+            model,
+            coordinator,
+            logger=log,
+        )
+    else:
+        service = AssistantService(config, unit2_config, store, model, logger=log)
     application, adapter = build_application(
         config, service, store, credentials.bot_token
     )

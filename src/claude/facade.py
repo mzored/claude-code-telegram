@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional
 import structlog
 
 from ..config.settings import Settings
+from ..private_controller.origin import RunOriginLedger, RunSource, RunTrigger
 from .sdk_integration import ClaudeResponse, ClaudeSDKManager, StreamUpdate
 from .session import SessionManager
 
@@ -38,11 +39,13 @@ class ClaudeIntegration:
         config: Settings,
         sdk_manager: Optional[ClaudeSDKManager] = None,
         session_manager: Optional[SessionManager] = None,
+        run_origins: RunOriginLedger | None = None,
     ):
         """Initialize Claude integration facade."""
         self.config = config
         self.sdk_manager = sdk_manager or ClaudeSDKManager(config)
         self.session_manager = session_manager
+        self.run_origins = run_origins
 
     async def run_command(
         self,
@@ -54,8 +57,26 @@ class ClaudeIntegration:
         force_new: bool = False,
         interrupt_event: Optional["asyncio.Event"] = None,
         images: Optional[List[Dict[str, str]]] = None,
+        run_trigger: RunTrigger | None = None,
     ) -> ClaudeResponse:
         """Run Claude Code command with full integration."""
+        if self.run_origins is None:
+            raise RuntimeError("private-model run origin ledger is required")
+        trigger = run_trigger or RunTrigger(
+            source=RunSource.CONTEXT_ONLY,
+            actor_id=user_id,
+            chat_id=0,
+            update_id=0,
+            message_id=0,
+            fresh=False,
+            context_only=True,
+            resumed_session=bool(session_id),
+        )
+        persisted_run = self.run_origins.begin(
+            trigger,
+            owner_id=self.config.private_controller_owner_id or -1,
+            control_chat_id=self.config.private_controller_control_chat_id or -1,
+        )
         logger.info(
             "Running Claude command",
             user_id=user_id,
@@ -63,6 +84,8 @@ class ClaudeIntegration:
             session_id=session_id,
             prompt_length=len(prompt),
             force_new=force_new,
+            run_id=persisted_run.run_id,
+            run_origin=persisted_run.origin.value,
         )
 
         # If no session_id provided, try to find an existing session for this
@@ -310,6 +333,7 @@ class ClaudeIntegration:
         working_directory: Path,
         prompt: Optional[str] = None,
         on_stream: Optional[Callable[[StreamUpdate], None]] = None,
+        run_trigger: RunTrigger | None = None,
     ) -> Optional[ClaudeResponse]:
         """Continue the most recent session."""
         logger.info(
@@ -344,6 +368,17 @@ class ClaudeIntegration:
             user_id=user_id,
             session_id=latest_session.session_id,
             on_stream=on_stream,
+            run_trigger=run_trigger
+            or RunTrigger(
+                source=RunSource.CONTEXT_ONLY,
+                actor_id=user_id,
+                chat_id=0,
+                update_id=0,
+                message_id=0,
+                fresh=False,
+                context_only=True,
+                resumed_session=True,
+            ),
         )
 
     async def get_session_info(
@@ -387,5 +422,8 @@ class ClaudeIntegration:
         logger.info("Shutting down Claude integration")
 
         await self.cleanup_expired_sessions()
+
+        if self.run_origins is not None:
+            self.run_origins.close()
 
         logger.info("Claude integration shutdown complete")

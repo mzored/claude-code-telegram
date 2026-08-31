@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence, cast
+
+from src.policy_gate.types import ActionSchema, Operation
 
 
 class ModelFailure(RuntimeError):
@@ -26,11 +28,20 @@ class RequestPatch:
 
 
 @dataclass(frozen=True)
+class ActionProposal:
+    """One schema-bounded proposal; identity and authority stay application-owned."""
+
+    operation: Operation
+    arguments: Mapping[str, object]
+
+
+@dataclass(frozen=True)
 class AssistantTurn:
     reply_text: str
     turn_kind: str
     missing_information: tuple[str, ...] = ()
     request_patch: RequestPatch | None = None
+    action_proposal: ActionProposal | None = None
 
 
 @dataclass(frozen=True)
@@ -45,7 +56,12 @@ class PublicModel(Protocol):
     """Only capability the conversation service receives from a model."""
 
     def generate(
-        self, conversation: Sequence[ConversationItem], safety_identifier: str
+        self,
+        conversation: Sequence[ConversationItem],
+        safety_identifier: str,
+        *,
+        policy_context: Mapping[str, object] | None = None,
+        allowed_actions: Sequence[ActionSchema] = (),
     ) -> ModelResult: ...
 
 
@@ -89,6 +105,71 @@ TURN_SCHEMA: dict[str, Any] = {
     ],
 }
 
+
+_ACTION_ARGUMENT_SCHEMAS: dict[Operation, dict[str, Any]] = {
+    Operation.MEETING_OPTIONS: {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "date": {"type": "string", "maxLength": 10},
+            "duration_minutes": {"type": "integer", "enum": [30, 60]},
+            "candidate_count": {"type": "integer", "minimum": 1, "maximum": 3},
+        },
+        "required": ["date", "duration_minutes", "candidate_count"],
+    },
+    Operation.MEETING_SCHEDULE: {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "start_at": {"type": "integer"},
+            "duration_minutes": {"type": "integer", "enum": [30, 60]},
+        },
+        "required": ["start_at", "duration_minutes"],
+    },
+    Operation.TASK_CREATE: {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "title": {"type": "string", "minLength": 1, "maxLength": 200},
+            "due_date": {"anyOf": [{"type": "null"}, {"type": "string"}]},
+        },
+        "required": ["title", "due_date"],
+    },
+}
+
+
+def action_schemas(operations: Sequence[Operation]) -> tuple[ActionSchema, ...]:
+    """Return local schemas only for the Gate's current discovery decision."""
+
+    return tuple(
+        ActionSchema(operation, _ACTION_ARGUMENT_SCHEMAS[operation])
+        for operation in operations
+    )
+
+
+def _turn_schema(allowed_actions: Sequence[ActionSchema]) -> dict[str, Any]:
+    schema = cast(dict[str, Any], json.loads(json.dumps(TURN_SCHEMA)))
+    if not allowed_actions:
+        return schema
+    variants: list[dict[str, Any]] = [{"type": "null"}]
+    for action in allowed_actions:
+        variants.append(
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "operation": {"type": "string", "const": action.operation.value},
+                    "arguments": action.arguments_schema,
+                },
+                "required": ["operation", "arguments"],
+            }
+        )
+    schema["properties"]["action_proposal"] = {"anyOf": variants}
+    schema["required"].append("action_proposal")
+    schema["properties"]["turn_kind"]["enum"].append("action")
+    return schema
+
+
 INSTRUCTIONS = """You are Misha's automated assistant in a consented private chat.
 Be concise and truthful. Never claim Misha read, approved, promised, or completed
 anything. Ask only for details needed to make a request coherent. When a coherent
@@ -121,17 +202,57 @@ def estimate_input_tokens(conversation: Sequence[ConversationItem]) -> int:
     return max(1, schema_bytes + instruction_bytes + content_bytes + envelope_bytes)
 
 
-def _parse_turn(raw: str) -> AssistantTurn:
+def _arguments_match_schema(arguments: object, schema: Mapping[str, object]) -> bool:
+    if not isinstance(arguments, dict):
+        return False
+    properties = schema.get("properties")
+    required = schema.get("required")
+    if not isinstance(properties, dict) or not isinstance(required, list):
+        return False
+    if set(arguments) != set(required):
+        return False
+    for name, value in arguments.items():
+        rule = properties[name]
+        if not isinstance(rule, dict):
+            return False
+        if "enum" in rule and value not in rule["enum"]:
+            return False
+        expected = rule.get("type")
+        if expected == "string" and not isinstance(value, str):
+            return False
+        if expected == "integer" and (
+            not isinstance(value, int) or isinstance(value, bool)
+        ):
+            return False
+        if "minLength" in rule and len(str(value)) < int(rule["minLength"]):
+            return False
+        if "maxLength" in rule and len(str(value)) > int(rule["maxLength"]):
+            return False
+        if "minimum" in rule and int(value) < int(rule["minimum"]):
+            return False
+        if "maximum" in rule and int(value) > int(rule["maximum"]):
+            return False
+        if "anyOf" in rule and value is not None and not isinstance(value, str):
+            return False
+    return True
+
+
+def _parse_turn(
+    raw: str, allowed_actions: Sequence[ActionSchema] = ()
+) -> AssistantTurn:
     try:
         value = json.loads(raw)
     except (TypeError, json.JSONDecodeError) as exc:
         raise ModelFailure("model returned invalid JSON") from exc
-    if not isinstance(value, dict) or set(value) != {
+    expected_keys = {
         "reply_text",
         "turn_kind",
         "missing_information",
         "request_patch",
-    }:
+    }
+    if allowed_actions:
+        expected_keys.add("action_proposal")
+    if not isinstance(value, dict) or set(value) != expected_keys:
         raise ModelFailure("model returned an invalid turn shape")
     reply = value["reply_text"]
     kind = value["turn_kind"]
@@ -141,7 +262,15 @@ def _parse_turn(raw: str) -> AssistantTurn:
         not isinstance(reply, str)
         or not reply.strip()
         or len(reply) > 1800
-        or kind not in {"answer", "clarification", "request", "greeting", "rejected"}
+        or kind
+        not in {
+            "answer",
+            "clarification",
+            "request",
+            "greeting",
+            "rejected",
+            *(("action",) if allowed_actions else ()),
+        }
         or not isinstance(missing, list)
         or len(missing) > 8
         or any(not isinstance(item, str) or len(item) > 120 for item in missing)
@@ -162,6 +291,30 @@ def _parse_turn(raw: str) -> AssistantTurn:
         raise ModelFailure("request turn omitted a request patch")
     if kind != "request" and request_patch is not None:
         raise ModelFailure("non-request turn attempted request capture")
+    action_proposal = None
+    proposed = value.get("action_proposal")
+    if proposed is not None:
+        if (
+            not isinstance(proposed, dict)
+            or set(proposed) != {"operation", "arguments"}
+            or not isinstance(proposed["operation"], str)
+        ):
+            raise ModelFailure("model returned an invalid action proposal")
+        available = {item.operation: item for item in allowed_actions}
+        try:
+            operation = Operation(proposed["operation"])
+        except ValueError as exc:
+            raise ModelFailure("model proposed an unavailable action") from exc
+        action_schema = available.get(operation)
+        if action_schema is None or not _arguments_match_schema(
+            proposed["arguments"], action_schema.arguments_schema
+        ):
+            raise ModelFailure("model proposed an unavailable or invalid action")
+        action_proposal = ActionProposal(operation, proposed["arguments"])
+    if kind == "action" and action_proposal is None:
+        raise ModelFailure("action turn omitted its proposal")
+    if kind != "action" and action_proposal is not None:
+        raise ModelFailure("non-action turn attempted an integration proposal")
     if _OWNER_IDENTITY.search(reply):
         raise ModelFailure("model reply made a forbidden owner claim")
     return AssistantTurn(
@@ -169,6 +322,7 @@ def _parse_turn(raw: str) -> AssistantTurn:
         turn_kind=str(kind),
         missing_information=tuple(missing),
         request_patch=request_patch,
+        action_proposal=action_proposal,
     )
 
 
@@ -200,17 +354,44 @@ class OpenAIResponsesModel:
         self.max_output_tokens = max_output_tokens
 
     def generate(
-        self, conversation: Sequence[ConversationItem], safety_identifier: str
+        self,
+        conversation: Sequence[ConversationItem],
+        safety_identifier: str,
+        *,
+        policy_context: Mapping[str, object] | None = None,
+        allowed_actions: Sequence[ActionSchema] = (),
     ) -> ModelResult:
         if not conversation:
             raise ModelFailure("conversation is empty")
         input_items = [
             {"role": item.role, "content": item.text} for item in conversation
         ]
+        forbidden_context = {
+            "sender_id",
+            "subject_id",
+            "provider",
+            "executor",
+            "credential",
+        }
+        if policy_context is not None and forbidden_context.intersection(
+            policy_context
+        ):
+            raise ModelFailure("policy context contains a forbidden authority field")
+        request_schema = _turn_schema(allowed_actions)
+        dynamic_instructions = INSTRUCTIONS
+        if allowed_actions:
+            dynamic_instructions += (
+                "\nThe application currently allows only the action variants present "
+                "in the response schema. Propose at most one and never invent identity "
+                "or authority. Policy context: "
+                + json.dumps(
+                    policy_context or {}, sort_keys=True, separators=(",", ":")
+                )
+            )
         try:
             response = self.client.responses.create(
                 model=self.model,
-                instructions=INSTRUCTIONS,
+                instructions=dynamic_instructions,
                 input=input_items,
                 max_output_tokens=self.max_output_tokens,
                 max_tool_calls=0,
@@ -223,7 +404,7 @@ class OpenAIResponsesModel:
                         "type": "json_schema",
                         "name": "public_assistant_turn",
                         "strict": True,
-                        "schema": TURN_SCHEMA,
+                        "schema": request_schema,
                     }
                 },
             )
@@ -232,7 +413,7 @@ class OpenAIResponsesModel:
         status = getattr(response, "status", "completed")
         if status != "completed":
             raise ModelFailure("model response did not complete")
-        turn = _parse_turn(getattr(response, "output_text", ""))
+        turn = _parse_turn(getattr(response, "output_text", ""), allowed_actions)
         usage = getattr(response, "usage", None)
         if usage is None:
             raise ModelFailure("model response omitted usage")

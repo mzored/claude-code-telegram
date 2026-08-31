@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 import structlog
 
 from ..claude.facade import ClaudeIntegration
+from ..private_controller.origin import RunSource, RunTrigger
 from .bus import Event, EventBus
 from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
 
@@ -60,6 +61,14 @@ class AgentHandler:
                 prompt=prompt,
                 working_directory=self.default_working_directory,
                 user_id=self.default_user_id,
+                run_trigger=RunTrigger(
+                    RunSource.WEBHOOK,
+                    self.default_user_id,
+                    0,
+                    0,
+                    0,
+                    fresh=True,
+                ),
             )
 
             if response.content:
@@ -105,6 +114,14 @@ class AgentHandler:
                 prompt=prompt,
                 working_directory=working_dir,
                 user_id=self.default_user_id,
+                run_trigger=RunTrigger(
+                    RunSource.SCHEDULED,
+                    self.default_user_id,
+                    0,
+                    0,
+                    0,
+                    fresh=True,
+                ),
             )
 
             if response.content:

@@ -139,12 +139,20 @@ def erase_subject_from_public_store(
                 (subject_ref,),
             ).fetchall()
         )
+        existing_tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
         for table in (
             "assistant_context",
             "inbox_requests",
             "model_reservations",
             "privacy_references",
             "privacy_previews",
+            "public_action_intents",
+            "integration_processing_receipts",
             "consents",
             "controls",
             "messages",
@@ -153,9 +161,10 @@ def erase_subject_from_public_store(
             "rate_admissions",
             "deletion_links",
         ):
-            connection.execute(
-                f"DELETE FROM {table} WHERE subject_ref=?", (subject_ref,)
-            )
+            if table in existing_tables:
+                connection.execute(
+                    f"DELETE FROM {table} WHERE subject_ref=?", (subject_ref,)
+                )
         for message_key in message_keys:
             connection.execute(
                 "DELETE FROM transfer_receipts WHERE message_key=?", (message_key,)
