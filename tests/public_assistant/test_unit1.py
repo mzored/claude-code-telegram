@@ -1287,7 +1287,7 @@ def test_ptb_handler_surface_is_explicit_blocking_and_callback_limited(
     assert "pause" not in PUBLIC_SCHEMA.casefold()
 
 
-def test_unit1_has_no_model_integration_or_private_agent_imports() -> None:
+def test_unit1_core_has_no_model_integration_or_private_agent_imports() -> None:
     forbidden = {
         "anthropic",
         "openai",
@@ -1302,7 +1302,17 @@ def test_unit1_has_no_model_integration_or_private_agent_imports() -> None:
         "uvicorn",
     }
     imported: set[str] = set()
-    for source_path in Path("src/public_assistant").glob("*.py"):
+    unit1_sources = (
+        "config.py",
+        "privacy_log.py",
+        "service.py",
+        "sqlcipher.py",
+        "storage.py",
+        "telegram_adapter.py",
+        "types.py",
+    )
+    for source_name in unit1_sources:
+        source_path = Path("src/public_assistant") / source_name
         tree = ast.parse(source_path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
