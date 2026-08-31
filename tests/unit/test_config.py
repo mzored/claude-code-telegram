@@ -123,12 +123,35 @@ def test_external_read_requires_the_filtered_adapter_and_no_direct_todoist_path(
         "private_controller_gate_socket_path": tmp_path / "gate.sock",
         "private_controller_external_read_enabled": True,
         "private_controller_external_read_socket_path": tmp_path / "external.sock",
+        "private_controller_external_erasure_socket_path": tmp_path
+        / "external-erase.sock",
+        "private_controller_external_erasure_public_uid": 1,
+        "private_controller_external_erasure_public_pid": 1,
+        "private_controller_external_erasure_client_gid": 1,
         "private_controller_todoist_adapter_enabled": True,
         "allowed_users": [123],
         "claude_allowed_tools": ["Read", "Grep"],
     }
     settings = Settings(**base)
     assert settings.private_controller_external_read_enabled is True
+    without_erasure = dict(base)
+    for name in (
+        "private_controller_external_erasure_socket_path",
+        "private_controller_external_erasure_public_uid",
+        "private_controller_external_erasure_public_pid",
+        "private_controller_external_erasure_client_gid",
+    ):
+        without_erasure.pop(name)
+    with pytest.raises(ValueError, match="external erasure socket"):
+        Settings(**without_erasure)
+    with pytest.raises(ValueError, match="must differ"):
+        Settings(
+            **{
+                **base,
+                "private_controller_external_erasure_socket_path": tmp_path
+                / "external.sock",
+            }
+        )
     with pytest.raises(ValueError, match="disable_tool_validation"):
         Settings(**base, disable_tool_validation=True)
     with pytest.raises(ValueError, match="direct Todoist Claude tools"):

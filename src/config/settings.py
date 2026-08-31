@@ -68,6 +68,24 @@ class Settings(BaseSettings):
     private_controller_external_read_socket_path: Optional[Path] = Field(
         None, description="Resolved Unix socket for the isolated external-read broker"
     )
+    private_controller_external_erasure_socket_path: Optional[Path] = Field(
+        None,
+        description=(
+            "Resolved Unix socket for the controller-owned external-link erasure sink"
+        ),
+    )
+    private_controller_external_erasure_public_uid: Optional[int] = Field(
+        None,
+        description="Pinned Public Assistant OS UID for external-link erasure",
+    )
+    private_controller_external_erasure_public_pid: Optional[int] = Field(
+        None,
+        description="Pinned Public Assistant PID for external-link erasure",
+    )
+    private_controller_external_erasure_client_gid: Optional[int] = Field(
+        None,
+        description="Public Assistant group granted access to the erasure socket",
+    )
     private_controller_todoist_adapter_enabled: bool = Field(
         False,
         description="Require the fixed filtered Todoist adapter for ordinary reads",
@@ -554,11 +572,39 @@ class Settings(BaseSettings):
                 raise ValueError("external read requires a Public Assistant socket")
             if not self.private_controller_external_read_socket_path.is_absolute():
                 raise ValueError("external read socket must be absolute")
+            if self.private_controller_external_erasure_socket_path is None:
+                raise ValueError("external read requires an external erasure socket")
+            if not self.private_controller_external_erasure_socket_path.is_absolute():
+                raise ValueError("external erasure socket must be absolute")
+            if (
+                self.private_controller_external_erasure_socket_path
+                == self.private_controller_external_read_socket_path
+            ):
+                raise ValueError("external erasure socket must differ from read socket")
+            if (
+                self.private_controller_external_erasure_public_uid is None
+                or self.private_controller_external_erasure_public_uid < 0
+            ):
+                raise ValueError("external erasure requires a public UID")
+            if (
+                self.private_controller_external_erasure_public_pid is None
+                or self.private_controller_external_erasure_public_pid <= 0
+            ):
+                raise ValueError("external erasure requires a public PID")
+            if (
+                self.private_controller_external_erasure_client_gid is None
+                or self.private_controller_external_erasure_client_gid < 0
+            ):
+                raise ValueError("external erasure requires a public client group")
             if not self.private_controller_todoist_adapter_enabled:
                 raise ValueError("external read requires the filtered Todoist adapter")
             self.assert_external_read_lockdown()
         elif (
             self.private_controller_external_read_socket_path is not None
+            or self.private_controller_external_erasure_socket_path is not None
+            or self.private_controller_external_erasure_public_uid is not None
+            or self.private_controller_external_erasure_public_pid is not None
+            or self.private_controller_external_erasure_client_gid is not None
             or self.private_controller_todoist_adapter_enabled
         ):
             raise ValueError(

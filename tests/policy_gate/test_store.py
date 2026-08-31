@@ -7,7 +7,10 @@ from pathlib import Path
 import pytest
 
 from src.encrypted_sqlite import SqlCipherDatabase
+from src.policy_gate.executors import MockExecutor, ReconcileOutcome
+from src.policy_gate.service import PolicyConfig, PolicyGateService
 from src.policy_gate.store import GATE_SCHEMA_VERSION, GateStore
+from src.policy_gate.types import ActionOrigin, Operation, canonical_json, digest
 from src.public_assistant.sqlcipher import EncryptedStoreError
 
 from .conftest import GATE_KEY
@@ -45,6 +48,20 @@ def test_v1_gate_migration_discards_unclassified_candidates_fail_closed(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "legacy-gate.db"
+    legacy_fields: dict[str, object] = {
+        "subject_id": "subject-a",
+        "connection_id": "connection-a",
+        "conversation_id": 202002,
+        "update_id": 31,
+        "request_id": "REQ-LEGACY-A",
+        "operation": Operation.TASK_CREATE.value,
+        "arguments": {"title": "Legacy recovery", "due_date": None},
+        "processing_authorization_version": "integration-v2",
+        "processing_authorization_revision": 2,
+        "processor_purpose": "external task creation",
+    }
+    legacy_action_id = digest(legacy_fields)
+    legacy_binding = {"action_id": legacy_action_id, **legacy_fields}
     legacy = SqlCipherDatabase(
         path,
         GATE_KEY,
@@ -97,10 +114,13 @@ def test_v1_gate_migration_discards_unclassified_candidates_fail_closed(
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
         );
-        INSERT INTO action_journal VALUES
-            ('journal-a', 'digest-a', '{}', 'subject-a', 'task.create',
-             'uncertain', NULL, NULL, 'uncertain', 1, 1);
         """,
+    )
+    legacy.execute(
+        """INSERT INTO action_journal VALUES
+           (?, ?, ?, 'subject-a', 'task.create', 'uncertain', NULL, NULL,
+            'uncertain', 1, 1)""",
+        (legacy_action_id, legacy_action_id, canonical_json(legacy_binding)),
     )
     legacy.close()
 
@@ -135,9 +155,26 @@ def test_v1_gate_migration_discards_unclassified_candidates_fail_closed(
             "external_minimum_confirmation_sequence",
         }.issubset(columns)
         journal = store.database.execute(
-            "SELECT origin FROM action_journal WHERE action_id='journal-a'"
+            "SELECT origin FROM action_journal WHERE action_id=?", (legacy_action_id,)
         ).fetchone()
-        assert journal is not None and journal["origin"] == "owner_external"
+        assert journal is not None
+        assert journal["origin"] == ActionOrigin.OWNER_EXTERNAL.value
+
+        executor = MockExecutor()
+        service = PolicyGateService(
+            store,
+            executor,
+            policy=PolicyConfig(enabled_operations=frozenset({Operation.TASK_CREATE})),
+        )
+        # No generic API may reinterpret an unclassified pre-origin journal.
+        assert service.reconcile_action(legacy_action_id).outcome == "denied"
+        executor.queue_reconcile(ReconcileOutcome.VERIFIED_SUCCESS)
+        # The internal erasure recovery path can only reconcile this existing
+        # effect; it never resubmits it or promotes it to public authority.
+        assert service.erase_subject("subject-a") == "erased"
+        assert executor.calls == []
+        assert len(executor.reconcile_calls) == 1
+        assert executor.reconcile_calls[0].origin is ActionOrigin.OWNER_EXTERNAL
     finally:
         store.close()
 

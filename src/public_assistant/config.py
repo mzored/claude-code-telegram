@@ -467,6 +467,7 @@ class Unit4Config:
 
     enabled: bool = False
     socket_path: Path | None = None
+    controller_erasure_socket_path: Path | None = None
     controller_uid: int | None = None
     controller_pid: int | None = None
     client_gid: int | None = None
@@ -482,6 +483,7 @@ class Unit4Config:
         enabled = _strict_bool(env, "PUBLIC_ASSISTANT_EXTERNAL_READ_ENABLED")
         names = (
             "PUBLIC_ASSISTANT_EXTERNAL_READ_SOCKET_PATH",
+            "PUBLIC_ASSISTANT_EXTERNAL_ERASURE_SOCKET_PATH",
             "PUBLIC_ASSISTANT_EXTERNAL_READ_CONTROLLER_UID",
             "PUBLIC_ASSISTANT_EXTERNAL_READ_CONTROLLER_PID",
             "PUBLIC_ASSISTANT_EXTERNAL_READ_CLIENT_GID",
@@ -503,6 +505,24 @@ class Unit4Config:
             raise PublicAssistantConfigurationError(
                 "external read socket must stay outside public data"
             )
+        erasure_socket_path = Path(
+            _required(env, "PUBLIC_ASSISTANT_EXTERNAL_ERASURE_SOCKET_PATH")
+        )
+        if not erasure_socket_path.is_absolute():
+            raise PublicAssistantConfigurationError(
+                "external erasure socket must be absolute"
+            )
+        erasure_socket_path = erasure_socket_path.resolve(strict=False)
+        if erasure_socket_path == base.data_dir or erasure_socket_path.is_relative_to(
+            base.data_dir
+        ):
+            raise PublicAssistantConfigurationError(
+                "external erasure socket must stay outside public data"
+            )
+        if erasure_socket_path == socket_path:
+            raise PublicAssistantConfigurationError(
+                "external erasure socket must differ from the read socket"
+            )
         processor_authorized = _strict_bool(
             env, "PUBLIC_ASSISTANT_EXTERNAL_READ_PROCESSOR_AUTHORIZED"
         )
@@ -513,6 +533,7 @@ class Unit4Config:
         return cls(
             enabled=True,
             socket_path=socket_path,
+            controller_erasure_socket_path=erasure_socket_path,
             controller_uid=_nonnegative_int(
                 env, "PUBLIC_ASSISTANT_EXTERNAL_READ_CONTROLLER_UID"
             ),

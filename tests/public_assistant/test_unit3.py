@@ -19,6 +19,8 @@ from src.policy_gate.types import (
     Scope,
     TrustedReference,
 )
+from src.private_controller.erasure import ExternalIntentLinkEraseRequest
+from src.private_controller.origin import external_subject_hash
 from src.public_assistant.action_store import Unit3Store
 from src.public_assistant.actions import ActionCoordinator
 from src.public_assistant.config import (
@@ -529,6 +531,82 @@ def test_erasure_converges_gate_receipts_and_delegations_without_revival(
         )
     public.close()
     gate_store.close()
+
+
+def test_public_erasure_retries_fixed_controller_link_deletion_after_gate_terminal(
+    tmp_path: Path,
+) -> None:
+    class FlakyExternalLinkEraser:
+        def __init__(self) -> None:
+            self.requests: list[ExternalIntentLinkEraseRequest] = []
+            self.remaining_failures = 1
+
+        def erase_external_links(self, request: ExternalIntentLinkEraseRequest) -> None:
+            self.requests.append(request)
+            if self.remaining_failures:
+                self.remaining_failures -= 1
+                raise RuntimeError("controller unavailable after Gate terminal erase")
+
+    public = Unit3Store(tmp_path / "public", PENDING_KEY, PUBLIC_KEY, PSEUDONYM_KEY)
+    message = inbound(16)
+    subject = public.subject_ref(
+        message.connection_id, message.conversation_id, message.sender_id
+    )
+    gate_store = GateStore(tmp_path / "gate.db", "g" * 40)
+    gate = PolicyGateService(gate_store, MockExecutor())
+    gate.register_subject(subject, {"managed_chat": "MCHAT-ERASURE-RETRY"})
+    eraser = FlakyExternalLinkEraser()
+    coordinator = ActionCoordinator(public, gate, external_link_eraser=eraser)
+    try:
+        with public.erasure.transaction() as connection:
+            connection.execute(
+                "INSERT INTO erasure_tombstones VALUES (?, ?, ?)",
+                (subject, public.now(), public.now() + 3600),
+            )
+        erase_subject_from_public_store(public.public, subject, public.now())
+        assert coordinator.erase_subject(subject) == "pending_private_erasure"
+        assert public.active_erasure_subjects() == (subject,)
+        assert eraser.requests == [
+            ExternalIntentLinkEraseRequest(external_subject_hash(subject))
+        ]
+
+        assert coordinator.erase_subject(subject) == "erased"
+        assert eraser.requests == [
+            ExternalIntentLinkEraseRequest(external_subject_hash(subject)),
+            ExternalIntentLinkEraseRequest(external_subject_hash(subject)),
+        ]
+    finally:
+        public.close()
+        gate_store.close()
+
+
+def test_public_erasure_does_not_contact_controller_before_gate_is_terminal(
+    tmp_path: Path,
+) -> None:
+    class PendingGate:
+        def erase_subject(self, subject_id: str) -> str:
+            assert subject_id == "subject-a"
+            return "pending_reconciliation"
+
+    class RecordingEraser:
+        def __init__(self) -> None:
+            self.requests: list[ExternalIntentLinkEraseRequest] = []
+
+        def erase_external_links(self, request: ExternalIntentLinkEraseRequest) -> None:
+            self.requests.append(request)
+
+    public = Unit3Store(tmp_path / "public", PENDING_KEY, PUBLIC_KEY, PSEUDONYM_KEY)
+    eraser = RecordingEraser()
+    try:
+        coordinator = ActionCoordinator(
+            public,
+            PendingGate(),  # type: ignore[arg-type]
+            external_link_eraser=eraser,
+        )
+        assert coordinator.erase_subject("subject-a") == "pending_reconciliation"
+        assert eraser.requests == []
+    finally:
+        public.close()
 
 
 def test_unit3_additive_schema_is_unit2_readable_and_erasure_removes_actions(

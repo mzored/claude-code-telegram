@@ -12,6 +12,7 @@ import threading
 
 from src.external_read import ExternalSource
 from src.policy_gate.rpc import PublicGateRpcClient
+from src.private_controller.erasure import ControllerExternalErasureRpcClient
 from src.public_assistant.action_store import Unit3Store
 from src.public_assistant.actions import ActionAssistantService, ActionCoordinator
 from src.public_assistant.config import (
@@ -147,8 +148,19 @@ def _run() -> None:
     if unit3_config.enabled:
         assert isinstance(store, Unit3Store)
         assert unit3_config.socket_path is not None
+        external_link_eraser = None
+        if unit4_config.enabled:
+            if unit4_config.controller_erasure_socket_path is None:
+                raise PublicAssistantConfigurationError(
+                    "external erasure controller socket is missing"
+                )
+            external_link_eraser = ControllerExternalErasureRpcClient(
+                unit4_config.controller_erasure_socket_path
+            )
         coordinator = ActionCoordinator(
-            store, PublicGateRpcClient(unit3_config.socket_path)
+            store,
+            PublicGateRpcClient(unit3_config.socket_path),
+            external_link_eraser=external_link_eraser,
         )
         service = ActionAssistantService(
             config,

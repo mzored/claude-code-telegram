@@ -6,6 +6,7 @@ import logging
 import re
 import signal
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -26,6 +27,7 @@ from src.events.middleware import EventSecurityMiddleware
 from src.exceptions import ConfigurationError
 from src.notifications.service import NotificationService
 from src.policy_gate.rpc import ControllerGateRpcClient
+from src.private_controller.erasure import ControllerExternalErasureRpcServer
 from src.private_controller.interpreter import DeterministicIntentInterpreter
 from src.private_controller.origin import RunOriginLedger, origin_ledger_key
 from src.private_controller.service import PrivateControllerService
@@ -188,6 +190,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     )
 
     private_controller = None
+    external_erasure_server: ControllerExternalErasureRpcServer | None = None
     if config.private_controller_enabled:
         if config.private_controller_gate_socket_path is None:
             raise ConfigurationError("Private controller Policy Gate socket is missing")
@@ -204,6 +207,22 @@ async def create_application(config: Settings) -> Dict[str, Any]:
                 )
             external_reads = ExternalReadRpcClient(
                 config.private_controller_external_read_socket_path
+            )
+            if (
+                config.private_controller_external_erasure_socket_path is None
+                or config.private_controller_external_erasure_public_uid is None
+                or config.private_controller_external_erasure_public_pid is None
+                or config.private_controller_external_erasure_client_gid is None
+            ):
+                raise ConfigurationError(
+                    "Private controller erasure sink is incomplete"
+                )
+            external_erasure_server = ControllerExternalErasureRpcServer(
+                run_origins,
+                config.private_controller_external_erasure_socket_path,
+                public_uid=config.private_controller_external_erasure_public_uid,
+                public_pid=config.private_controller_external_erasure_public_pid,
+                client_gid=config.private_controller_external_erasure_client_gid,
             )
         private_controller = PrivateControllerService(
             ControllerGateRpcClient(config.private_controller_gate_socket_path),
@@ -269,6 +288,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "auth_manager": auth_manager,
         "security_validator": security_validator,
         "private_controller": private_controller,
+        "external_erasure_server": external_erasure_server,
     }
 
 
@@ -281,10 +301,15 @@ async def run_application(app: Dict[str, Any]) -> None:
     config: Settings = app["config"]
     features: FeatureFlags = app["features"]
     event_bus: EventBus = app["event_bus"]
+    external_erasure_server: ControllerExternalErasureRpcServer | None = app[
+        "external_erasure_server"
+    ]
 
     notification_service: Optional[NotificationService] = None
     scheduler: Optional[JobScheduler] = None
     project_threads_manager: Optional[ProjectThreadManager] = None
+    external_erasure_stop = threading.Event()
+    external_erasure_thread: threading.Thread | None = None
 
     # Set up signal handlers for graceful shutdown
     shutdown_event = asyncio.Event()
@@ -298,6 +323,15 @@ async def run_application(app: Dict[str, Any]) -> None:
 
     try:
         logger.info("Starting Claude Code Telegram Bot")
+
+        if external_erasure_server is not None:
+            external_erasure_thread = threading.Thread(
+                target=external_erasure_server.serve_forever,
+                args=(external_erasure_stop,),
+                name="private-external-link-erasure",
+                daemon=True,
+            )
+            external_erasure_thread.start()
 
         # Initialize the bot first (creates the Telegram Application)
         await bot.initialize()
@@ -420,6 +454,11 @@ async def run_application(app: Dict[str, Any]) -> None:
         logger.info("Shutting down application")
 
         try:
+            external_erasure_stop.set()
+            if external_erasure_server is not None:
+                external_erasure_server.close()
+            if external_erasure_thread is not None:
+                external_erasure_thread.join(timeout=2)
             if scheduler:
                 await scheduler.stop()
             if notification_service:

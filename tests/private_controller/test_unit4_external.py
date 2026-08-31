@@ -20,7 +20,7 @@ from src.external_read import (
     ExternalSource,
     ExternalSourceMetadata,
 )
-from src.policy_gate.executors import ExecutionOutcome, MockExecutor
+from src.policy_gate.executors import ExecutionOutcome, MockExecutor, ReconcileOutcome
 from src.policy_gate.service import PolicyConfig, PolicyGateService
 from src.policy_gate.store import GateStore
 from src.policy_gate.types import (
@@ -489,6 +489,77 @@ def test_external_origin_cannot_use_generic_or_delegated_execution(
         gate_store.close()
 
 
+@pytest.mark.parametrize(
+    ("first_outcome", "reconcile_outcome", "expected_replay"),
+    (
+        (ExecutionOutcome.DEFINITE_FAILURE, None, "definite_failure"),
+        (
+            ExecutionOutcome.UNCERTAIN,
+            ReconcileOutcome.VERIFIED_ABSENT,
+            "verified_absent",
+        ),
+    ),
+)
+def test_external_exact_authority_is_consumed_after_any_terminal_outcome(
+    tmp_path: Path,
+    first_outcome: ExecutionOutcome,
+    reconcile_outcome: ReconcileOutcome | None,
+    expected_replay: str,
+) -> None:
+    """A new owner message may replay an external result but never re-execute it."""
+
+    gate, executor, gate_store, ledger, controller, _ = _controller(tmp_path)
+    try:
+        executor.queue(first_outcome)
+        prepared = controller.prepare_external(
+            _direct_run(ledger, 1, 11),
+            _metadata().reference,
+            "Owner-written task title",
+            preview_message_id=71,
+        )
+        preview_binding = prepared.preview["exact_binding"]
+        assert isinstance(preview_binding, dict)
+        external_binding = ActionBinding.from_dict(preview_binding)
+        first = controller.confirm(
+            _direct_run(ledger, 2, 12),
+            prepared.intent_id,
+            71,
+            external_reference=_metadata().reference,
+        )
+        assert first.action_result is not None
+        assert first.action_result.outcome == first_outcome.value
+        if reconcile_outcome is not None:
+            executor.queue_reconcile(reconcile_outcome)
+            assert (
+                gate._reconcile_owner_external_for_erasure(
+                    external_binding.action_id
+                ).outcome
+                == "definite_failure"
+            )
+
+        replay = controller.confirm(
+            _direct_run(ledger, 3, 13),
+            prepared.intent_id,
+            71,
+            external_reference=_metadata().reference,
+        )
+        assert replay.action_result is not None
+        assert replay.action_result.outcome == expected_replay
+        assert executor.calls == [external_binding]
+        assert len(executor.reconcile_calls) == int(reconcile_outcome is not None)
+        delegation = gate_store.database.execute(
+            """SELECT status, remaining_uses FROM delegations
+               WHERE exact_action_id=?""",
+            (external_binding.action_id,),
+        ).fetchone()
+        assert delegation is not None
+        assert delegation["status"] == "consumed"
+        assert delegation["remaining_uses"] == 0
+    finally:
+        ledger.close()
+        gate_store.close()
+
+
 def test_external_intent_database_type_mismatch_fails_closed(tmp_path: Path) -> None:
     """A persisted row cannot relabel an external exact grant as another control."""
 
@@ -575,6 +646,101 @@ def test_generic_reconciliation_and_erasure_preserve_external_origin(
         assert journal is not None
         assert journal["origin"] == ActionOrigin.OWNER_EXTERNAL.value
         assert len(executor.calls) == 1
+    finally:
+        ledger.close()
+        gate_store.close()
+
+
+def test_erasure_recovers_uncertain_external_journal_without_generic_access(
+    tmp_path: Path,
+) -> None:
+    """Erasure may settle an old external effect, but cannot submit it again."""
+
+    gate, executor, gate_store, ledger, controller, _ = _controller(tmp_path)
+    try:
+        executor.queue(ExecutionOutcome.UNCERTAIN)
+        prepared = controller.prepare_external(
+            _direct_run(ledger, 1, 11),
+            _metadata().reference,
+            "Owner-written task title",
+            preview_message_id=71,
+        )
+        preview_binding = prepared.preview["exact_binding"]
+        assert isinstance(preview_binding, dict)
+        external_binding = ActionBinding.from_dict(preview_binding)
+        result = controller.confirm(
+            _direct_run(ledger, 2, 12),
+            prepared.intent_id,
+            71,
+            external_reference=_metadata().reference,
+        )
+        assert result.action_result is not None
+        assert result.action_result.outcome == "uncertain"
+        assert gate.reconcile_action(external_binding.action_id).outcome == "denied"
+
+        executor.queue_reconcile(ReconcileOutcome.VERIFIED_SUCCESS)
+        assert gate.erase_subject("subject-a") == "erased"
+        assert executor.calls == [external_binding]
+        assert executor.reconcile_calls == [external_binding]
+        journal = gate_store.database.execute(
+            "SELECT origin, binding_json FROM action_journal WHERE action_id=?",
+            (external_binding.action_id,),
+        ).fetchone()
+        assert journal is not None
+        assert journal["origin"] == ActionOrigin.OWNER_EXTERNAL.value
+        assert journal["binding_json"] == "{}"
+    finally:
+        ledger.close()
+        gate_store.close()
+
+
+def test_erasure_waits_for_live_external_claim_then_reconciles_expired_claim(
+    tmp_path: Path,
+) -> None:
+    """The internal recovery path never races a current owner-external worker."""
+
+    gate, executor, gate_store, ledger, controller, _ = _controller(tmp_path)
+    try:
+        prepared = controller.prepare_external(
+            _direct_run(ledger, 1, 11),
+            _metadata().reference,
+            "Owner-written task title",
+            preview_message_id=71,
+        )
+        preview_binding = prepared.preview["exact_binding"]
+        assert isinstance(preview_binding, dict)
+        external_binding = ActionBinding.from_dict(preview_binding)
+        assert (
+            controller.confirm(
+                _direct_run(ledger, 2, 12),
+                prepared.intent_id,
+                71,
+                external_reference=_metadata().reference,
+            ).outcome
+            == "executed"
+        )
+        with gate_store.database.transaction() as connection:
+            connection.execute(
+                """UPDATE action_journal SET state='claimed', outcome=NULL, updated_at=?
+                   WHERE action_id=?""",
+                (gate.now(), external_binding.action_id),
+            )
+            connection.execute(
+                "UPDATE quota_events SET state='reserved' WHERE action_id=?",
+                (external_binding.action_id,),
+            )
+        assert gate.erase_subject("subject-a") == "pending_reconciliation"
+        assert executor.reconcile_calls == []
+
+        with gate_store.database.transaction() as connection:
+            connection.execute(
+                "UPDATE action_journal SET updated_at=0 WHERE action_id=?",
+                (external_binding.action_id,),
+            )
+        executor.queue_reconcile(ReconcileOutcome.VERIFIED_SUCCESS)
+        assert gate.erase_subject("subject-a") == "erased"
+        assert executor.calls == [external_binding]
+        assert executor.reconcile_calls == [external_binding]
     finally:
         ledger.close()
         gate_store.close()

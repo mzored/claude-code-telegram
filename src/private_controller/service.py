@@ -218,6 +218,22 @@ class PrivateControllerService:
             metadata.source_digest,
         )
 
+    @staticmethod
+    def _external_result_is_terminal(result: AdminResult) -> bool:
+        if result.outcome in {"applied", "replayed"}:
+            return True
+        return (
+            result.outcome == "executed"
+            and result.action_result is not None
+            and result.action_result.outcome
+            in {
+                "verified_success",
+                "replayed_success",
+                "definite_failure",
+                "verified_absent",
+            }
+        )
+
     def prepare_external(
         self,
         run_id: str,
@@ -298,12 +314,7 @@ class PrivateControllerService:
                     preview_message_id,
                     recovery_confirmation,
                 )
-                if result.outcome in {"applied", "replayed"} or (
-                    result.outcome == "executed"
-                    and result.action_result is not None
-                    and result.action_result.outcome
-                    in {"verified_success", "replayed_success"}
-                ):
+                if self._external_result_is_terminal(result):
                     self.runs.mark_external_terminal(intent_id)
                 return result
             try:
@@ -345,12 +356,7 @@ class PrivateControllerService:
                 preview_message_id,
                 recovery_confirmation,
             )
-            if result.outcome in {"applied", "replayed"} or (
-                result.outcome == "executed"
-                and result.action_result is not None
-                and result.action_result.outcome
-                in {"verified_success", "replayed_success"}
-            ):
+            if self._external_result_is_terminal(result):
                 self.runs.mark_external_terminal(intent_id)
             return result
         elif external_reference is not None:

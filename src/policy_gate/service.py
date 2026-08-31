@@ -31,6 +31,7 @@ from src.policy_gate.types import (
     Scope,
     TrustedReference,
     canonical_json,
+    digest,
 )
 
 _PURPOSES: dict[Operation, tuple[str, str]] = {
@@ -1179,6 +1180,23 @@ class PolicyGateService:
             connection.execute(
                 "DELETE FROM candidate_actions WHERE subject_id=?", (subject_id,)
             )
+
+        # A worker may have claimed an action immediately before the subject was
+        # blocked.  Only an expired lease is safe to turn into recovery work;
+        # a live claim remains pending so erasure never races an in-flight effect.
+        self.recover_claimed_actions()
+        rows = self.store.database.execute(
+            """SELECT action_id FROM action_journal WHERE subject_id=?
+               AND state='uncertain' AND origin=? ORDER BY created_at, action_id""",
+            (subject_id, ActionOrigin.OWNER_EXTERNAL.value),
+        ).fetchall()
+        for row in rows:
+            self._reconcile_owner_external_for_erasure(str(row["action_id"]))
+
+        # Recheck after the private recovery pass.  Ordinary public uncertainty
+        # deliberately remains generic reconciliation work; neither path can
+        # submit a fresh effect during erasure.
+        with self.store.database.transaction() as connection:
             unresolved = int(
                 connection.execute(
                     """SELECT count(*) FROM action_journal WHERE subject_id=?
@@ -1566,6 +1584,22 @@ class PolicyGateService:
                     return ActionResult("binding_mismatch", binding.action_id)
                 if existing["state"] == "succeeded":
                     return ActionResult("replayed_success", binding.action_id)
+                if expected_origin is ActionOrigin.OWNER_EXTERNAL and existing[
+                    "state"
+                ] in {"definite_failure", "cancelled"}:
+                    # The exact owner confirmation is consumed by its first
+                    # claim.  A later fresh confirmation may observe the
+                    # durable outcome, but cannot turn a failed external exact
+                    # action into a new claim or executor call.
+                    outcome = existing["outcome"]
+                    return ActionResult(
+                        (
+                            str(outcome)
+                            if isinstance(outcome, str) and outcome
+                            else str(existing["state"])
+                        ),
+                        binding.action_id,
+                    )
                 if existing["state"] in {"claimed", "uncertain"}:
                     return ActionResult(str(existing["state"]), binding.action_id)
             authority = self._authorize_claim(connection, binding)
@@ -1662,7 +1696,7 @@ class PolicyGateService:
         }[outcome]
         with self.store.database.transaction() as connection:
             row = connection.execute(
-                """SELECT authority_id FROM action_journal WHERE action_id=?
+                """SELECT authority_id, origin FROM action_journal WHERE action_id=?
                    AND state='claimed' AND claim_token=?""",
                 (action_id, claim_token),
             ).fetchone()
@@ -1683,7 +1717,14 @@ class PolicyGateService:
                     "SELECT remaining_uses FROM delegations WHERE delegation_id=?",
                     (authority_id,),
                 ).fetchone()
-                if outcome is ExecutionOutcome.DEFINITE_FAILURE:
+                owner_external = str(row["origin"]) == ActionOrigin.OWNER_EXTERNAL.value
+                if owner_external and outcome is not ExecutionOutcome.UNCERTAIN:
+                    connection.execute(
+                        """UPDATE delegations SET status='consumed' WHERE delegation_id=?
+                           AND remaining_uses IS NOT NULL""",
+                        (authority_id,),
+                    )
+                elif outcome is ExecutionOutcome.DEFINITE_FAILURE:
                     connection.execute(
                         """UPDATE delegations SET remaining_uses=remaining_uses+1,
                            status='active' WHERE delegation_id=?
@@ -1745,6 +1786,31 @@ class PolicyGateService:
         return len(rows)
 
     def reconcile_action(self, action_id: str) -> ActionResult:
+        """Public reconciliation is intentionally limited to public-origin work."""
+
+        return self._reconcile_action_for_origin(
+            action_id, ActionOrigin.PUBLIC_SENDER, allow_legacy_owner_binding=False
+        )
+
+    def _reconcile_owner_external_for_erasure(self, action_id: str) -> ActionResult:
+        """Settle one pre-existing external effect while erasure is pending.
+
+        This is deliberately not an RPC operation.  It accepts only an already
+        uncertain owner-external journal, calls the fixed executor reconciler,
+        and has no route to action claiming, authority lookup, or execution.
+        """
+
+        return self._reconcile_action_for_origin(
+            action_id, ActionOrigin.OWNER_EXTERNAL, allow_legacy_owner_binding=True
+        )
+
+    def _reconcile_action_for_origin(
+        self,
+        action_id: str,
+        expected_origin: ActionOrigin,
+        *,
+        allow_legacy_owner_binding: bool,
+    ) -> ActionResult:
         with self._action_lock(action_id):
             row = self.store.database.execute(
                 "SELECT * FROM action_journal WHERE action_id=?", (action_id,)
@@ -1752,23 +1818,26 @@ class PolicyGateService:
             if (
                 row is None
                 or row["state"] != "uncertain"
-                or str(row["origin"]) != ActionOrigin.PUBLIC_SENDER.value
+                or str(row["origin"]) != expected_origin.value
             ):
                 return ActionResult("denied", action_id)
-            try:
-                binding = ActionBinding.from_dict(json.loads(str(row["binding_json"])))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                return ActionResult("denied", action_id)
-            if (
-                binding.origin is not ActionOrigin.PUBLIC_SENDER
-                or binding.action_id != action_id
-                or binding.binding_digest != str(row["binding_digest"])
-                or binding.subject_id != str(row["subject_id"])
-                or binding.operation.value != str(row["operation"])
-                or not binding.verify()
-                or not self._validate_arguments(binding)
-            ):
-                return ActionResult("denied", action_id)
+            binding = self._journal_binding_for_reconciliation(
+                row,
+                expected_origin,
+                allow_legacy_owner_binding=allow_legacy_owner_binding,
+            )
+            if binding is None:
+                # A malformed owner-external legacy journal is retained as
+                # uncertain: erasure must not scrub an effect it cannot prove
+                # terminal, and cannot promote it into a generic public route.
+                return ActionResult(
+                    (
+                        "uncertain"
+                        if expected_origin is ActionOrigin.OWNER_EXTERNAL
+                        else "denied"
+                    ),
+                    action_id,
+                )
             outcome = self.executor.reconcile(binding)
             if outcome is ReconcileOutcome.UNRESOLVED:
                 return ActionResult("uncertain", action_id)
@@ -1778,11 +1847,101 @@ class PolicyGateService:
             self._resolve_uncertain(action_id, success=False)
             return ActionResult("definite_failure", action_id)
 
+    def _journal_binding_for_reconciliation(
+        self,
+        row: Any,
+        expected_origin: ActionOrigin,
+        *,
+        allow_legacy_owner_binding: bool,
+    ) -> ActionBinding | None:
+        """Validate a durable binding without ever assigning or changing origin."""
+
+        action_id = str(row["action_id"])
+        try:
+            value = json.loads(str(row["binding_json"]))
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(value, dict):
+            return None
+        try:
+            binding = ActionBinding.from_dict(value)
+        except (TypeError, ValueError):
+            binding = None
+        if binding is not None:
+            if (
+                binding.origin is expected_origin
+                and binding.action_id == action_id
+                and binding.binding_digest == str(row["binding_digest"])
+                and binding.subject_id == str(row["subject_id"])
+                and binding.operation.value == str(row["operation"])
+                and binding.verify()
+                and self._validate_arguments(binding)
+            ):
+                return binding
+            return None
+        if (
+            expected_origin is not ActionOrigin.OWNER_EXTERNAL
+            or not allow_legacy_owner_binding
+        ):
+            return None
+        return self._legacy_owner_external_binding(row, value)
+
+    def _legacy_owner_external_binding(
+        self, row: Any, value: dict[str, object]
+    ) -> ActionBinding | None:
+        """Read, but never re-authorize, one pre-origin journal envelope.
+
+        The v2-to-v3 migration deliberately labels unknown legacy journals
+        owner-external.  Their old action identifier did not include an origin,
+        so they are usable solely by the internal erasure reconciler after a
+        complete verification of their legacy canonical bytes.
+        """
+
+        expected_fields = {
+            "action_id",
+            "subject_id",
+            "connection_id",
+            "conversation_id",
+            "update_id",
+            "request_id",
+            "operation",
+            "arguments",
+            "processing_authorization_version",
+            "processing_authorization_revision",
+            "processor_purpose",
+        }
+        if set(value) != expected_fields:
+            return None
+        old_action_id = value.get("action_id")
+        legacy_fields = dict(value)
+        legacy_fields.pop("action_id")
+        if (
+            not isinstance(old_action_id, str)
+            or old_action_id != str(row["action_id"])
+            or digest(legacy_fields) != old_action_id
+            or digest(legacy_fields) != str(row["binding_digest"])
+        ):
+            return None
+        value_with_origin = dict(value)
+        value_with_origin["origin"] = ActionOrigin.OWNER_EXTERNAL.value
+        try:
+            binding = ActionBinding.from_dict(value_with_origin)
+        except (TypeError, ValueError):
+            return None
+        if (
+            binding.action_id != str(row["action_id"])
+            or binding.subject_id != str(row["subject_id"])
+            or binding.operation.value != str(row["operation"])
+            or not self._validate_arguments(binding)
+        ):
+            return None
+        return binding
+
     def _resolve_uncertain(self, action_id: str, *, success: bool) -> None:
         now = self.now()
         with self.store.database.transaction() as connection:
             row = connection.execute(
-                """SELECT authority_id FROM action_journal WHERE action_id=?
+                """SELECT authority_id, origin FROM action_journal WHERE action_id=?
                    AND state='uncertain'""",
                 (action_id,),
             ).fetchone()
@@ -1809,7 +1968,14 @@ class PolicyGateService:
                 "SELECT remaining_uses FROM delegations WHERE delegation_id=?",
                 (authority_id,),
             ).fetchone()
-            if not success:
+            owner_external = str(row["origin"]) == ActionOrigin.OWNER_EXTERNAL.value
+            if owner_external:
+                connection.execute(
+                    """UPDATE delegations SET status='consumed' WHERE delegation_id=?
+                       AND remaining_uses IS NOT NULL""",
+                    (authority_id,),
+                )
+            elif not success:
                 connection.execute(
                     """UPDATE delegations SET remaining_uses=remaining_uses+1,
                        status='active' WHERE delegation_id=?

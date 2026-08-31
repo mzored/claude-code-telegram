@@ -274,12 +274,25 @@ def test_live_external_analyzer_stays_unavailable_under_current_consent_wording(
         "PUBLIC_ASSISTANT_EXTERNAL_READ_SOCKET_PATH": str(
             (tmp_path / "run" / "external.sock").resolve(strict=False)
         ),
+        "PUBLIC_ASSISTANT_EXTERNAL_ERASURE_SOCKET_PATH": str(
+            (tmp_path / "run" / "external-erase.sock").resolve(strict=False)
+        ),
         "PUBLIC_ASSISTANT_EXTERNAL_READ_CONTROLLER_UID": str(os.getuid()),
         "PUBLIC_ASSISTANT_EXTERNAL_READ_CONTROLLER_PID": str(os.getpid()),
         "PUBLIC_ASSISTANT_EXTERNAL_READ_CLIENT_GID": str(os.getgid()),
         "PUBLIC_ASSISTANT_EXTERNAL_READ_PROCESSOR_AUTHORIZED": "false",
     }
     assert Unit4Config.from_environment(base, environment).processor_authorized is False
+    missing_erasure = dict(environment)
+    missing_erasure.pop("PUBLIC_ASSISTANT_EXTERNAL_ERASURE_SOCKET_PATH")
+    with pytest.raises(PublicAssistantConfigurationError, match="ERASURE_SOCKET_PATH"):
+        Unit4Config.from_environment(base, missing_erasure)
+    same_socket = dict(environment)
+    same_socket["PUBLIC_ASSISTANT_EXTERNAL_ERASURE_SOCKET_PATH"] = environment[
+        "PUBLIC_ASSISTANT_EXTERNAL_READ_SOCKET_PATH"
+    ]
+    with pytest.raises(PublicAssistantConfigurationError, match="must differ"):
+        Unit4Config.from_environment(base, same_socket)
     environment["PUBLIC_ASSISTANT_EXTERNAL_READ_PROCESSOR_AUTHORIZED"] = "true"
     with pytest.raises(PublicAssistantConfigurationError, match="does not cover"):
         Unit4Config.from_environment(base, environment)

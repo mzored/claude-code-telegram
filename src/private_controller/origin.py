@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 from dataclasses import dataclass
 from enum import Enum
@@ -15,6 +16,26 @@ from src.external_read import (
     external_link_identity,
 )
 from src.policy_gate.types import ExternalActionLink
+
+_EXTERNAL_LINK_HASH_DOMAIN = b"assist-ai/private-external-link/v1\0"
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _external_link_hash(label: str, value: str) -> str:
+    """Return the stable digest format already used by external intent links."""
+
+    return hashlib.sha256(
+        _EXTERNAL_LINK_HASH_DOMAIN
+        + label.encode("utf-8")
+        + b"\0"
+        + value.encode("utf-8")
+    ).hexdigest()
+
+
+def external_subject_hash(subject_id: str) -> str:
+    """Share the opaque subject identity with the public erasure coordinator."""
+
+    return _external_link_hash("subject", subject_id)
 
 
 class RunOrigin(str, Enum):
@@ -124,6 +145,12 @@ CREATE TABLE IF NOT EXISTS external_control_claims (
     created_at INTEGER NOT NULL,
     FOREIGN KEY(run_id) REFERENCES private_run_origins(run_id),
     UNIQUE(source, actor_id, chat_id, update_id, message_id)
+);
+CREATE TABLE IF NOT EXISTS erased_external_subjects (
+    subject_hash TEXT PRIMARY KEY CHECK(
+        length(subject_hash) = 64 AND subject_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    erased_at INTEGER NOT NULL
 );
 """
 
@@ -276,12 +303,7 @@ class RunOriginLedger:
 
     @staticmethod
     def _hash(label: str, value: str) -> str:
-        return hashlib.sha256(
-            b"assist-ai/private-external-link/v1\0"
-            + label.encode("utf-8")
-            + b"\0"
-            + value.encode("utf-8")
-        ).hexdigest()
+        return _external_link_hash(label, value)
 
     @staticmethod
     def _minimum_sequence(connection: object) -> int:
@@ -315,7 +337,16 @@ class RunOriginLedger:
         self.require(prepare_run_id)
         if metadata.reference != reference:
             raise ValueError("external source reference does not match metadata")
+        subject_hash = external_subject_hash(metadata.subject_id)
         with self.database.transaction() as connection:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM erased_external_subjects WHERE subject_hash=?",
+                    (subject_hash,),
+                ).fetchone()
+                is not None
+            ):
+                raise PermissionError("external subject was erased")
             minimum_sequence = self._link_intent_locked(
                 connection, intent_id, prepare_run_id
             )
@@ -328,10 +359,31 @@ class RunOriginLedger:
                     reference.reference_hash(),
                     metadata.source_digest,
                     self._hash("request", metadata.request_id),
-                    self._hash("subject", metadata.subject_id),
+                    subject_hash,
                     prepare_run_id,
                     minimum_sequence,
                 ),
+            )
+
+    def erase_external_subject_hash(self, subject_hash: str) -> None:
+        """Tombstone one opaque subject and remove only its source-link rows.
+
+        The durable hash tombstone makes a delayed controller activation fail
+        closed instead of recreating a link after the public erasure converges.
+        It stores no raw subject, reference, source body, or source digest.
+        """
+
+        if not isinstance(subject_hash, str) or not _SHA256_HEX.fullmatch(subject_hash):
+            raise ValueError("external subject hash is invalid")
+        with self.database.transaction() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO erased_external_subjects(subject_hash, erased_at)
+                   VALUES (?, unixepoch())""",
+                (subject_hash,),
+            )
+            connection.execute(
+                "DELETE FROM external_intent_links WHERE subject_hash=?",
+                (subject_hash,),
             )
 
     def has_external_link(self, intent_id: str) -> bool:
@@ -402,7 +454,7 @@ class RunOriginLedger:
         link = self.require_external_reference(intent_id, reference)
         if link.request_hash != self._hash(
             "request", metadata.request_id
-        ) or link.subject_hash != self._hash("subject", metadata.subject_id):
+        ) or link.subject_hash != external_subject_hash(metadata.subject_id):
             raise PermissionError("external source reference does not match preview")
         if link.source_digest != metadata.source_digest:
             raise PermissionError("external source changed after preview")
