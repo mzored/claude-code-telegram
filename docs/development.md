@@ -63,7 +63,7 @@ This document provides detailed information for developers working on the Claude
 
 4. **Check code quality**:
    ```bash
-   make lint
+   make check
    ```
 
 ### Available Make Commands
@@ -73,7 +73,9 @@ make help          # Show all available commands
 make install       # Install production dependencies only
 make dev           # Install all dependencies including dev tools
 make test          # Run full test suite with coverage
-make lint          # Run all code quality checks
+make lint          # Run Black, isort, and flake8 checks
+make typecheck     # Run mypy; existing debt is tracked separately
+make check         # Run the required CI checks
 make format        # Auto-format all code
 make clean         # Clean up generated files
 make run           # Run the bot in normal mode
@@ -158,7 +160,7 @@ We use strict code formatting and quality tools:
 - **Black**: Code formatting with 88-character line length
 - **isort**: Import sorting with Black compatibility
 - **flake8**: Linting with 88-character line length
-- **mypy**: Static type checking with strict settings
+- **mypy**: Strict static type checking, run separately while existing debt remains
 
 ### Type Hints
 
@@ -273,7 +275,7 @@ We aim for >80% test coverage. Current coverage:
 - **Environment-specific overrides** (development/testing/production)
 - **Feature flags system** for dynamic functionality control
 - **Cross-field validation** with proper error messages
-- **Type-safe configuration** with full mypy compliance
+- **Typed configuration** with strict mypy settings
 - **Computed properties** for derived values
 - **Configuration loader** with environment detection
 - **Test utilities** for easy test configuration
@@ -411,7 +413,7 @@ Tags containing `-rc`, `-beta`, or `-alpha` (e.g. `v1.3.0-rc1`) are marked as pr
 
 2. **Check code quality**:
    ```bash
-   make lint
+   make check
    ```
 
 3. **Format code**:
@@ -503,9 +505,9 @@ test: add tests for authentication system
 
 3. **Test failures**: Ensure test dependencies are installed (`make dev`)
 
-4. **Type checking errors**: Run `poetry run mypy src` to see detailed errors
+4. **Type checking errors**: Run `make typecheck`; this check is not yet required CI
 
-5. **Poetry issues**: Try `poetry lock --no-update` to fix lock file issues
+5. **Poetry issues**: Run `poetry check --lock`. Update the lock only when dependencies change
 
 ### Getting Help
 

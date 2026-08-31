@@ -1,4 +1,4 @@
-.PHONY: install dev test lint format clean help run run-watch run-remote remote-attach remote-stop \
+.PHONY: install dev test lint typecheck check check-lock test-deploy format clean help run run-watch \
        bump-patch bump-minor bump-major release version
 
 # Default target
@@ -8,6 +8,8 @@ help:
 	@echo "  dev           - Install development dependencies"
 	@echo "  test          - Run tests"
 	@echo "  lint          - Run linting checks"
+	@echo "  typecheck     - Run mypy (known debt is tracked separately)"
+	@echo "  check         - Run the same required checks as CI"
 	@echo "  format        - Format code"
 	@echo "  clean         - Clean up generated files"
 	@echo "  run           - Run the bot"
@@ -17,12 +19,9 @@ help:
 	@echo "  bump-minor    - Bump minor version (1.2.0 -> 1.3.0), commit, and tag"
 	@echo "  bump-major    - Bump major version (1.2.0 -> 2.0.0), commit, and tag"
 	@echo "  release       - Push current version tag to trigger release workflow"
-	@echo "  run-remote    - Start bot in tmux on remote Mac (unlocks keychain)"
-	@echo "  remote-attach - Attach to running bot tmux session"
-	@echo "  remote-stop   - Stop the bot tmux session"
 
 install:
-	poetry install --no-dev
+	poetry sync --only main
 
 dev:
 	poetry install
@@ -32,14 +31,24 @@ test:
 	poetry run pytest
 
 lint:
-	poetry run black --check src tests
-	poetry run isort --check-only src tests
-	poetry run flake8 src tests
+	poetry run black --check src tests ops
+	poetry run isort --check-only src tests ops
+	poetry run flake8 src tests ops
+
+typecheck:
 	poetry run mypy src
 
+check-lock:
+	poetry check --lock
+
+test-deploy:
+	poetry run pytest tests/deploy
+
+check: check-lock lint test test-deploy
+
 format:
-	poetry run black src tests
-	poetry run isort src tests
+	poetry run black src tests ops
+	poetry run isort src tests ops
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
@@ -56,20 +65,6 @@ run-watch:  ## Run the bot with auto-restart on src/ changes (uses watchfiles)
 # For debugging
 run-debug:
 	poetry run claude-telegram-bot --debug
-
-# Remote Mac Mini (SSH session)
-run-remote:  ## Start bot on remote Mac in tmux (persists after SSH disconnect)
-	security unlock-keychain ~/Library/Keychains/login.keychain-db
-	tmux new-session -d -s claude-bot 'poetry run claude-telegram-bot'
-	@echo "Bot started in tmux session 'claude-bot'"
-	@echo "  Attach: make remote-attach"
-	@echo "  Stop:   make remote-stop"
-
-remote-attach:  ## Attach to running bot tmux session
-	tmux attach -t claude-bot
-
-remote-stop:  ## Stop the bot tmux session
-	tmux kill-session -t claude-bot
 
 # --- Version Management ---
 

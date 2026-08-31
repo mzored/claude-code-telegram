@@ -60,8 +60,7 @@ This project is currently under active development with the following status:
 
 4. **Verify setup**:
    ```bash
-   make test
-   make lint
+   make check
    ```
 
 ## Development Workflow
@@ -94,7 +93,7 @@ This project is currently under active development with the following status:
 3. **Follow code standards**:
    ```bash
    make format  # Auto-format code
-   make lint    # Check code quality
+   make lint    # Check formatting and lint
    ```
 
 4. **Update documentation** as needed
@@ -222,8 +221,7 @@ async def test_feature():
 
 1. **Ensure tests pass**:
    ```bash
-   make test
-   make lint
+   make check
    ```
 
 2. **Update documentation** if needed
@@ -360,7 +358,7 @@ Instead:
 - **Black**: Code formatting  
 - **isort**: Import sorting
 - **flake8**: Linting
-- **mypy**: Type checking
+- **mypy**: Strict type checking, run separately while existing debt remains
 - **pytest**: Testing
 
 ### Recommended IDE Setup
@@ -414,7 +412,7 @@ Instead:
 ### Debugging
 - Use `make run-debug` for detailed logging
 - Check test output with `make test`
-- Run type checking with `poetry run mypy src`
+- Run the optional type check with `make typecheck`
 
 ## Recognition
 

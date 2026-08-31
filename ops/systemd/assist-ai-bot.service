@@ -1,0 +1,21 @@
+[Unit]
+Description=assist-ai-bot (claude-code-telegram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+EnvironmentFile=%h/projects/assist-ai/bot/.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+WorkingDirectory=%h/.local/lib/assist-ai/current
+ExecStart=%h/.local/lib/assist-ai/current/.venv/bin/claude-telegram-bot
+Restart=on-failure
+RestartSec=10
+MemoryHigh=300M
+MemoryMax=400M
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
