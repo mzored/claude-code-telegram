@@ -37,11 +37,14 @@ git fetch origin main
 The local and remote preflight checks both require clean, non-divergent Git state.
 The deployment target is always the `mybots` host and its canonical checkout; caller
 arguments cannot select a different host or repository. The host fetches but never
-pushes, checks out the commit detached, installs only the locked production
-dependencies, installs the tracked unit, and confirms that the service remains active
-through a short stabilization period. A failed release restores the previous Git
-checkout, dependencies, unit, and prior enabled and active service state. A mismatched
-handshake fails the deployment.
+pushes, builds a separate candidate environment from the target lock before it stops
+the running service, then switches the environment with same-filesystem renames. It
+rejects a cutover when there is not enough free disk for the candidate and cleans up
+failed candidates. A failed release restores the saved environment and unit directly,
+then reloads systemd and restores the prior enabled and active service state. The
+rollback code never runs a helper from the failed target. Targets older than the
+automation may not contain a unit; in that case the already-installed canonical unit
+remains in place. A mismatched handshake fails the deployment.
 
 The first deploy from an older mutable checkout can fail because that checkout has a
 local-only commit or uncommitted file. Preserve or integrate that work before retrying;
