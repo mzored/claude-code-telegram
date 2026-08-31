@@ -71,6 +71,7 @@ class Responses:
                     "turn_kind": "answer",
                     "missing_information": [],
                     "request_patch": None,
+                    "task_candidate": None,
                     "action_proposal": None,
                 }
             ),

@@ -111,7 +111,7 @@ def test_todoist_enablement_is_independent_of_calendar(tmp_path: Path) -> None:
         tmp_path / "secrets" / "todoist-token",
         '{"token":"'
         + "t" * 32
-        + '","scopes":["data:read_write"],"external_requests_project_id":"external-requests"}',
+        + '","scopes":["task:add"],"external_requests_project_id":"external-requests"}',
     )
     erasure = credential(
         tmp_path / "secrets" / "todoist-erasure-token",
@@ -138,3 +138,57 @@ def test_todoist_enablement_is_independent_of_calendar(tmp_path: Path) -> None:
 
     with pytest.raises(GateConfigurationError, match="TODOIST_CREDENTIAL_FILE"):
         GateConfig.from_environment({**base, "POLICY_GATE_TODOIST_ENABLED": "1"})
+
+
+def test_todoist_credential_document_requires_exact_scopes_and_project(
+    tmp_path: Path,
+) -> None:
+    key = credential(tmp_path / "secrets" / "gate-key", "g" * 40)
+    token = credential(
+        tmp_path / "secrets" / "todoist-token",
+        '{"token":"'
+        + "t" * 32
+        + '","scopes":["task:add","data:read"],"external_requests_project_id":"external-requests"}',
+    )
+    erasure = credential(
+        tmp_path / "secrets" / "todoist-erasure-token",
+        '{"token":"'
+        + "e" * 32
+        + '","scopes":["data:delete"],"external_requests_project_id":"external-requests"}',
+    )
+    enabled = {
+        **environment(tmp_path, key),
+        "POLICY_GATE_TODOIST_ENABLED": "1",
+        "POLICY_GATE_TODOIST_CREDENTIAL_FILE": str(token),
+        "POLICY_GATE_TODOIST_ERASURE_CREDENTIAL_FILE": str(erasure),
+        "POLICY_GATE_TODOIST_EXTERNAL_REQUESTS_PROJECT_ID": "external-requests",
+    }
+    without_explicit_read = GateConfig.from_environment(enabled)
+    with pytest.raises(GateConfigurationError, match="scope or project"):
+        without_explicit_read.read_todoist_credentials()
+    with_read = GateConfig.from_environment(
+        {**enabled, "POLICY_GATE_TODOIST_OPTIONAL_READ_SCOPE_ENABLED": "1"}
+    )
+    assert with_read.read_todoist_credentials().scopes == {"task:add", "data:read"}
+
+    token.write_text(
+        '{"token":"'
+        + "t" * 32
+        + '","scopes":["task:add","data:read_write"],"external_requests_project_id":"external-requests"}'
+    )
+    with pytest.raises(GateConfigurationError, match="scope or project"):
+        with_read.read_todoist_credentials()
+    token.write_text(
+        '{"token":"'
+        + "t" * 32
+        + '","scopes":["task:add"],"external_requests_project_id":"other-project"}'
+    )
+    with pytest.raises(GateConfigurationError, match="scope or project"):
+        with_read.read_todoist_credentials()
+    erasure.write_text(
+        '{"token":"'
+        + "e" * 32
+        + '","scopes":["data:delete","task:add"],"external_requests_project_id":"external-requests"}'
+    )
+    with pytest.raises(GateConfigurationError, match="erasure credential scope"):
+        with_read.read_todoist_erasure_credentials()

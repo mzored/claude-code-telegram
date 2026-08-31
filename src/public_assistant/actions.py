@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,6 +14,7 @@ from src.policy_gate.types import (
     ActionSchema,
     MeetingOptionsResult,
     Operation,
+    canonical_json,
 )
 from src.private_controller.erasure import (
     ExternalIntentLinkEraser,
@@ -419,8 +419,6 @@ TODOIST_SUCCEEDED = {
     "en": "The task was created in the configured external requests list.",
     "ru": "Задача создана в настроенном списке внешних запросов.",
 }
-_TASK_CANDIDATE = re.compile(r"\b(?:task|todo|create|добавь|задач)\b", re.I)
-_ISO_DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 
 MEETING_OPTIONS_PROMPT = {
     "en": "Choose one of these available times.",
@@ -518,35 +516,6 @@ class ActionAssistantService(AssistantService):
         try:
             discovery = self.coordinator.discover(message)
         except Exception:
-            return self._process_without_actions(message)
-        if not discovery.schemas:
-            if discovery.authorization is not None and _TASK_CANDIDATE.search(
-                message.text
-            ):
-                title = _ISO_DATE.sub("", message.text).strip(" .,:;!?")
-                due = _ISO_DATE.search(message.text)
-                candidate_request_id = self.store.upsert_request(
-                    message, message.text.strip()[:4000], self.config.retention_seconds
-                )
-                binding = self.coordinator.stage_exact_task_candidate(
-                    message,
-                    candidate_request_id,
-                    title,
-                    None if due is None else due.group(1),
-                    self.config.retention_seconds,
-                    discovery,
-                )
-                self._register_request(message, candidate_request_id)
-                if binding is not None:
-                    text = REQUEST_CONFIRMED[_language(message.text)]
-                    reply = self._assistant_reply(message, text)
-                    self.store.add_assistant_context(
-                        message, text, self.config.retention_seconds
-                    )
-                    self.store.set_update_outcome(
-                        message.update_id, "task_exact_staged", reply.reply_id
-                    )
-                    return ProcessingResult("task_exact_staged", reply)
             return self._process_without_actions(message)
         if not self.store.has_active_consent(
             message.connection_id,
@@ -653,15 +622,51 @@ class ActionAssistantService(AssistantService):
                 self.store.add_assistant_context(
                     message, text, self.config.retention_seconds
                 )
-                self.store.set_update_outcome(
-                    message.update_id, "dry_run_action_validated", reply.reply_id
+                outcome = (
+                    "todoist_task_created"
+                    if turn.action_proposal.operation is Operation.TASK_CREATE
+                    else "dry_run_action_validated"
                 )
-                return ProcessingResult("dry_run_action_validated", reply)
+                self.store.set_update_outcome(
+                    message.update_id, outcome, reply.reply_id
+                )
+                return ProcessingResult(outcome, reply)
             return self._fallback_request(message, "action_denied")
 
         request_id = None
+        staged_task = False
         reply_text = turn.reply_text
-        if turn.turn_kind == "request":
+        if turn.turn_kind == "task":
+            if turn.task_candidate is None:
+                return self._fallback_request(message, "model_fallback")
+            # Persist only model-minimized typed fields: never the sender's
+            # free-form message. The action remains staged until a fresh direct
+            # owner confirmation grants exact authority for this same binding.
+            candidate_content = canonical_json(
+                {
+                    "due_date": turn.task_candidate.due_date,
+                    "title": turn.task_candidate.title,
+                }
+            )
+            request_id = self.store.upsert_request(
+                message, candidate_content, self.config.retention_seconds
+            )
+            staged_task = (
+                self.coordinator.stage_exact_task_candidate(
+                    message,
+                    request_id,
+                    turn.task_candidate.title,
+                    turn.task_candidate.due_date,
+                    self.config.retention_seconds,
+                    discovery,
+                )
+                is not None
+            )
+            self._register_request(message, request_id)
+            # An unavailable current receipt leaves the typed Inbox record and
+            # owner alert intact, but never creates an executable public action.
+            reply_text = REQUEST_CONFIRMED[_language(message.text)]
+        elif turn.turn_kind == "request":
             if turn.request_patch is None:
                 self.store.finish_model_call(reservation, None, self.unit2_config)
                 return self._fallback_request(message, "model_fallback")
@@ -678,7 +683,15 @@ class ActionAssistantService(AssistantService):
         self.store.add_assistant_context(
             message, reply_text, self.config.retention_seconds
         )
-        outcome = "request_captured" if request_id is not None else turn.turn_kind
+        outcome = (
+            "task_exact_staged"
+            if turn.turn_kind == "task" and staged_task
+            else (
+                "task_inbox_captured"
+                if turn.turn_kind == "task" and request_id is not None
+                else "request_captured" if request_id is not None else turn.turn_kind
+            )
+        )
         self.store.set_update_outcome(message.update_id, outcome, reply.reply_id)
         return ProcessingResult(outcome, reply)
 

@@ -14,7 +14,8 @@ TODOIST_COMMAND_NAMESPACE = uuid.UUID("1c9bc1ca-21a4-4d9e-8b04-0b8b3e4c3943")
 TODOIST_TEMP_ID_NAMESPACE = uuid.UUID("f1be8d48-7f2f-43c3-8bdc-6f7e5309cc84")
 TODOIST_DESCRIPTION = "Provenance: external_untrusted"
 TODOIST_CONTENT_PREFIX = "[External request] "
-TODOIST_ADD_SCOPE = "data:read_write"
+TODOIST_ADD_SCOPE = "task:add"
+TODOIST_READ_SCOPE = "data:read"
 TODOIST_DELETE_SCOPE = "data:delete"
 
 
@@ -31,9 +32,9 @@ class TodoistPolicy:
     def __post_init__(self) -> None:
         if self.enabled and not self.external_requests_project_id.strip():
             raise ValueError("enabled Todoist requires the External Requests project")
-        if self.optional_read_scope_enabled:
-            # Lost-response recovery has not been demonstrated against a sandbox.
-            raise ValueError("Todoist optional read scope is not enabled")
+        # A deployment may explicitly opt into the narrow read scope only after
+        # sandbox rollout has demonstrated the lost-response recovery contract.
+        # This local document check cannot prove Todoist enforces that scope.
 
 
 @dataclass(frozen=True)
@@ -259,6 +260,7 @@ __all__ = [
     "TODOIST_ADD_SCOPE",
     "TODOIST_DELETE_SCOPE",
     "TODOIST_DESCRIPTION",
+    "TODOIST_READ_SCOPE",
     "TodoistAddResult",
     "TodoistApi",
     "TodoistCredentials",

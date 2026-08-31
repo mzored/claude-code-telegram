@@ -16,6 +16,7 @@ from src.policy_gate.calendar import (
 from src.policy_gate.todoist import (
     TODOIST_ADD_SCOPE,
     TODOIST_DELETE_SCOPE,
+    TODOIST_READ_SCOPE,
     TodoistCredentials,
     TodoistPolicy,
 )
@@ -55,6 +56,13 @@ def _bounded_integer(
     if not minimum <= value <= maximum:
         raise GateConfigurationError(f"{name} is outside its allowed range")
     return value
+
+
+def _optional_bool(environment: Mapping[str, str], name: str) -> bool:
+    value = environment.get(name, "0").strip()
+    if value not in {"0", "1"}:
+        raise GateConfigurationError(f"{name} must be 0 or 1")
+    return value == "1"
 
 
 def _read_owner_file(path: Path, label: str, minimum_bytes: int) -> str:
@@ -238,6 +246,9 @@ class GateConfig:
                     ).strip(),
                     credential_file=todoist_credential_file,
                     erasure_credential_file=erasure_credential_file,
+                    optional_read_scope_enabled=_optional_bool(
+                        env, "POLICY_GATE_TODOIST_OPTIONAL_READ_SCOPE_ENABLED"
+                    ),
                 )
             except ValueError as exc:
                 raise GateConfigurationError(
@@ -278,8 +289,13 @@ class GateConfig:
             )
         except ValueError as exc:
             raise GateConfigurationError("Todoist credential is invalid") from exc
+        expected_scopes = frozenset({TODOIST_ADD_SCOPE})
+        if self.todoist.optional_read_scope_enabled:
+            expected_scopes |= {TODOIST_READ_SCOPE}
+        # This validates only the deployment-owned credential document. Real
+        # provider scope enforcement remains rollout evidence, not a local claim.
         if (
-            TODOIST_ADD_SCOPE not in credentials.scopes
+            credentials.scopes != expected_scopes
             or credentials.external_requests_project_id
             != self.todoist.external_requests_project_id
         ):
@@ -303,6 +319,6 @@ class GateConfig:
             raise GateConfigurationError(
                 "Todoist erasure credential is invalid"
             ) from exc
-        if TODOIST_DELETE_SCOPE not in credentials.scopes:
+        if credentials.scopes != frozenset({TODOIST_DELETE_SCOPE}):
             raise GateConfigurationError("Todoist erasure credential scope is invalid")
         return credentials
