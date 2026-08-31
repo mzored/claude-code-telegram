@@ -13,6 +13,7 @@ from src.policy_gate.executors import MockExecutor
 from src.policy_gate.rpc import PolicyGateRpcServer, StopSignal
 from src.policy_gate.service import PolicyConfig, PolicyGateService
 from src.policy_gate.store import GateStore
+from src.policy_gate.todoist import TodoistSyncApi
 from src.policy_gate.transport import (
     GatePeerAuthorizer,
     OwnershipSetter,
@@ -81,16 +82,28 @@ def run() -> None:
         # Enabled mode fails before binding the IPC listener unless the fixed
         # refresh grant proves the exact Calendar scopes we require.
         calendar_api.validate_startup()
+    todoist_api = None
+    if config.todoist.enabled:
+        # The token is read only inside the owner-controlled Gate process.
+        todoist_api = TodoistSyncApi(config.read_todoist_token())
     policy = PolicyConfig(
-        enabled_operations=(
-            frozenset({Operation.MEETING_OPTIONS, Operation.MEETING_SCHEDULE})
-            if config.calendar.enabled
-            else frozenset()
+        enabled_operations=frozenset(
+            (
+                {Operation.MEETING_OPTIONS, Operation.MEETING_SCHEDULE}
+                if config.calendar.enabled
+                else set()
+            )
+            | ({Operation.TASK_CREATE} if config.todoist.enabled else set())
         ),
         calendar=config.calendar,
+        todoist=config.todoist,
     )
     service = PolicyGateService(
-        store, MockExecutor(), policy=policy, calendar_api=calendar_api
+        store,
+        MockExecutor(),
+        policy=policy,
+        calendar_api=calendar_api,
+        todoist_api=todoist_api,
     )
     stop = threading.Event()
 

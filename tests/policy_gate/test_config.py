@@ -103,3 +103,25 @@ def test_enabled_calendar_requires_complete_distinct_configuration_and_fixed_sco
     }
     with pytest.raises(GateConfigurationError, match="Calendar credential"):
         GateConfig.from_environment(inside_data)
+
+
+def test_todoist_enablement_is_independent_of_calendar(tmp_path: Path) -> None:
+    key = credential(tmp_path / "secrets" / "gate-key", "g" * 40)
+    token = credential(tmp_path / "secrets" / "todoist-token", "t" * 32)
+    base = environment(tmp_path, key)
+    disabled = GateConfig.from_environment(base)
+    assert not disabled.calendar.enabled and not disabled.todoist.enabled
+
+    todoist = GateConfig.from_environment(
+        {
+            **base,
+            "POLICY_GATE_TODOIST_ENABLED": "1",
+            "POLICY_GATE_TODOIST_CREDENTIAL_FILE": str(token),
+            "POLICY_GATE_TODOIST_EXTERNAL_REQUESTS_PROJECT_ID": "external-requests",
+        }
+    )
+    assert not todoist.calendar.enabled and todoist.todoist.enabled
+    assert todoist.read_todoist_token() == "t" * 32
+
+    with pytest.raises(GateConfigurationError, match="TODOIST_CREDENTIAL_FILE"):
+        GateConfig.from_environment({**base, "POLICY_GATE_TODOIST_ENABLED": "1"})

@@ -13,6 +13,7 @@ from src.policy_gate.calendar import (
     CalendarCredentials,
     CalendarPolicy,
 )
+from src.policy_gate.todoist import TodoistPolicy
 
 
 class GateConfigurationError(ValueError):
@@ -85,6 +86,7 @@ class GateConfig:
     controller_uid: int
     client_gid: int
     calendar: CalendarPolicy = CalendarPolicy()
+    todoist: TodoistPolicy = TodoistPolicy()
 
     @classmethod
     def from_environment(
@@ -122,6 +124,7 @@ class GateConfig:
         if enabled_raw not in {"0", "1"}:
             raise GateConfigurationError("POLICY_GATE_CALENDAR_ENABLED must be 0 or 1")
         calendar = CalendarPolicy()
+        todoist = TodoistPolicy()
         if enabled_raw == "1":
             calendar_credential_file = _absolute(
                 env, "POLICY_GATE_CALENDAR_CREDENTIAL_FILE"
@@ -194,6 +197,35 @@ class GateConfig:
                 raise GateConfigurationError(
                     "Calendar configuration is invalid"
                 ) from exc
+        todoist_enabled = env.get("POLICY_GATE_TODOIST_ENABLED", "0").strip()
+        if todoist_enabled not in {"0", "1"}:
+            raise GateConfigurationError("POLICY_GATE_TODOIST_ENABLED must be 0 or 1")
+        if todoist_enabled == "1":
+            todoist_credential_file = _absolute(
+                env, "POLICY_GATE_TODOIST_CREDENTIAL_FILE"
+            ).resolve()
+            if (
+                todoist_credential_file == data_dir
+                or todoist_credential_file.is_relative_to(data_dir)
+                or todoist_credential_file == repository
+                or todoist_credential_file.is_relative_to(repository)
+                or todoist_credential_file == key_file
+            ):
+                raise GateConfigurationError(
+                    "Todoist credential must stay outside data, repository, and key paths"
+                )
+            try:
+                todoist = TodoistPolicy(
+                    enabled=True,
+                    external_requests_project_id=env.get(
+                        "POLICY_GATE_TODOIST_EXTERNAL_REQUESTS_PROJECT_ID", ""
+                    ).strip(),
+                    credential_file=todoist_credential_file,
+                )
+            except ValueError as exc:
+                raise GateConfigurationError(
+                    "Todoist configuration is invalid"
+                ) from exc
         return cls(
             data_dir,
             key_file,
@@ -202,6 +234,7 @@ class GateConfig:
             controller_uid,
             client_gid,
             calendar,
+            todoist,
         )
 
     def read_database_key(self) -> str:
@@ -218,3 +251,8 @@ class GateConfig:
             )
         except CalendarConfigurationError as exc:
             raise GateConfigurationError("Calendar credential is invalid") from exc
+
+    def read_todoist_token(self) -> str:
+        if not self.todoist.enabled or self.todoist.credential_file is None:
+            raise GateConfigurationError("Todoist is disabled")
+        return _read_owner_file(self.todoist.credential_file, "Todoist credential", 16)

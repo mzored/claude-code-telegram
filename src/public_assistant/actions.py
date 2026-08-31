@@ -256,6 +256,57 @@ class ActionCoordinator:
             self.store.finish_action(result)
             return result
 
+    def stage_exact_task_candidate(
+        self,
+        message: InboundMessage,
+        request_id: str,
+        title: str,
+        due_date: str | None,
+        retention_seconds: int,
+        discovery: ActionDiscovery,
+    ) -> ActionBinding | None:
+        """Persist a public-sender task for the owner-only exact-control flow.
+
+        This deliberately stages but never submits: public schema discovery does
+        not reveal exact authority, and the owner must use the existing fresh
+        draft/preview/confirm controls against this immutable action reference.
+        """
+
+        if (
+            discovery.authorization is None
+            or not isinstance(title, str)
+            or not 0 < len(title.strip()) <= 200
+            or due_date is not None
+            and not isinstance(due_date, str)
+        ):
+            return None
+        subject = self.store.subject_ref(
+            message.connection_id, message.conversation_id, message.sender_id
+        )
+        with self._subject_lock(subject):
+            if not self._current_authorization(message, discovery):
+                return None
+            binding = self.store.prepare_action(
+                message,
+                request_id,
+                Operation.TASK_CREATE,
+                {"title": title.strip(), "due_date": due_date},
+                discovery.authorization.version,
+                discovery.authorization.revision,
+                retention_seconds,
+            )
+            self.gate.register_subject(
+                binding.subject_id,
+                {"request": request_id, "action": binding.action_id},
+            )
+            if not self._current_authorization(message, discovery):
+                self.store.finish_action(ActionResult("denied", binding.action_id))
+                return None
+            if not self.gate.stage_action(binding):
+                self.store.finish_action(ActionResult("denied", binding.action_id))
+                return None
+            return binding
+
     def meeting_options(
         self,
         message: InboundMessage,

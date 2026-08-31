@@ -24,6 +24,13 @@ from src.policy_gate.executors import (
     ReconcileOutcome,
 )
 from src.policy_gate.store import GateStore
+from src.policy_gate.todoist import (
+    TodoistAddResult,
+    TodoistApi,
+    TodoistPolicy,
+    command_identity,
+    item_add_command,
+)
 from src.policy_gate.types import (
     ActionBinding,
     ActionOrigin,
@@ -73,6 +80,7 @@ class PolicyConfig:
     working_hour_start_utc: int = 9
     working_hour_end_utc: int = 18
     calendar: CalendarPolicy = CalendarPolicy()
+    todoist: TodoistPolicy = TodoistPolicy()
 
 
 class PolicyGateService:
@@ -85,6 +93,7 @@ class PolicyGateService:
         *,
         policy: PolicyConfig | None = None,
         calendar_api: CalendarApi | None = None,
+        todoist_api: TodoistApi | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if not getattr(executor, "is_mock", False):
@@ -92,15 +101,23 @@ class PolicyGateService:
         selected_policy = policy or PolicyConfig()
         if selected_policy.calendar.enabled != (calendar_api is not None):
             raise ValueError("Calendar adapter and enablement must agree")
+        if selected_policy.todoist.enabled != (todoist_api is not None):
+            raise ValueError("Todoist adapter and enablement must agree")
         if selected_policy.calendar.enabled and not {
             Operation.MEETING_OPTIONS,
             Operation.MEETING_SCHEDULE,
         }.issubset(selected_policy.enabled_operations):
             raise ValueError("enabled Calendar requires both reviewed operations")
+        if (
+            selected_policy.todoist.enabled
+            and Operation.TASK_CREATE not in selected_policy.enabled_operations
+        ):
+            raise ValueError("enabled Todoist requires task creation policy")
         self.store = store
         self.executor = executor
         self.policy = selected_policy
         self.calendar_api = calendar_api
+        self.todoist_api = todoist_api
         self._clock = clock
         self._locks_guard = threading.Lock()
         self._action_locks: dict[str, threading.Lock] = {}
@@ -1284,6 +1301,13 @@ class PolicyGateService:
                 "DELETE FROM calendar_reservations WHERE subject_id=?", (subject_id,)
             )
             connection.execute(
+                "DELETE FROM todoist_task_mappings WHERE subject_id=?", (subject_id,)
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO todoist_erasure_tombstones VALUES (?, ?)",
+                (digest({"todoist_subject": subject_id}), now),
+            )
+            connection.execute(
                 """UPDATE action_journal SET binding_json='{}', updated_at=?
                    WHERE subject_id=?""",
                 (now, subject_id),
@@ -1822,11 +1846,13 @@ class PolicyGateService:
             return False
         if binding.operation is Operation.MEETING_OPTIONS:
             return None
-        offer = self._calendar_offer(
-            connection, binding, include_consumed=not require_unused_offer
-        )
-        if self.policy.calendar.enabled and offer is None:
-            return False
+        offer = None
+        if binding.operation is Operation.MEETING_SCHEDULE:
+            offer = self._calendar_offer(
+                connection, binding, include_consumed=not require_unused_offer
+            )
+            if self.policy.calendar.enabled and offer is None:
+                return False
         delegations = self._active_delegations(
             connection, binding.subject_id, binding.operation
         )
@@ -1874,8 +1900,12 @@ class PolicyGateService:
                ) AND status='active' AND (expires_at IS NULL OR expires_at>?)""",
             (binding.action_id, claim_token, self.now()),
         ).fetchone()
-        offer = self._calendar_offer(connection, binding, include_consumed=True)
-        if row is None or offer is None:
+        offer = None
+        if binding.operation is Operation.MEETING_SCHEDULE:
+            offer = self._calendar_offer(connection, binding, include_consumed=True)
+        if row is None or (
+            binding.operation is Operation.MEETING_SCHEDULE and offer is None
+        ):
             return False
         if row["scope"] == Scope.EXACT.value:
             return bool(
@@ -2082,6 +2112,26 @@ class PolicyGateService:
                     ),
                     "uncertain",
                 )
+            if (
+                binding.operation is Operation.TASK_CREATE
+                and self.policy.todoist.enabled
+            ):
+                command_uuid, temp_id = command_identity(binding.action_id)
+                connection.execute(
+                    """INSERT INTO todoist_task_mappings(
+                           action_id, subject_id, command_uuid, temp_id,
+                           provider_task_id, state, updated_at
+                       ) VALUES (?, ?, ?, ?, NULL, 'claimed', ?)
+                       ON CONFLICT(action_id) DO UPDATE SET state='claimed',
+                       updated_at=excluded.updated_at""",
+                    (
+                        binding.action_id,
+                        binding.subject_id,
+                        command_uuid,
+                        temp_id,
+                        now,
+                    ),
+                )
             connection.execute(
                 """INSERT INTO quota_events VALUES (?, ?, ?, ?, ?, 'reserved', ?)
                    ON CONFLICT(action_id) DO UPDATE SET state='reserved',
@@ -2113,11 +2163,67 @@ class PolicyGateService:
             and binding.operation is Operation.MEETING_SCHEDULE
         ):
             return self._execute_calendar_schedule(binding, claim_token)
+        if binding.operation is Operation.TASK_CREATE and self.policy.todoist.enabled:
+            return self._execute_todoist_task(binding, claim_token)
         try:
             outcome = self.executor.execute(binding)
         except BaseException:
             self._finalize(binding.action_id, claim_token, ExecutionOutcome.UNCERTAIN)
             return ActionResult("uncertain", binding.action_id)
+        if not self._finalize(binding.action_id, claim_token, outcome):
+            return ActionResult("uncertain", binding.action_id)
+        return ActionResult(outcome.value, binding.action_id)
+
+    def _execute_todoist_task(
+        self, binding: ActionBinding, claim_token: str
+    ) -> ActionResult:
+        """Submit one fixed item_add and record its exact task ID before success."""
+
+        if not self.policy.todoist.enabled or self.todoist_api is None:
+            self._finalize(
+                binding.action_id, claim_token, ExecutionOutcome.DEFINITE_FAILURE
+            )
+            return ActionResult("definite_failure", binding.action_id)
+        row = self.store.database.execute(
+            """SELECT command_uuid, temp_id FROM todoist_task_mappings
+               WHERE action_id=? AND subject_id=? AND state='claimed'""",
+            (binding.action_id, binding.subject_id),
+        ).fetchone()
+        if row is None:
+            self._finalize(binding.action_id, claim_token, ExecutionOutcome.UNCERTAIN)
+            return ActionResult("uncertain", binding.action_id)
+        try:
+            result = self.todoist_api.item_add(
+                item_add_command(
+                    self.policy.todoist,
+                    binding.action_id,
+                    str(binding.arguments["title"]),
+                    (
+                        binding.arguments["due_date"]
+                        if isinstance(binding.arguments["due_date"], str)
+                        else None
+                    ),
+                )
+            )
+        except BaseException:
+            result = TodoistAddResult.uncertain()
+        if result.provider_task_id is not None:
+            with self.store.database.transaction() as connection:
+                cursor = connection.execute(
+                    """UPDATE todoist_task_mappings SET provider_task_id=?, state='succeeded', updated_at=?
+                       WHERE action_id=? AND state='claimed'""",
+                    (result.provider_task_id, self.now(), binding.action_id),
+                )
+                if int(cursor.rowcount) != 1:
+                    self._finalize(
+                        binding.action_id, claim_token, ExecutionOutcome.UNCERTAIN
+                    )
+                    return ActionResult("uncertain", binding.action_id)
+            outcome = ExecutionOutcome.VERIFIED_SUCCESS
+        elif result.definite_failure:
+            outcome = ExecutionOutcome.DEFINITE_FAILURE
+        else:
+            outcome = ExecutionOutcome.UNCERTAIN
         if not self._finalize(binding.action_id, claim_token, outcome):
             return ActionResult("uncertain", binding.action_id)
         return ActionResult(outcome.value, binding.action_id)
@@ -2254,6 +2360,11 @@ class PolicyGateService:
             connection.execute(
                 "UPDATE quota_events SET state=?, changed_at=? WHERE action_id=?",
                 (quota_state, now, action_id),
+            )
+            connection.execute(
+                """UPDATE todoist_task_mappings SET state=?, updated_at=?
+                   WHERE action_id=? AND state='claimed'""",
+                (state, now, action_id),
             )
             if authority_id is not None:
                 authority = connection.execute(
@@ -2422,6 +2533,46 @@ class PolicyGateService:
                     return ActionResult("uncertain", action_id)
                 self._resolve_uncertain(action_id, success=True)
                 return ActionResult("verified_success", action_id)
+            if (
+                binding.operation is Operation.TASK_CREATE
+                and self.policy.todoist.enabled
+            ):
+                mapping = self.store.database.execute(
+                    """SELECT command_uuid, temp_id FROM todoist_task_mappings
+                       WHERE action_id=? AND state='uncertain'""",
+                    (action_id,),
+                ).fetchone()
+                if mapping is None or self.todoist_api is None:
+                    return ActionResult("uncertain", action_id)
+                try:
+                    todoist_result = self.todoist_api.reconcile(
+                        item_add_command(
+                            self.policy.todoist,
+                            binding.action_id,
+                            str(binding.arguments["title"]),
+                            (
+                                binding.arguments["due_date"]
+                                if isinstance(binding.arguments["due_date"], str)
+                                else None
+                            ),
+                        )
+                    )
+                except BaseException:
+                    return ActionResult("uncertain", action_id)
+                if todoist_result.provider_task_id is not None:
+                    with self.store.database.transaction() as connection:
+                        connection.execute(
+                            """UPDATE todoist_task_mappings
+                               SET provider_task_id=?, state='succeeded', updated_at=?
+                               WHERE action_id=? AND state='uncertain'""",
+                            (todoist_result.provider_task_id, self.now(), action_id),
+                        )
+                    self._resolve_uncertain(action_id, success=True)
+                    return ActionResult("verified_success", action_id)
+                if todoist_result.definite_failure:
+                    self._resolve_uncertain(action_id, success=False)
+                    return ActionResult("definite_failure", action_id)
+                return ActionResult("uncertain", action_id)
             outcome = self.executor.reconcile(binding)
             if outcome is ReconcileOutcome.UNRESOLVED:
                 return ActionResult("uncertain", action_id)
@@ -2494,6 +2645,11 @@ class PolicyGateService:
             connection.execute(
                 "UPDATE quota_events SET state=?, changed_at=? WHERE action_id=?",
                 ("succeeded" if success else "released", now, action_id),
+            )
+            connection.execute(
+                """UPDATE todoist_task_mappings SET state=?, updated_at=?
+                   WHERE action_id=? AND state='uncertain'""",
+                ("succeeded" if success else "definite_failure", now, action_id),
             )
             if (
                 not success

@@ -11,14 +11,14 @@ from typing import Callable
 from src.encrypted_sqlite import EncryptedStoreError, SqlCipherDatabase
 from src.policy_gate.types import ActionBinding, ActionOrigin, Operation
 
-GATE_SCHEMA_VERSION = 5
+GATE_SCHEMA_VERSION = 6
 
 GATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS gate_schema_meta (
     version INTEGER NOT NULL
 );
 INSERT INTO gate_schema_meta(version)
-SELECT 5 WHERE NOT EXISTS (SELECT 1 FROM gate_schema_meta);
+SELECT 6 WHERE NOT EXISTS (SELECT 1 FROM gate_schema_meta);
 CREATE TABLE IF NOT EXISTS subjects (
     subject_id TEXT PRIMARY KEY,
     blocked INTEGER NOT NULL DEFAULT 0 CHECK(blocked IN (0, 1)),
@@ -206,6 +206,20 @@ CREATE TABLE IF NOT EXISTS calendar_reservations (
     updated_at INTEGER NOT NULL,
     FOREIGN KEY(subject_id) REFERENCES subjects(subject_id)
 );
+CREATE TABLE IF NOT EXISTS todoist_task_mappings (
+    action_id TEXT PRIMARY KEY,
+    subject_id TEXT NOT NULL,
+    command_uuid TEXT NOT NULL UNIQUE,
+    temp_id TEXT NOT NULL UNIQUE,
+    provider_task_id TEXT,
+    state TEXT NOT NULL CHECK(state IN ('claimed', 'succeeded', 'uncertain', 'definite_failure')),
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(subject_id) REFERENCES subjects(subject_id)
+);
+CREATE TABLE IF NOT EXISTS todoist_erasure_tombstones (
+    subject_hash TEXT PRIMARY KEY,
+    changed_at INTEGER NOT NULL
+);
 """
 
 
@@ -250,6 +264,13 @@ class GateStore:
             )
         if version == 4:
             self._migrate_v4_to_v5()
+            version = int(
+                self.database.execute(
+                    "SELECT version FROM gate_schema_meta"
+                ).fetchone()[0]
+            )
+        if version == 5:
+            self._migrate_v5_to_v6()
             version = int(
                 self.database.execute(
                     "SELECT version FROM gate_schema_meta"
@@ -475,6 +496,12 @@ class GateStore:
         # from an unsupported database rather than silently treating it as new.
         with self.database.transaction() as connection:
             connection.execute("UPDATE gate_schema_meta SET version=5")
+
+    def _migrate_v5_to_v6(self) -> None:
+        """Add content-free Todoist command-to-task recovery state."""
+
+        with self.database.transaction() as connection:
+            connection.execute("UPDATE gate_schema_meta SET version=6")
 
     def now(self) -> int:
         return int(self._clock())
