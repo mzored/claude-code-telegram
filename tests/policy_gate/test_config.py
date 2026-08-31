@@ -107,7 +107,18 @@ def test_enabled_calendar_requires_complete_distinct_configuration_and_fixed_sco
 
 def test_todoist_enablement_is_independent_of_calendar(tmp_path: Path) -> None:
     key = credential(tmp_path / "secrets" / "gate-key", "g" * 40)
-    token = credential(tmp_path / "secrets" / "todoist-token", "t" * 32)
+    token = credential(
+        tmp_path / "secrets" / "todoist-token",
+        '{"token":"'
+        + "t" * 32
+        + '","scopes":["data:read_write"],"external_requests_project_id":"external-requests"}',
+    )
+    erasure = credential(
+        tmp_path / "secrets" / "todoist-erasure-token",
+        '{"token":"'
+        + "e" * 32
+        + '","scopes":["data:delete"],"external_requests_project_id":"external-requests"}',
+    )
     base = environment(tmp_path, key)
     disabled = GateConfig.from_environment(base)
     assert not disabled.calendar.enabled and not disabled.todoist.enabled
@@ -117,11 +128,13 @@ def test_todoist_enablement_is_independent_of_calendar(tmp_path: Path) -> None:
             **base,
             "POLICY_GATE_TODOIST_ENABLED": "1",
             "POLICY_GATE_TODOIST_CREDENTIAL_FILE": str(token),
+            "POLICY_GATE_TODOIST_ERASURE_CREDENTIAL_FILE": str(erasure),
             "POLICY_GATE_TODOIST_EXTERNAL_REQUESTS_PROJECT_ID": "external-requests",
         }
     )
     assert not todoist.calendar.enabled and todoist.todoist.enabled
-    assert todoist.read_todoist_token() == "t" * 32
+    assert todoist.read_todoist_credentials().token == "t" * 32
+    assert todoist.read_todoist_erasure_credentials().token == "e" * 32
 
     with pytest.raises(GateConfigurationError, match="TODOIST_CREDENTIAL_FILE"):
         GateConfig.from_environment({**base, "POLICY_GATE_TODOIST_ENABLED": "1"})

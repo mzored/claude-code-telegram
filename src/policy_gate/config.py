@@ -13,7 +13,12 @@ from src.policy_gate.calendar import (
     CalendarCredentials,
     CalendarPolicy,
 )
-from src.policy_gate.todoist import TodoistPolicy
+from src.policy_gate.todoist import (
+    TODOIST_ADD_SCOPE,
+    TODOIST_DELETE_SCOPE,
+    TodoistCredentials,
+    TodoistPolicy,
+)
 
 
 class GateConfigurationError(ValueError):
@@ -215,12 +220,24 @@ class GateConfig:
                     "Todoist credential must stay outside data, repository, and key paths"
                 )
             try:
+                erasure_credential_file = _absolute(
+                    env, "POLICY_GATE_TODOIST_ERASURE_CREDENTIAL_FILE"
+                ).resolve()
+                if erasure_credential_file == todoist_credential_file or any(
+                    erasure_credential_file == path
+                    or erasure_credential_file.is_relative_to(path)
+                    for path in (data_dir, repository, key_file)
+                ):
+                    raise GateConfigurationError(
+                        "Todoist erasure credential is invalid"
+                    )
                 todoist = TodoistPolicy(
                     enabled=True,
                     external_requests_project_id=env.get(
                         "POLICY_GATE_TODOIST_EXTERNAL_REQUESTS_PROJECT_ID", ""
                     ).strip(),
                     credential_file=todoist_credential_file,
+                    erasure_credential_file=erasure_credential_file,
                 )
             except ValueError as exc:
                 raise GateConfigurationError(
@@ -252,7 +269,40 @@ class GateConfig:
         except CalendarConfigurationError as exc:
             raise GateConfigurationError("Calendar credential is invalid") from exc
 
-    def read_todoist_token(self) -> str:
+    def read_todoist_credentials(self) -> TodoistCredentials:
         if not self.todoist.enabled or self.todoist.credential_file is None:
             raise GateConfigurationError("Todoist is disabled")
-        return _read_owner_file(self.todoist.credential_file, "Todoist credential", 16)
+        try:
+            credentials = TodoistCredentials.from_json(
+                _read_owner_file(self.todoist.credential_file, "Todoist credential", 32)
+            )
+        except ValueError as exc:
+            raise GateConfigurationError("Todoist credential is invalid") from exc
+        if (
+            TODOIST_ADD_SCOPE not in credentials.scopes
+            or credentials.external_requests_project_id
+            != self.todoist.external_requests_project_id
+        ):
+            raise GateConfigurationError(
+                "Todoist credential scope or project is invalid"
+            )
+        return credentials
+
+    def read_todoist_erasure_credentials(self) -> TodoistCredentials:
+        if not self.todoist.enabled or self.todoist.erasure_credential_file is None:
+            raise GateConfigurationError("Todoist erasure is disabled")
+        try:
+            credentials = TodoistCredentials.from_json(
+                _read_owner_file(
+                    self.todoist.erasure_credential_file,
+                    "Todoist erasure credential",
+                    32,
+                )
+            )
+        except ValueError as exc:
+            raise GateConfigurationError(
+                "Todoist erasure credential is invalid"
+            ) from exc
+        if TODOIST_DELETE_SCOPE not in credentials.scopes:
+            raise GateConfigurationError("Todoist erasure credential scope is invalid")
+        return credentials

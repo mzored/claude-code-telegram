@@ -13,7 +13,7 @@ from src.policy_gate.executors import MockExecutor
 from src.policy_gate.rpc import PolicyGateRpcServer, StopSignal
 from src.policy_gate.service import PolicyConfig, PolicyGateService
 from src.policy_gate.store import GateStore
-from src.policy_gate.todoist import TodoistSyncApi
+from src.policy_gate.todoist import TodoistErasureSyncApi, TodoistSyncApi
 from src.policy_gate.transport import (
     GatePeerAuthorizer,
     OwnershipSetter,
@@ -83,9 +83,13 @@ def run() -> None:
         # refresh grant proves the exact Calendar scopes we require.
         calendar_api.validate_startup()
     todoist_api = None
+    todoist_erasure_api = None
     if config.todoist.enabled:
-        # The token is read only inside the owner-controlled Gate process.
-        todoist_api = TodoistSyncApi(config.read_todoist_token())
+        # Credentials are read only inside the owner-controlled Gate process.
+        todoist_api = TodoistSyncApi(config.read_todoist_credentials().token)
+        todoist_erasure_api = TodoistErasureSyncApi(
+            config.read_todoist_erasure_credentials().token
+        )
     policy = PolicyConfig(
         enabled_operations=frozenset(
             (
@@ -104,6 +108,7 @@ def run() -> None:
         policy=policy,
         calendar_api=calendar_api,
         todoist_api=todoist_api,
+        todoist_erasure_api=todoist_erasure_api,
     )
     stop = threading.Event()
 

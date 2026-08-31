@@ -98,6 +98,33 @@ def test_v4_to_v5_migration_creates_calendar_state_independently(
         reopened.close()
 
 
+def test_v5_to_v6_migration_creates_todoist_recovery_state(tmp_path: Path) -> None:
+    path = tmp_path / "v5-todoist.db"
+    database = SqlCipherDatabase(path, GATE_KEY, GATE_SCHEMA)
+    try:
+        database.execute("UPDATE gate_schema_meta SET version=5")
+        database.execute("DROP TABLE todoist_erasure_tombstones")
+        database.execute("DROP TABLE todoist_task_mappings")
+    finally:
+        database.close()
+
+    store = GateStore(path, GATE_KEY)
+    try:
+        assert (
+            store.database.execute("SELECT version FROM gate_schema_meta").fetchone()[0]
+            == 6
+        )
+        tables = {
+            str(row["name"])
+            for row in store.database.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert {"todoist_task_mappings", "todoist_erasure_tombstones"} <= tables
+    finally:
+        store.close()
+
+
 def _legacy_binding(label: str, update_id: int) -> tuple[str, dict[str, object]]:
     fields: dict[str, object] = {
         "subject_id": "subject-a",

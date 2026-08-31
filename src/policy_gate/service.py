@@ -27,6 +27,7 @@ from src.policy_gate.store import GateStore
 from src.policy_gate.todoist import (
     TodoistAddResult,
     TodoistApi,
+    TodoistDeleteApi,
     TodoistPolicy,
     command_identity,
     item_add_command,
@@ -94,6 +95,7 @@ class PolicyGateService:
         policy: PolicyConfig | None = None,
         calendar_api: CalendarApi | None = None,
         todoist_api: TodoistApi | None = None,
+        todoist_erasure_api: TodoistDeleteApi | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if not getattr(executor, "is_mock", False):
@@ -118,6 +120,7 @@ class PolicyGateService:
         self.policy = selected_policy
         self.calendar_api = calendar_api
         self.todoist_api = todoist_api
+        self.todoist_erasure_api = todoist_erasure_api
         self._clock = clock
         self._locks_guard = threading.Lock()
         self._action_locks: dict[str, threading.Lock] = {}
@@ -1265,6 +1268,24 @@ class PolicyGateService:
         for row in rows:
             self._reconcile_owner_external_for_erasure(str(row["action_id"]))
 
+        mappings = self.store.database.execute(
+            """SELECT action_id, provider_task_id FROM todoist_task_mappings
+               WHERE subject_id=? AND state='succeeded' AND provider_task_id IS NOT NULL
+               ORDER BY action_id""",
+            (subject_id,),
+        ).fetchall()
+        for mapping in mappings:
+            if self.todoist_erasure_api is None:
+                return "pending_erasure"
+            try:
+                deleted = self.todoist_erasure_api.delete_mapped_task(
+                    str(mapping["provider_task_id"])
+                )
+            except BaseException:
+                return "pending_erasure"
+            if deleted is not True:
+                return "pending_erasure"
+
         # Recheck after the private recovery pass.  Ordinary public uncertainty
         # deliberately remains generic reconciliation work; neither path can
         # submit a fresh effect during erasure.
@@ -2164,7 +2185,7 @@ class PolicyGateService:
         ):
             return self._execute_calendar_schedule(binding, claim_token)
         if binding.operation is Operation.TASK_CREATE and self.policy.todoist.enabled:
-            return self._execute_todoist_task(binding, claim_token)
+            return self._execute_todoist_task(binding, claim_token, crash_hook)
         try:
             outcome = self.executor.execute(binding)
         except BaseException:
@@ -2175,7 +2196,10 @@ class PolicyGateService:
         return ActionResult(outcome.value, binding.action_id)
 
     def _execute_todoist_task(
-        self, binding: ActionBinding, claim_token: str
+        self,
+        binding: ActionBinding,
+        claim_token: str,
+        crash_hook: Callable[[str], None] | None,
     ) -> ActionResult:
         """Submit one fixed item_add and record its exact task ID before success."""
 
@@ -2219,6 +2243,8 @@ class PolicyGateService:
                         binding.action_id, claim_token, ExecutionOutcome.UNCERTAIN
                     )
                     return ActionResult("uncertain", binding.action_id)
+            if crash_hook is not None:
+                crash_hook("after_todoist_mapping")
             outcome = ExecutionOutcome.VERIFIED_SUCCESS
         elif result.definite_failure:
             outcome = ExecutionOutcome.DEFINITE_FAILURE
@@ -2538,11 +2564,17 @@ class PolicyGateService:
                 and self.policy.todoist.enabled
             ):
                 mapping = self.store.database.execute(
-                    """SELECT command_uuid, temp_id FROM todoist_task_mappings
-                       WHERE action_id=? AND state='uncertain'""",
+                    """SELECT command_uuid, temp_id, provider_task_id, state
+                       FROM todoist_task_mappings WHERE action_id=?
+                       AND state IN ('uncertain', 'succeeded')""",
                     (action_id,),
                 ).fetchone()
-                if mapping is None or self.todoist_api is None:
+                if mapping is None:
+                    return ActionResult("uncertain", action_id)
+                if str(mapping["state"]) == "succeeded" and mapping["provider_task_id"]:
+                    self._resolve_uncertain(action_id, success=True)
+                    return ActionResult("verified_success", action_id)
+                if self.todoist_api is None:
                     return ActionResult("uncertain", action_id)
                 try:
                     todoist_result = self.todoist_api.reconcile(

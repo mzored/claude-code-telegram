@@ -7,12 +7,15 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol, cast
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 TODOIST_COMMAND_NAMESPACE = uuid.UUID("1c9bc1ca-21a4-4d9e-8b04-0b8b3e4c3943")
 TODOIST_TEMP_ID_NAMESPACE = uuid.UUID("f1be8d48-7f2f-43c3-8bdc-6f7e5309cc84")
-TODOIST_DESCRIPTION_PREFIX = "Created by Assist AI public sender; action="
-TODOIST_CONTENT_PREFIX = "[Public request] "
+TODOIST_DESCRIPTION = "Provenance: external_untrusted"
+TODOIST_CONTENT_PREFIX = "[External request] "
+TODOIST_ADD_SCOPE = "data:read_write"
+TODOIST_DELETE_SCOPE = "data:delete"
 
 
 @dataclass(frozen=True)
@@ -22,6 +25,7 @@ class TodoistPolicy:
     enabled: bool = False
     external_requests_project_id: str = ""
     credential_file: Path | None = None
+    erasure_credential_file: Path | None = None
     optional_read_scope_enabled: bool = False
 
     def __post_init__(self) -> None:
@@ -55,6 +59,39 @@ class TodoistAddResult:
 
 
 @dataclass(frozen=True)
+class TodoistCredentials:
+    token: str
+    scopes: frozenset[str]
+    external_requests_project_id: str
+
+    @classmethod
+    def from_json(cls, value: str) -> "TodoistCredentials":
+        try:
+            raw = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Todoist credential document is invalid") from exc
+        if not isinstance(raw, dict) or set(raw) != {
+            "token",
+            "scopes",
+            "external_requests_project_id",
+        }:
+            raise ValueError("Todoist credential document is invalid")
+        token = raw["token"]
+        scopes = raw["scopes"]
+        project = raw["external_requests_project_id"]
+        if (
+            not isinstance(token, str)
+            or len(token.encode()) < 16
+            or not isinstance(scopes, list)
+            or not all(isinstance(scope, str) for scope in scopes)
+            or not isinstance(project, str)
+            or not project
+        ):
+            raise ValueError("Todoist credential document is invalid")
+        return cls(token, frozenset(scopes), project)
+
+
+@dataclass(frozen=True)
 class TodoistItemAdd:
     """The complete fixed Sync command, constructed only inside Policy Gate."""
 
@@ -72,6 +109,12 @@ class TodoistApi(Protocol):
     def item_add(self, command: TodoistItemAdd) -> TodoistAddResult: ...
 
     def reconcile(self, command: TodoistItemAdd) -> TodoistAddResult: ...
+
+
+class TodoistDeleteApi(Protocol):
+    """Narrow administrative-only task deletion boundary."""
+
+    def delete_mapped_task(self, provider_task_id: str) -> bool | None: ...
 
 
 HttpPost = Callable[[str, dict[str, str], bytes], bytes]
@@ -102,20 +145,19 @@ class TodoistSyncApi:
         }
         if command.due_date is not None:
             args["due"] = {"date": command.due_date}
-        return json.dumps(
-            {
-                "commands": [
-                    {
-                        "type": "item_add",
-                        "uuid": command.command_uuid,
-                        "temp_id": command.temp_id,
-                        "args": args,
-                    }
-                ]
-            },
+        commands = json.dumps(
+            [
+                {
+                    "type": "item_add",
+                    "uuid": command.command_uuid,
+                    "temp_id": command.temp_id,
+                    "args": args,
+                }
+            ],
             separators=(",", ":"),
             sort_keys=True,
-        ).encode("utf-8")
+        )
+        return urlencode({"commands": commands}).encode("utf-8")
 
     def item_add(self, command: TodoistItemAdd) -> TodoistAddResult:
         try:
@@ -123,7 +165,7 @@ class TodoistSyncApi:
                 "https://api.todoist.com/api/v1/sync",
                 {
                     "Authorization": f"Bearer {self._token}",
-                    "Content-Type": "application/json",
+                    "Content-Type": "application/x-www-form-urlencoded",
                 },
                 self._payload(command),
             )
@@ -141,6 +183,51 @@ class TodoistSyncApi:
     def reconcile(self, command: TodoistItemAdd) -> TodoistAddResult:
         # Same command identity and payload only; no optional provider read scope.
         return self.item_add(command)
+
+
+class TodoistErasureSyncApi:
+    """Separate credentialed administrative deletion adapter."""
+
+    def __init__(self, token: str, *, post: HttpPost = _post) -> None:
+        self._token = token
+        self._post = post
+
+    def delete_mapped_task(self, provider_task_id: str) -> bool | None:
+        command_uuid = str(
+            uuid.uuid5(TODOIST_COMMAND_NAMESPACE, "erase:" + provider_task_id)
+        )
+        payload = urlencode(
+            {
+                "commands": json.dumps(
+                    [
+                        {
+                            "type": "item_delete",
+                            "uuid": command_uuid,
+                            "args": {"id": provider_task_id},
+                        }
+                    ],
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            }
+        ).encode("utf-8")
+        try:
+            raw = self._post(
+                "https://api.todoist.com/api/v1/sync",
+                {
+                    "Authorization": f"Bearer {self._token}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                payload,
+            )
+            status = json.loads(raw).get("sync_status", {}).get(command_uuid)
+            if status == "ok":
+                return True
+            if isinstance(status, dict) and status.get("error"):
+                return False
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+        return None
 
 
 def command_identity(action_id: str) -> tuple[str, str]:
@@ -163,15 +250,20 @@ def item_add_command(
         temp_id=temp_id,
         project_id=policy.external_requests_project_id,
         content=TODOIST_CONTENT_PREFIX + title,
-        description=TODOIST_DESCRIPTION_PREFIX + action_id,
+        description=TODOIST_DESCRIPTION,
         due_date=due_date,
     )
 
 
 __all__ = [
-    "TODOIST_DESCRIPTION_PREFIX",
+    "TODOIST_ADD_SCOPE",
+    "TODOIST_DELETE_SCOPE",
+    "TODOIST_DESCRIPTION",
     "TodoistAddResult",
     "TodoistApi",
+    "TodoistCredentials",
+    "TodoistDeleteApi",
+    "TodoistErasureSyncApi",
     "TodoistItemAdd",
     "TodoistPolicy",
     "TodoistSyncApi",

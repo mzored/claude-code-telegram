@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -414,6 +415,12 @@ DRY_RUN_ACCEPTED = {
     "en": "The requested action passed the dry-run policy check. No external provider was contacted.",
     "ru": "Запрошенное действие прошло проверку в тестовом режиме. Внешний сервис не вызывался.",
 }
+TODOIST_SUCCEEDED = {
+    "en": "The task was created in the configured external requests list.",
+    "ru": "Задача создана в настроенном списке внешних запросов.",
+}
+_TASK_CANDIDATE = re.compile(r"\b(?:task|todo|create|добавь|задач)\b", re.I)
+_ISO_DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 
 MEETING_OPTIONS_PROMPT = {
     "en": "Choose one of these available times.",
@@ -513,6 +520,33 @@ class ActionAssistantService(AssistantService):
         except Exception:
             return self._process_without_actions(message)
         if not discovery.schemas:
+            if discovery.authorization is not None and _TASK_CANDIDATE.search(
+                message.text
+            ):
+                title = _ISO_DATE.sub("", message.text).strip(" .,:;!?")
+                due = _ISO_DATE.search(message.text)
+                candidate_request_id = self.store.upsert_request(
+                    message, message.text.strip()[:4000], self.config.retention_seconds
+                )
+                binding = self.coordinator.stage_exact_task_candidate(
+                    message,
+                    candidate_request_id,
+                    title,
+                    None if due is None else due.group(1),
+                    self.config.retention_seconds,
+                    discovery,
+                )
+                self._register_request(message, candidate_request_id)
+                if binding is not None:
+                    text = REQUEST_CONFIRMED[_language(message.text)]
+                    reply = self._assistant_reply(message, text)
+                    self.store.add_assistant_context(
+                        message, text, self.config.retention_seconds
+                    )
+                    self.store.set_update_outcome(
+                        message.update_id, "task_exact_staged", reply.reply_id
+                    )
+                    return ProcessingResult("task_exact_staged", reply)
             return self._process_without_actions(message)
         if not self.store.has_active_consent(
             message.connection_id,
@@ -610,7 +644,11 @@ class ActionAssistantService(AssistantService):
                 discovery,
             )
             if action_result.outcome in {"verified_success", "replayed_success"}:
-                text = DRY_RUN_ACCEPTED[_language(message.text)]
+                text = (
+                    TODOIST_SUCCEEDED[_language(message.text)]
+                    if turn.action_proposal.operation is Operation.TASK_CREATE
+                    else DRY_RUN_ACCEPTED[_language(message.text)]
+                )
                 reply = self._assistant_reply(message, text)
                 self.store.add_assistant_context(
                     message, text, self.config.retention_seconds

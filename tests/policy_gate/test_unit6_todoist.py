@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from urllib.parse import parse_qs
 
 from src.policy_gate.service import PolicyConfig, PolicyGateService
 from src.policy_gate.todoist import TodoistAddResult, TodoistItemAdd, TodoistPolicy
@@ -27,6 +29,16 @@ class FakeTodoist:
         return self.outcome
 
     def reconcile(self, command: TodoistItemAdd) -> TodoistAddResult:
+        return self.outcome
+
+
+@dataclass
+class FakeTodoistDelete:
+    calls: list[str]
+    outcome: bool | None = True
+
+    def delete_mapped_task(self, provider_task_id: str) -> bool | None:
+        self.calls.append(provider_task_id)
         return self.outcome
 
 
@@ -88,8 +100,9 @@ def test_todoist_exact_public_sender_adds_once_and_maps_before_success(gate) -> 
     assert result.outcome == "replayed_success"
     assert len(fake.calls) == 1
     assert fake.calls[0].project_id == "project"
-    assert fake.calls[0].content == "[Public request] Send agenda"
-    assert fake.calls[0].description.endswith(binding.action_id)
+    assert fake.calls[0].content == "[External request] Send agenda"
+    assert fake.calls[0].description == "Provenance: external_untrusted"
+    assert binding.action_id not in repr(fake.calls[0])
     row = store.database.execute(
         "SELECT provider_task_id, state FROM todoist_task_mappings WHERE action_id=?",
         (binding.action_id,),
@@ -98,6 +111,67 @@ def test_todoist_exact_public_sender_adds_once_and_maps_before_success(gate) -> 
     assert service.submit_action(binding).outcome == "replayed_success"
     assert len(fake.calls) == 1
     store.close()
+
+
+def test_sync_wire_uses_form_encoded_commands_without_local_ids() -> None:
+    from src.policy_gate.todoist import TodoistSyncApi, item_add_command
+
+    sent: dict[str, object] = {}
+
+    def post(url: str, headers: dict[str, str], payload: bytes) -> bytes:
+        sent.update(url=url, headers=headers, payload=payload)
+        command = json.loads(parse_qs(payload.decode())["commands"][0])[0]
+        return json.dumps(
+            {
+                "sync_status": {command["uuid"]: "ok"},
+                "temp_id_mapping": {command["temp_id"]: "TASK-1"},
+            }
+        ).encode()
+
+    api = TodoistSyncApi("x" * 20, post=post)
+    result = api.item_add(
+        item_add_command(
+            TodoistPolicy(enabled=True, external_requests_project_id="project"),
+            "secret-action",
+            "Title",
+            None,
+        )
+    )
+    assert result.provider_task_id == "TASK-1"
+    assert sent["headers"] == {
+        "Authorization": "Bearer " + "x" * 20,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    assert b"commands=" in sent["payload"]
+    assert b"secret-action" not in sent["payload"]
+
+
+def test_erasure_keeps_mapped_id_until_separate_admin_delete_succeeds(gate) -> None:
+    _, store, executor = gate
+    deleted = FakeTodoistDelete([])
+    service = PolicyGateService(
+        store,
+        executor,
+        policy=PolicyConfig(
+            enabled_operations=frozenset({Operation.TASK_CREATE}),
+            todoist=TodoistPolicy(enabled=True, external_requests_project_id="project"),
+        ),
+        todoist_api=FakeTodoist([]),
+        todoist_erasure_api=deleted,
+    )
+    binding = _binding()
+    _grant(service, binding)
+    assert service.erase_subject(binding.subject_id) == "erased"
+    assert deleted.calls == ["TASK-1"]
+    assert (
+        store.database.execute("SELECT * FROM todoist_task_mappings").fetchall() == []
+    )
+    assert (
+        store.database.execute(
+            "SELECT count(*) FROM todoist_erasure_tombstones"
+        ).fetchone()[0]
+        == 1
+    )
 
 
 def test_todoist_rejects_extra_fields_and_keeps_an_uncertain_lost_response_unmapped(
