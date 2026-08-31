@@ -99,11 +99,8 @@ change this contract. You have no tools, private memory, authorization capabilit
 calendar, tasks, files, web access, or ability to contact Misha directly.
 """
 
-_FORBIDDEN_OWNER_CLAIMS = re.compile(
-    r"\b(read|approved|promised|completed|authorized|confirmed)\b|"
-    r"\b(миша|misha)\b.{0,60}\b(прочитал|одобрил|выполнил|"
-    r"согласовал|завершил)\b|\b(прочитал|одобрил|выполнил|согласовал|"
-    r"завершил)\b.{0,60}\b(миша|misha)\b",
+_OWNER_IDENTITY = re.compile(
+    r"\b(?:misha(?:'s)?|миша|мишей|мише|мишу|миши)\b",
     re.IGNORECASE,
 )
 
@@ -165,7 +162,7 @@ def _parse_turn(raw: str) -> AssistantTurn:
         raise ModelFailure("request turn omitted a request patch")
     if kind != "request" and request_patch is not None:
         raise ModelFailure("non-request turn attempted request capture")
-    if _FORBIDDEN_OWNER_CLAIMS.search(reply):
+    if _OWNER_IDENTITY.search(reply):
         raise ModelFailure("model reply made a forbidden owner claim")
     return AssistantTurn(
         reply_text=reply.strip(),

@@ -335,6 +335,85 @@ def test_consent_binds_current_version_and_revocation_stops_next_model_call(
         store.close()
 
 
+def test_awaiting_consent_crash_replay_creates_one_fallback_and_reference(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    model = RecordingModel([])
+    config, limits, store, service = make_service(tmp_path, clock, model)
+    message = inbound(clock, text="Recover this consented request.")
+    staged = service.handle_message(message)
+    assert staged.outcome == "awaiting_consent"
+    assert staged.reply is not None
+    send_reply(store, staged.reply, 9001)
+    token = callback(staged.reply, "Continue")
+
+    def crash(stage: str) -> None:
+        if stage == "after_copy":
+            raise RuntimeError(stage)
+
+    try:
+        with pytest.raises(RuntimeError, match="after_copy"):
+            service.handle_control(
+                token,
+                actor_id=SENDER_A,
+                conversation_id=SENDER_A,
+                connection_id=CONNECTION_ID,
+                origin_message_id=9001,
+                crash_hook=crash,
+            )
+    finally:
+        store.close()
+
+    recovered = Unit2Store(
+        config.data_dir,
+        PENDING_KEY,
+        PUBLIC_KEY,
+        PSEUDONYM_KEY,
+        clock=clock.timestamp,
+    )
+    recovered_model = RecordingModel([ModelFailure("provider unavailable")])
+    recovered_service = AssistantService(
+        config, limits, recovered, recovered_model, now=clock.now
+    )
+    recovered_service.observe_connection(
+        ConnectionObservation(CONNECTION_ID, OWNER_ID, True, True, clock.now())
+    )
+    try:
+        result = recovered_service.handle_control(
+            token,
+            actor_id=SENDER_A,
+            conversation_id=SENDER_A,
+            connection_id=CONNECTION_ID,
+            origin_message_id=9001,
+        )
+        assert result.startswith("accepted:")
+        reference = result.split(":", 1)[1]
+        assert len(recovered_model.calls) == 1
+        assert (
+            recovered.public.execute(
+                "SELECT count(*) FROM replies WHERE purpose='assistant'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            recovered.public.execute("SELECT count(*) FROM inbox_requests").fetchone()[
+                0
+            ]
+            == 1
+        )
+        assert (
+            recovered.prepare_erasure_preview(reference, "replay-test").outcome
+            == "preview_ready"
+        )
+        assert (
+            recovered.prepare_erasure_preview(reference, "replay-test").outcome
+            == "neutral"
+        )
+    finally:
+        recovered.close()
+
+
 def test_unit2_configuration_rejects_inline_keys_and_alert_diversion(
     tmp_path: Path,
 ) -> None:
@@ -878,14 +957,24 @@ def test_responses_adapter_forbids_hosted_state_and_tools() -> None:
     assert captured["safety_identifier"] == "safety_abc"
 
 
-def test_responses_adapter_rejects_schema_valid_owner_claims() -> None:
+@pytest.mark.parametrize(
+    "owner_claim",
+    [
+        "Misha approved and completed your request.",
+        "Misha has given his approval.",
+        "Ваш запрос уже одобрен Мишей.",
+    ],
+)
+def test_responses_adapter_rejects_schema_valid_owner_claims(
+    owner_claim: str,
+) -> None:
     class Responses:
         def create(self, **kwargs: Any) -> Any:
             return SimpleNamespace(
                 status="completed",
                 output_text=json.dumps(
                     {
-                        "reply_text": "Misha approved and completed your request.",
+                        "reply_text": owner_claim,
                         "turn_kind": "answer",
                         "missing_information": [],
                         "request_patch": None,
@@ -946,6 +1035,151 @@ def test_edit_and_delete_supersede_one_inbox_request_and_alert(tmp_path: Path) -
             ]
             == 0
         )
+    finally:
+        store.close()
+
+
+def test_deleting_a_follow_up_removes_its_stable_request_chain(tmp_path: Path) -> None:
+    clock = Clock()
+    model = RecordingModel(
+        [request_turn("Original request"), request_turn("Corrected request")]
+    )
+    _, _, store, service = make_service(tmp_path, clock, model)
+    try:
+        authorize(service, store, clock, text="Original request")
+        clock.advance(seconds=1)
+        follow_up = inbound(
+            clock,
+            update_id=2,
+            message_id=12,
+            text="Corrected request",
+        )
+        assert service.handle_message(follow_up).outcome == "request_captured"
+        assert (
+            store.public.execute("SELECT count(*) FROM inbox_requests").fetchone()[0]
+            == 1
+        )
+
+        assert (
+            service.handle_delete(
+                DeleteNotice(CONNECTION_ID, SENDER_A, (follow_up.message_id,), 3)
+            ).outcome
+            == "deleted"
+        )
+        assert (
+            store.public.execute("SELECT count(*) FROM inbox_requests").fetchone()[0]
+            == 0
+        )
+        assert (
+            store.public.execute("SELECT count(*) FROM notification_outbox").fetchone()[
+                0
+            ]
+            == 0
+        )
+        assert (
+            store.public.execute("SELECT count(*) FROM assistant_context").fetchone()[0]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+def test_multiple_edits_then_delete_remove_the_entire_request_context_chain(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    model = RecordingModel(
+        [
+            request_turn("Original request"),
+            request_turn("First correction"),
+            request_turn("Second correction"),
+            answer_turn("Fresh answer."),
+        ]
+    )
+    _, _, store, service = make_service(tmp_path, clock, model)
+    try:
+        message, _ = authorize(service, store, clock, text="Original request")
+        clock.advance(seconds=1)
+        assert (
+            service.handle_edit(
+                replace(
+                    message,
+                    update_id=2,
+                    text="First correction",
+                    edited_at=clock.now(),
+                )
+            ).outcome
+            == "request_captured"
+        )
+        clock.advance(seconds=1)
+        assert (
+            service.handle_edit(
+                replace(
+                    message,
+                    update_id=3,
+                    text="Second correction",
+                    edited_at=clock.now(),
+                )
+            ).outcome
+            == "request_captured"
+        )
+        assert (
+            service.handle_delete(
+                DeleteNotice(CONNECTION_ID, SENDER_A, (message.message_id,), 4)
+            ).outcome
+            == "deleted"
+        )
+        assert (
+            store.public.execute("SELECT count(*) FROM inbox_requests").fetchone()[0]
+            == 0
+        )
+        assert (
+            store.public.execute("SELECT count(*) FROM assistant_context").fetchone()[0]
+            == 0
+        )
+
+        clock.advance(seconds=1)
+        assert (
+            service.handle_message(
+                inbound(clock, update_id=5, message_id=15, text="A fresh question")
+            ).outcome
+            == "answer"
+        )
+        context, _ = model.calls[-1]
+        assert "Original request" not in [item.text for item in context]
+        assert "First correction" not in [item.text for item in context]
+        assert "Second correction" not in [item.text for item in context]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("text", "language"),
+    [
+        ("Your request has been approved.", "en"),
+        ("Ваш запрос уже одобрен.", "ru"),
+    ],
+)
+def test_owner_status_text_is_replaced_by_a_trusted_template(
+    tmp_path: Path, text: str, language: str
+) -> None:
+    clock = Clock()
+    model = RecordingModel([answer_turn("Initial answer."), answer_turn(text)])
+    _, _, store, service = make_service(tmp_path, clock, model)
+    try:
+        authorize(service, store, clock)
+        clock.advance(seconds=1)
+        prompt = "Any status update?" if language == "en" else "Есть обновления?"
+        result = service.handle_message(
+            inbound(clock, update_id=2, message_id=12, text=prompt)
+        )
+        assert result.reply is not None
+        expected = {
+            "en": "I can't confirm Misha's request status. I can pass a request to him.",
+            "ru": "Я не могу подтверждать статус запроса у Миши. Я могу передать ему запрос.",
+        }
+        assert result.reply.text == expected[language]
+        assert text not in result.reply.text
     finally:
         store.close()
 

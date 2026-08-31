@@ -50,6 +50,13 @@ CREATE TABLE IF NOT EXISTS inbox_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_inbox_subject
     ON inbox_requests(subject_ref, created_at);
+CREATE TABLE IF NOT EXISTS request_sources (
+    message_key TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    source_update_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_request_sources_request
+    ON request_sources(request_id);
 CREATE TABLE IF NOT EXISTS notification_outbox (
     notification_id TEXT PRIMARY KEY,
     request_id TEXT NOT NULL UNIQUE,
@@ -159,6 +166,9 @@ def erase_subject_from_public_store(
         for request_id in request_ids:
             connection.execute(
                 "DELETE FROM notification_outbox WHERE request_id=?", (request_id,)
+            )
+            connection.execute(
+                "DELETE FROM request_sources WHERE request_id=?", (request_id,)
             )
         connection.execute(
             """INSERT INTO privacy_state(subject_ref, state, changed_at)
@@ -502,6 +512,9 @@ class Unit2Store(Unit1Store):
             .upper()
         )
         now = self.now()
+        message_key = self.message_key(
+            message.connection_id, message.conversation_id, message.message_id
+        )
         with self.public.transaction() as connection:
             existing = connection.execute(
                 """SELECT request_id FROM inbox_requests WHERE subject_ref=?
@@ -509,7 +522,9 @@ class Unit2Store(Unit1Store):
                    ORDER BY content_updated_at DESC LIMIT 1""",
                 (subject, message.connection_id, message.conversation_id),
             ).fetchone()
-            request_id = str(existing[0]) if existing is not None else default_request_id
+            request_id = (
+                str(existing[0]) if existing is not None else default_request_id
+            )
             alert = f"Assistant Inbox request {request_id} is ready."
             connection.execute(
                 """INSERT INTO inbox_requests VALUES
@@ -546,6 +561,13 @@ class Unit2Store(Unit1Store):
                     now,
                 ),
             )
+            connection.execute(
+                """INSERT INTO request_sources VALUES (?, ?, ?)
+                   ON CONFLICT(message_key) DO UPDATE SET
+                   request_id=excluded.request_id,
+                   source_update_id=excluded.source_update_id""",
+                (message_key, request_id, message.update_id),
+            )
         return request_id
 
     def supersede_message_artifacts(
@@ -561,17 +583,13 @@ class Unit2Store(Unit1Store):
         )
         marks = ",".join("?" for _ in message_keys)
         with self.public.transaction() as connection:
-            # Request identifiers are deterministic from message identity, so derive
-            # them in Python rather than retaining a second sender-text mapping.
             request_ids = tuple(
-                "REQ-"
-                + uuid.uuid5(
-                    uuid.UUID("4641cd62-c11d-4167-9218-e713060cb7d5"),
-                    f"{connection_id}:{conversation_id}:{message_id}",
-                )
-                .hex[:12]
-                .upper()
-                for message_id in message_ids
+                str(row[0])
+                for row in connection.execute(
+                    f"SELECT DISTINCT request_id FROM request_sources "
+                    f"WHERE message_key IN ({marks})",
+                    message_keys,
+                ).fetchall()
             )
             if request_ids:
                 request_marks = ",".join("?" for _ in request_ids)
@@ -581,6 +599,17 @@ class Unit2Store(Unit1Store):
                 )
                 connection.execute(
                     f"DELETE FROM inbox_requests WHERE request_id IN ({request_marks})",
+                    request_ids,
+                )
+                connection.execute(
+                    f"DELETE FROM assistant_context WHERE source_update_id IN ("
+                    f"SELECT source_update_id FROM request_sources "
+                    f"WHERE request_id IN ({request_marks})"
+                    f")",
+                    request_ids,
+                )
+                connection.execute(
+                    f"DELETE FROM request_sources WHERE request_id IN ({request_marks})",
                     request_ids,
                 )
             connection.execute(
@@ -730,6 +759,10 @@ class Unit2Store(Unit1Store):
             ).rowcount
             connection.execute(
                 """DELETE FROM notification_outbox WHERE request_id NOT IN
+                   (SELECT request_id FROM inbox_requests)"""
+            )
+            connection.execute(
+                """DELETE FROM request_sources WHERE request_id NOT IN
                    (SELECT request_id FROM inbox_requests)"""
             )
             connection.execute(

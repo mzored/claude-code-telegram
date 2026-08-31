@@ -121,11 +121,11 @@ def restore_public_backup(config: BackupConfig, source: Path) -> Path:
             """SELECT count(*) FROM sqlite_master WHERE type='table'
                AND name IN ('messages', 'privacy_state', 'poll_state',
                             'assistant_context', 'inbox_requests',
-                            'notification_outbox', 'model_reservations',
+                            'request_sources', 'notification_outbox', 'model_reservations',
                             'privacy_references', 'privacy_previews',
                             'privacy_attempts')"""
         ).fetchone()[0]
-        if int(required) != 10:
+        if int(required) != 11:
             raise PublicAssistantConfigurationError(
                 "Unit 2 backup source schema is invalid"
             )

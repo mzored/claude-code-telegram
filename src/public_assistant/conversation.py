@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from datetime import datetime
 
@@ -21,6 +22,10 @@ from src.public_assistant.types import (
 REQUEST_CONFIRMED = {
     "en": "I passed this request to Misha. He will respond directly if appropriate.",
     "ru": "Я передал запрос Мише. Если потребуется, он ответит напрямую.",
+}
+OWNER_STATUS = {
+    "en": "I can't confirm Misha's request status. I can pass a request to him.",
+    "ru": "Я не могу подтверждать статус запроса у Миши. Я могу передать ему запрос.",
 }
 FALLBACK = {
     "en": "I couldn't complete an automated reply, but I passed your message to Misha as a request. He will respond directly if appropriate.",
@@ -64,6 +69,14 @@ _ABUSE = (
     "i will kill",
     "я тебя убью",
     "сдохни",
+)
+_OWNER_STATUS_TERMS = re.compile(
+    r"\b(?:approved|approval|completed|complete|confirmed|authorized|"
+    r"reviewed|finished|promised)\b|"
+    r"\b(?:одобрен\w*|одобрил\w*|выполнен\w*|выполнил\w*|"
+    r"завершен\w*|завершил\w*|согласован\w*|согласовал\w*|"
+    r"подтвержден\w*|подтвердил\w*)\b",
+    re.IGNORECASE,
 )
 
 
@@ -261,6 +274,8 @@ class AssistantService(SecretaryService):
                 message, body, self.config.retention_seconds
             )
             reply_text = REQUEST_CONFIRMED[lang]
+        elif _OWNER_STATUS_TERMS.search(reply_text):
+            reply_text = OWNER_STATUS[lang]
         reply = self._assistant_reply(message, reply_text)
         self.store.add_assistant_context(
             message, reply_text, self.config.retention_seconds
