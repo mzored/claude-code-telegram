@@ -131,14 +131,14 @@ Use `/verbose 0|1|2` to control how much background activity is shown:
 
 #### GitHub Workflow
 
-Claude Code already knows how to use `gh` CLI and `git`. Authenticate on your server with `gh auth login`, then work with repos conversationally:
+Claude Code can use `gh` and Git when the installation grants those tools. In this
+fork, development happens in the local macOS checkout. Production systems are not
+development workspaces and do not push, create branches, or make commits. See
+[`docs/fork-workflow.md`](docs/fork-workflow.md).
 
 ```
 You: List my repos related to monitoring
 Bot: [Claude runs gh repo list, shows results]
-
-You: Clone the uptime one
-Bot: [Claude runs gh repo clone, clones into workspace]
 
 You: /repo
 Bot: 📦 uptime-monitor/  ◀
@@ -146,9 +146,6 @@ Bot: 📦 uptime-monitor/  ◀
 
 You: Show me the open issues
 Bot: [Claude runs gh issue list]
-
-You: Create a fix branch and push it
-Bot: [Claude creates branch, commits, pushes]
 ```
 
 Use `/repo` to list cloned repos in your workspace, or `/repo <name>` to switch directories (sessions auto-resume).
@@ -332,7 +329,9 @@ See [SECURITY.md](SECURITY.md) for details.
 ```bash
 make dev           # Install all dependencies
 make test          # Run tests with coverage
-make lint          # Black + isort + flake8 + mypy
+make lint          # Black + isort + flake8
+make typecheck     # mypy (existing debt is tracked separately)
+make check         # Same required checks as CI
 make format        # Auto-format code
 make run-debug     # Run with debug logging
 make run-watch     # Run with auto-restart on code changes
@@ -356,7 +355,7 @@ Each command commits, tags, and pushes automatically, triggering CI tests and a 
 
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature/amazing-feature`
-3. Make changes with tests: `make test && make lint`
+3. Make changes with tests: `make check`
 4. Submit a Pull Request
 
 **Code standards:** Python 3.11+, Black formatting (88 chars), type hints required, pytest with >85% coverage.
