@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Mapping, Sequence, cast
 
 import pytest
 
@@ -15,6 +15,7 @@ from src.policy_gate.service import PolicyConfig, PolicyGateService
 from src.policy_gate.store import GateStore
 from src.policy_gate.todoist import TodoistAddResult, TodoistItemAdd, TodoistPolicy
 from src.policy_gate.types import (
+    ActionSchema,
     AdminDraft,
     AdminKind,
     Operation,
@@ -22,7 +23,11 @@ from src.policy_gate.types import (
     TrustedReference,
 )
 from src.public_assistant.action_store import Unit3Store
-from src.public_assistant.actions import ActionAssistantService, ActionCoordinator
+from src.public_assistant.actions import (
+    ActionAssistantService,
+    ActionCoordinator,
+    PublicGateClient,
+)
 from src.public_assistant.config import PublicAssistantConfig, Unit2Config
 from src.public_assistant.model import (
     ActionProposal,
@@ -54,7 +59,7 @@ class FixedModel:
         safety_identifier: str,
         *,
         policy_context: Mapping[str, object] | None = None,
-        allowed_actions: Sequence[object] = (),
+        allowed_actions: Sequence[ActionSchema] = (),
     ) -> ModelResult:
         del conversation, safety_identifier, policy_context
         self.allowed.append(tuple(item.operation for item in allowed_actions))
@@ -158,7 +163,7 @@ def test_strict_structured_task_result_needs_only_typed_candidate_fields() -> No
         ("Пожалуйста, напомни про отчёт к пятнице.", "Подготовить отчёт"),
     ],
 )
-def test_model_classified_task_stages_without_delegation_then_exact_owner_approves(
+def test_model_classified_task_captures_without_delegation_or_gate_action(
     tmp_path: Path, sender_text: str, title: str
 ) -> None:
     config, limits = _config(tmp_path)
@@ -182,7 +187,7 @@ def test_model_classified_task_stages_without_delegation_then_exact_owner_approv
         ),
         [],
     )
-    coordinator = ActionCoordinator(store, gate)
+    coordinator = ActionCoordinator(store, cast(PublicGateClient, gate))
     service = ActionAssistantService(config, limits, store, model, coordinator)
     try:
         assert service.observe_connection(
@@ -190,31 +195,47 @@ def test_model_classified_task_stages_without_delegation_then_exact_owner_approv
         )
         _consent(service, store)
         item = _message(2, sender_text)
-        assert coordinator.activate_integration_authorization(
-            item, "integration-v1", 1, {"Todoist": ("external task creation",)}
-        )
         result = service.handle_message(item)
-        assert result.outcome == "task_exact_staged"
+        assert result.outcome == "task_inbox_captured"
         assert model.allowed == [()]
         row = store.public.execute(
-            "SELECT action_id, arguments_json FROM public_action_intents"
+            "SELECT arguments_json FROM public_task_candidates"
         ).fetchone()
         assert row is not None
-        action_id, arguments = str(row[0]), str(row[1])
+        arguments = str(row[0])
         assert json.loads(arguments) == {"due_date": "2026-09-04", "title": title}
         inbox = store.public.execute("SELECT body FROM inbox_requests").fetchone()
         assert inbox is not None and str(inbox[0]) == arguments
         assert sender_text not in str(inbox[0])
         assert executor.calls == []
-        prepared = gate.prepare_admin(
-            TrustedReference("action", action_id),
-            AdminDraft(AdminKind.GRANT, scope=Scope.EXACT),
-            101,
-            101,
-            2,
+        assert (
+            store.public.execute("SELECT 1 FROM public_action_intents").fetchone()
+            is None
         )
-        assert gate.confirm_admin(prepared.intent_id, 101, 101, 2).outcome == "executed"
-        assert executor.calls
+        assert (
+            gate_store.database.execute(
+                "SELECT count(*) FROM subject_references"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            gate_store.database.execute(
+                "SELECT count(*) FROM candidate_actions"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            gate_store.database.execute(
+                "SELECT count(*) FROM administration_intents"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            gate_store.database.execute(
+                "SELECT count(*) FROM action_journal"
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         store.close()
         gate_store.close()
@@ -248,7 +269,7 @@ def test_verified_todoist_submission_has_durable_truthful_public_outcome(
         ),
         [],
     )
-    coordinator = ActionCoordinator(store, gate)
+    coordinator = ActionCoordinator(store, cast(PublicGateClient, gate))
     service = ActionAssistantService(config, limits, store, model, coordinator)
     try:
         assert service.observe_connection(

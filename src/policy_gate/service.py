@@ -365,7 +365,8 @@ class PolicyGateService:
     ) -> tuple[ActionBinding, CandidateProvenance, ExternalActionLink | None]:
         row = self.store.database.execute(
             """SELECT binding_json, provenance, external_link_identity,
-                      external_source_digest
+                      external_source_digest, public_candidate_identity,
+                      public_candidate_digest
                FROM candidate_actions WHERE action_id=? AND subject_id=?""",
             (reference.value, subject_id),
         ).fetchone()
@@ -386,6 +387,8 @@ class PolicyGateService:
             if (
                 row["external_link_identity"] is not None
                 or row["external_source_digest"] is not None
+                or row["public_candidate_identity"] is not None
+                or row["public_candidate_digest"] is not None
                 or binding.origin is not ActionOrigin.PUBLIC_SENDER
             ):
                 raise ValueError("ordinary action provenance is invalid")
@@ -771,6 +774,520 @@ class PolicyGateService:
             external_link,
             minimum_confirmation_sequence,
         )
+
+    def prepare_public_task_exact(
+        self,
+        request_reference: TrustedReference,
+        binding: ActionBinding,
+        candidate_link: ExternalActionLink,
+        owner_id: int,
+        control_chat_id: int,
+        preview_message_id: int,
+        ttl_seconds: int = 300,
+        *,
+        crash_hook: Callable[[str], None] | None = None,
+    ) -> PreparedIntent:
+        """Atomically stage one brokered public candidate and its exact preview."""
+
+        if (
+            request_reference.kind != "request"
+            or binding.request_id != request_reference.value
+            or binding.operation is not Operation.TASK_CREATE
+            or binding.origin is not ActionOrigin.PUBLIC_SENDER
+            or not isinstance(candidate_link, ExternalActionLink)
+            or candidate_link.source_digest != binding.payload_digest
+            or not binding.verify()
+            or not self._validate_arguments(binding)
+        ):
+            raise ValueError("public task exact binding is invalid")
+        if owner_id <= 0 or control_chat_id <= 0 or preview_message_id <= 0:
+            raise ValueError("owner preview binding is incomplete")
+        if ttl_seconds <= 0 or ttl_seconds > 900:
+            raise ValueError("administration preview TTL is invalid")
+        draft = AdminDraft(
+            AdminKind.GRANT,
+            operation=Operation.TASK_CREATE,
+            scope=Scope.EXACT,
+            exact_binding=binding,
+        )
+        self._validate_draft(draft)
+        payload = self._draft_payload(draft)
+        intent_id = "INT-" + secrets.token_urlsafe(24)
+        now = self.now()
+        expires = now + ttl_seconds
+        with self.store.database.transaction() as connection:
+            subject = connection.execute(
+                "SELECT blocked, revision FROM subjects WHERE subject_id=?",
+                (binding.subject_id,),
+            ).fetchone()
+            if (
+                subject is None
+                or bool(subject["blocked"])
+                or not self._policy_allows(connection, binding.operation)
+                or not self._receipt_allows(
+                    connection,
+                    binding.subject_id,
+                    binding.processing_authorization_version,
+                    binding.processing_authorization_revision,
+                    binding.operation,
+                )
+                or not self._quota_available(
+                    connection, binding.subject_id, binding.operation
+                )
+            ):
+                raise PermissionError("public task exact binding was rejected")
+            for kind, value in (
+                ("request", request_reference.value),
+                ("action", binding.action_id),
+            ):
+                reference_hash = self.store.reference_hash(kind, value)
+                existing_reference = connection.execute(
+                    "SELECT subject_id FROM subject_references WHERE reference_hash=?",
+                    (reference_hash,),
+                ).fetchone()
+                if (
+                    existing_reference is not None
+                    and str(existing_reference["subject_id"]) != binding.subject_id
+                ):
+                    raise ValueError("ambiguous trusted subject reference")
+                connection.execute(
+                    "INSERT OR IGNORE INTO subject_references VALUES (?, ?, ?, ?)",
+                    (reference_hash, kind, binding.subject_id, now),
+                )
+            existing_link = connection.execute(
+                """SELECT action_id FROM candidate_actions
+                   WHERE public_candidate_identity=?""",
+                (candidate_link.link_identity,),
+            ).fetchone()
+            if existing_link is not None and str(existing_link["action_id"]) != (
+                binding.action_id
+            ):
+                raise ValueError("public task candidate replay conflicts")
+            binding_json = canonical_json(binding.as_dict())
+            existing = connection.execute(
+                "SELECT * FROM candidate_actions WHERE action_id=?",
+                (binding.action_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """INSERT INTO candidate_actions(
+                           action_id, binding_digest, binding_json, subject_id,
+                           created_at, provenance, external_link_identity,
+                           external_source_digest, public_candidate_identity,
+                           public_candidate_digest
+                       ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)""",
+                    (
+                        binding.action_id,
+                        binding.binding_digest,
+                        binding_json,
+                        binding.subject_id,
+                        now,
+                        CandidateProvenance.ORDINARY_PUBLIC.value,
+                        candidate_link.link_identity,
+                        candidate_link.source_digest,
+                    ),
+                )
+            elif not (
+                str(existing["binding_digest"]) == binding.binding_digest
+                and str(existing["binding_json"]) == binding_json
+                and str(existing["subject_id"]) == binding.subject_id
+                and str(existing["provenance"])
+                == CandidateProvenance.ORDINARY_PUBLIC.value
+                and str(existing["public_candidate_identity"])
+                == candidate_link.link_identity
+                and str(existing["public_candidate_digest"])
+                == candidate_link.source_digest
+            ):
+                raise ValueError("public task candidate replay conflicts")
+            if crash_hook is not None:
+                crash_hook("after_public_task_candidate_staged")
+            revision = int(subject["revision"])
+            old_state = {"blocked": False, "subject_revision": revision}
+            new_state = {
+                "blocked": False,
+                "subject_revision": revision + 1,
+                "delegation": payload,
+            }
+            preview = {
+                "old_state": old_state,
+                "new_state": new_state,
+                "authority_delta": {
+                    "kind": AdminKind.GRANT.value,
+                    "operation": Operation.TASK_CREATE.value,
+                    "affected_delegation_ids": [],
+                },
+                **payload,
+            }
+            connection.execute(
+                """INSERT INTO administration_intents(
+                       intent_id, subject_id, kind, payload_json, old_state_json,
+                       new_state_json, base_subject_revision, owner_id,
+                       control_chat_id, preview_message_id, created_at, expires_at,
+                       provenance, external_link_identity, external_source_digest,
+                       external_minimum_confirmation_sequence, state, consumed_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL,
+                             NULL, 'prepared', NULL)""",
+                (
+                    intent_id,
+                    binding.subject_id,
+                    AdminKind.GRANT.value,
+                    canonical_json(payload),
+                    canonical_json(old_state),
+                    canonical_json(new_state),
+                    revision,
+                    owner_id,
+                    control_chat_id,
+                    preview_message_id,
+                    now,
+                    expires,
+                    CandidateProvenance.ORDINARY_PUBLIC.value,
+                ),
+            )
+        return PreparedIntent(intent_id, preview, expires)
+
+    def confirm_public_task_exact(
+        self,
+        intent_id: str,
+        owner_id: int,
+        control_chat_id: int,
+        preview_message_id: int,
+        binding: ActionBinding,
+        candidate_link: ExternalActionLink,
+        *,
+        crash_hook: Callable[[str], None] | None = None,
+    ) -> AdminResult:
+        """Atomically grant and claim the same revalidated public candidate."""
+
+        if (
+            binding.operation is not Operation.TASK_CREATE
+            or binding.origin is not ActionOrigin.PUBLIC_SENDER
+            or not isinstance(candidate_link, ExternalActionLink)
+            or candidate_link.source_digest != binding.payload_digest
+            or not binding.verify()
+            or not self._validate_arguments(binding)
+        ):
+            return AdminResult("denied")
+        with self._action_lock(binding.action_id):
+            claim_token: str | None = None
+            newly_claimed = False
+            now = self.now()
+            with self.store.database.transaction() as connection:
+                intent = connection.execute(
+                    "SELECT * FROM administration_intents WHERE intent_id=?",
+                    (intent_id,),
+                ).fetchone()
+                if intent is None or (
+                    int(intent["owner_id"]) != owner_id
+                    or int(intent["control_chat_id"]) != control_chat_id
+                    or int(intent["preview_message_id"]) != preview_message_id
+                    or str(intent["kind"]) != AdminKind.GRANT.value
+                    or str(intent["provenance"])
+                    != CandidateProvenance.ORDINARY_PUBLIC.value
+                    or intent["external_link_identity"] is not None
+                    or intent["external_source_digest"] is not None
+                    or intent["external_minimum_confirmation_sequence"] is not None
+                ):
+                    return AdminResult("denied")
+                try:
+                    payload = json.loads(str(intent["payload_json"]))
+                except (TypeError, json.JSONDecodeError):
+                    return AdminResult("denied")
+                if not isinstance(payload, dict) or payload != self._draft_payload(
+                    AdminDraft(
+                        AdminKind.GRANT,
+                        operation=Operation.TASK_CREATE,
+                        scope=Scope.EXACT,
+                        exact_binding=binding,
+                    )
+                ):
+                    return AdminResult("denied")
+                candidate = connection.execute(
+                    "SELECT * FROM candidate_actions WHERE action_id=?",
+                    (binding.action_id,),
+                ).fetchone()
+                binding_json = canonical_json(binding.as_dict())
+                if candidate is None or not (
+                    str(candidate["binding_digest"]) == binding.binding_digest
+                    and str(candidate["binding_json"]) == binding_json
+                    and str(candidate["subject_id"]) == binding.subject_id
+                    and str(candidate["provenance"])
+                    == CandidateProvenance.ORDINARY_PUBLIC.value
+                    and candidate["external_link_identity"] is None
+                    and candidate["external_source_digest"] is None
+                    and str(candidate["public_candidate_identity"])
+                    == candidate_link.link_identity
+                    and str(candidate["public_candidate_digest"])
+                    == candidate_link.source_digest
+                ):
+                    return AdminResult("denied")
+                intent_state = str(intent["state"])
+                journal = connection.execute(
+                    "SELECT * FROM action_journal WHERE action_id=?",
+                    (binding.action_id,),
+                ).fetchone()
+                if journal is not None and (
+                    str(journal["binding_digest"]) != binding.binding_digest
+                    or str(journal["binding_json"]) != binding_json
+                    or str(journal["origin"]) != binding.origin.value
+                ):
+                    return AdminResult("denied")
+                if intent_state == "applied":
+                    if journal is None or str(journal["state"]) != "succeeded":
+                        return AdminResult("denied")
+                    return AdminResult(
+                        "replayed",
+                        ActionResult("replayed_success", binding.action_id),
+                    )
+                if intent_state in {"expired", "stale"}:
+                    return AdminResult(intent_state)
+                if intent_state not in {"prepared", "executing"}:
+                    return AdminResult("denied")
+                if intent_state == "prepared" and int(intent["expires_at"]) <= now:
+                    connection.execute(
+                        "UPDATE administration_intents SET state='expired' WHERE intent_id=?",
+                        (intent_id,),
+                    )
+                    return AdminResult("expired")
+                if intent_state == "prepared" and journal is not None:
+                    return AdminResult("denied")
+                if journal is not None:
+                    if str(journal["state"]) == "succeeded":
+                        connection.execute(
+                            """UPDATE administration_intents SET state='applied',
+                               consumed_at=? WHERE intent_id=?""",
+                            (now, intent_id),
+                        )
+                        return AdminResult(
+                            "replayed",
+                            ActionResult("replayed_success", binding.action_id),
+                        )
+                    if str(journal["state"]) == "uncertain":
+                        return AdminResult(
+                            "executed", ActionResult("uncertain", binding.action_id)
+                        )
+                    if str(journal["state"]) in {"definite_failure", "cancelled"}:
+                        outcome = journal["outcome"]
+                        return AdminResult(
+                            "replayed",
+                            ActionResult(
+                                (
+                                    str(outcome)
+                                    if isinstance(outcome, str) and outcome
+                                    else str(journal["state"])
+                                ),
+                                binding.action_id,
+                            ),
+                        )
+                    if str(journal["state"]) == "claimed":
+                        token = journal["claim_token"]
+                        if not isinstance(token, str) or not token:
+                            return AdminResult("denied")
+                        claim_token = token
+                resume_claimed = (
+                    intent_state == "executing"
+                    and journal is not None
+                    and str(journal["state"]) == "claimed"
+                )
+                subject = None
+                if not resume_claimed:
+                    subject = connection.execute(
+                        "SELECT blocked, revision FROM subjects WHERE subject_id=?",
+                        (binding.subject_id,),
+                    ).fetchone()
+                    if subject is None or bool(subject["blocked"]):
+                        return AdminResult("denied")
+                    if intent_state == "prepared" and int(subject["revision"]) != int(
+                        intent["base_subject_revision"]
+                    ):
+                        connection.execute(
+                            """UPDATE administration_intents SET state='stale'
+                               WHERE intent_id=?""",
+                            (intent_id,),
+                        )
+                        return AdminResult("stale")
+                    if (
+                        not self._policy_allows(connection, binding.operation)
+                        or not self._receipt_allows(
+                            connection,
+                            binding.subject_id,
+                            binding.processing_authorization_version,
+                            binding.processing_authorization_revision,
+                            binding.operation,
+                        )
+                        or not self._quota_available(
+                            connection, binding.subject_id, binding.operation
+                        )
+                    ):
+                        return AdminResult("denied")
+                authority_id: str
+                if intent_state == "prepared":
+                    assert subject is not None
+                    authority_id = "DEL-" + secrets.token_urlsafe(18)
+                    revision = int(subject["revision"]) + 1
+                    connection.execute(
+                        """INSERT INTO delegations VALUES
+                           (?, ?, ?, ?, '{}', NULL, 1, ?, ?, ?, 'active', ?, ?, ?)""",
+                        (
+                            authority_id,
+                            binding.subject_id,
+                            Operation.TASK_CREATE.value,
+                            Scope.EXACT.value,
+                            binding.action_id,
+                            binding.payload_digest,
+                            binding_json,
+                            intent_id,
+                            now,
+                            revision,
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE subjects SET revision=?, changed_at=? WHERE subject_id=?",
+                        (revision, now, binding.subject_id),
+                    )
+                    connection.execute(
+                        """UPDATE administration_intents SET state='executing',
+                           consumed_at=? WHERE intent_id=? AND state='prepared'""",
+                        (now, intent_id),
+                    )
+                else:
+                    authority_id_value = (
+                        None if journal is None else journal["authority_id"]
+                    )
+                    if not isinstance(authority_id_value, str):
+                        return AdminResult("denied")
+                    authority_id = authority_id_value
+                if claim_token is None:
+                    authority = connection.execute(
+                        "SELECT * FROM delegations WHERE delegation_id=?",
+                        (authority_id,),
+                    ).fetchone()
+                    if authority is None or not (
+                        str(authority["subject_id"]) == binding.subject_id
+                        and str(authority["operation"]) == Operation.TASK_CREATE.value
+                        and str(authority["scope"]) == Scope.EXACT.value
+                        and str(authority["exact_action_id"]) == binding.action_id
+                        and str(authority["exact_payload_digest"])
+                        == binding.payload_digest
+                        and str(authority["exact_binding_json"]) == binding_json
+                        and str(authority["status"]) == "active"
+                        and int(authority["remaining_uses"]) == 1
+                    ):
+                        raise RuntimeError(
+                            "atomic public task authority could not claim its binding"
+                        )
+                    cursor = connection.execute(
+                        """UPDATE delegations SET remaining_uses=remaining_uses-1
+                           WHERE delegation_id=? AND status='active'
+                             AND remaining_uses>0""",
+                        (authority_id,),
+                    )
+                    if int(cursor.rowcount) != 1:
+                        raise RuntimeError(
+                            "atomic public task authority reservation failed"
+                        )
+                    claim_token = secrets.token_hex(16)
+                    if journal is None:
+                        connection.execute(
+                            """INSERT INTO action_journal(
+                                   action_id, binding_digest, binding_json, subject_id,
+                                   operation, origin, state, authority_id, claim_token,
+                                   outcome, created_at, updated_at
+                               ) VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, NULL, ?, ?)""",
+                            (
+                                binding.action_id,
+                                binding.binding_digest,
+                                binding_json,
+                                binding.subject_id,
+                                binding.operation.value,
+                                binding.origin.value,
+                                authority_id,
+                                claim_token,
+                                now,
+                                now,
+                            ),
+                        )
+                    else:
+                        connection.execute(
+                            """UPDATE action_journal SET state='claimed',
+                               authority_id=?, claim_token=?, outcome=NULL, updated_at=?
+                               WHERE action_id=?""",
+                            (authority_id, claim_token, now, binding.action_id),
+                        )
+                    if self.policy.todoist.enabled:
+                        command_uuid, temp_id = command_identity(binding.action_id)
+                        connection.execute(
+                            """INSERT INTO todoist_task_mappings(
+                                   action_id, subject_id, command_uuid, temp_id,
+                                   provider_task_id, state, updated_at
+                               ) VALUES (?, ?, ?, ?, NULL, 'claimed', ?)
+                               ON CONFLICT(action_id) DO UPDATE SET state='claimed',
+                               updated_at=excluded.updated_at""",
+                            (
+                                binding.action_id,
+                                binding.subject_id,
+                                command_uuid,
+                                temp_id,
+                                now,
+                            ),
+                        )
+                    connection.execute(
+                        """INSERT INTO quota_events VALUES (?, ?, ?, ?, ?, 'reserved', ?)
+                           ON CONFLICT(action_id) DO UPDATE SET state='reserved',
+                           changed_at=excluded.changed_at""",
+                        (
+                            binding.action_id,
+                            binding.subject_id,
+                            binding.operation.value,
+                            now // 86400,
+                            now // 60,
+                            now,
+                        ),
+                    )
+                    connection.execute(
+                        "INSERT INTO action_attempts VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            secrets.token_hex(16),
+                            binding.action_id,
+                            binding.subject_id,
+                            binding.operation.value,
+                            now // 60,
+                            now,
+                        ),
+                    )
+                    newly_claimed = True
+                if intent_state == "prepared":
+                    connection.execute(
+                        "INSERT INTO administration_audit VALUES (?, ?, ?, ?, ?)",
+                        (
+                            secrets.token_hex(16),
+                            intent_id,
+                            self.store.reference_hash("subject", binding.subject_id),
+                            "executing",
+                            now,
+                        ),
+                    )
+            assert claim_token is not None
+            if newly_claimed and crash_hook is not None:
+                crash_hook("after_public_task_exact_committed")
+            if self.policy.todoist.enabled:
+                result = self._execute_todoist_task(binding, claim_token, crash_hook)
+            else:
+                try:
+                    outcome = self.executor.execute(binding)
+                except BaseException:
+                    outcome = ExecutionOutcome.UNCERTAIN
+                if not self._finalize(binding.action_id, claim_token, outcome):
+                    result = ActionResult("uncertain", binding.action_id)
+                else:
+                    result = ActionResult(outcome.value, binding.action_id)
+            if result.outcome in {"verified_success", "replayed_success"}:
+                with self.store.database.transaction() as connection:
+                    connection.execute(
+                        """UPDATE administration_intents SET state='applied',
+                           consumed_at=? WHERE intent_id=? AND state='executing'""",
+                        (self.now(), intent_id),
+                    )
+            return AdminResult("executed", result)
 
     def _prepare_admin(
         self,

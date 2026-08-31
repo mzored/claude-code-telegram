@@ -19,6 +19,7 @@ from src.external_read import (
     ExternalRecordRef,
     ExternalSource,
     ExternalSourceMetadata,
+    PublicTaskCandidateEnvelope,
 )
 from src.policy_gate.rpc import MAX_FRAME_BYTES
 from src.policy_gate.transport import (
@@ -30,7 +31,7 @@ from src.policy_gate.transport import (
 from src.policy_gate.types import canonical_json
 
 PROTOCOL_VERSION = 1
-_OPERATIONS = frozenset({"inspect", "validate_for_prepare"})
+_OPERATIONS = frozenset({"inspect", "validate_for_prepare", "public_task_candidate"})
 _MAX_SUMMARY_BYTES = 1_200
 
 
@@ -87,6 +88,15 @@ class InboxExternalRecordResolver:
         record = method(reference)
         return record if isinstance(record, ExternalRecord) else None
 
+    def resolve_public_task_candidate(
+        self, reference: ExternalRecordRef
+    ) -> PublicTaskCandidateEnvelope | None:
+        method = getattr(self._store, "resolve_public_task_candidate", None)
+        if not callable(method):
+            return None
+        candidate = method(reference)
+        return candidate if isinstance(candidate, PublicTaskCandidateEnvelope) else None
+
 
 class MultiplexedExternalRecordResolver:
     """Keep source-specific raw retrieval behind a fixed source discriminator."""
@@ -99,6 +109,17 @@ class MultiplexedExternalRecordResolver:
     def resolve(self, reference: ExternalRecordRef) -> ExternalRecord | None:
         resolver = self._resolvers.get(reference.source)
         return None if resolver is None else resolver.resolve(reference)
+
+    def resolve_public_task_candidate(
+        self, reference: ExternalRecordRef
+    ) -> PublicTaskCandidateEnvelope | None:
+        resolver = self._resolvers.get(reference.source)
+        method = (
+            None
+            if resolver is None
+            else getattr(resolver, "resolve_public_task_candidate", None)
+        )
+        return None if not callable(method) else method(reference)
 
 
 class ExternalReadBroker:
@@ -135,6 +156,23 @@ class ExternalReadBroker:
         self, reference: ExternalRecordRef
     ) -> ExternalSourceMetadata:
         return self._record(reference).metadata
+
+    def public_task_candidate(
+        self, reference: ExternalRecordRef
+    ) -> PublicTaskCandidateEnvelope:
+        """Resolve a typed candidate without exposing source content or summaries."""
+
+        resolver = getattr(self._resolver, "resolve_public_task_candidate", None)
+        try:
+            candidate = None if not callable(resolver) else resolver(reference)
+        except Exception:
+            candidate = None
+        if (
+            not isinstance(candidate, PublicTaskCandidateEnvelope)
+            or candidate.metadata.reference != reference
+        ):
+            raise ExternalReadError("public task candidate is unavailable")
+        return candidate
 
     def inspect(self, reference: ExternalRecordRef) -> ExternalInspection:
         if not self._processor_authorized:
@@ -240,6 +278,42 @@ def _metadata_to_wire(metadata: ExternalSourceMetadata) -> dict[str, object]:
         "processing_authorization_revision": metadata.processing_authorization_revision,
         "source_digest": metadata.source_digest,
     }
+
+
+def _public_task_candidate_to_wire(
+    candidate: PublicTaskCandidateEnvelope,
+) -> dict[str, object]:
+    return {
+        "candidate_id": candidate.candidate_id,
+        "metadata": _metadata_to_wire(candidate.metadata),
+        "arguments": dict(candidate.arguments),
+        "payload_digest": candidate.payload_digest,
+    }
+
+
+def _public_task_candidate_from_wire(value: object) -> PublicTaskCandidateEnvelope:
+    if not isinstance(value, dict) or set(value) != {
+        "candidate_id",
+        "metadata",
+        "arguments",
+        "payload_digest",
+    }:
+        raise ValueError("public task candidate response is invalid")
+    if (
+        not isinstance(value["candidate_id"], str)
+        or not isinstance(value["arguments"], dict)
+        or not isinstance(value["payload_digest"], str)
+    ):
+        raise ValueError("public task candidate response is invalid")
+    arguments = value["arguments"]
+    if set(arguments) != {"title", "due_date"}:
+        raise ValueError("public task candidate response is invalid")
+    return PublicTaskCandidateEnvelope(
+        value["candidate_id"],
+        _metadata_from_wire(value["metadata"]),
+        cast(dict[str, str | None], arguments),
+        value["payload_digest"],
+    )
 
 
 def _metadata_from_wire(value: object) -> ExternalSourceMetadata:
@@ -357,6 +431,17 @@ class ExternalReadBrokerServer:
                 },
             )
             return
+        if operation == "public_task_candidate":
+            _write_frame(
+                connection,
+                {
+                    "ok": True,
+                    "result": _public_task_candidate_to_wire(
+                        self.broker.public_task_candidate(reference)
+                    ),
+                },
+            )
+            return
         raise ValueError("external read request is invalid")
 
     def serve_once(self) -> None:
@@ -465,6 +550,18 @@ class ExternalReadRpcClient(ExternalReadClient):
             return _metadata_from_wire(result["metadata"])
         except ValueError as exc:
             raise ExternalReadError("external validation response is invalid") from exc
+
+    def public_task_candidate(
+        self, reference: ExternalRecordRef
+    ) -> PublicTaskCandidateEnvelope:
+        try:
+            return _public_task_candidate_from_wire(
+                self._call("public_task_candidate", reference)
+            )
+        except ValueError as exc:
+            raise ExternalReadError(
+                "public task candidate response is invalid"
+            ) from exc
 
 
 __all__ = [

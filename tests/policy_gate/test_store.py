@@ -15,7 +15,6 @@ from src.policy_gate.types import (
     ActionOrigin,
     AdminDraft,
     AdminKind,
-    CandidateProvenance,
     ExternalActionConfirmation,
     ExternalActionLink,
     Operation,
@@ -112,7 +111,7 @@ def test_v5_to_v6_migration_creates_todoist_recovery_state(tmp_path: Path) -> No
     try:
         assert (
             store.database.execute("SELECT version FROM gate_schema_meta").fetchone()[0]
-            == 6
+            == GATE_SCHEMA_VERSION
         )
         tables = {
             str(row["name"])
@@ -222,8 +221,10 @@ def _insert_legacy_rows(
         )
     else:
         database.execute(
-            """INSERT INTO candidate_actions VALUES
-               (?, ?, ?, 'subject-a', 1, 'ordinary_public', NULL, NULL)""",
+            """INSERT INTO candidate_actions(
+                   action_id, binding_digest, binding_json, subject_id, created_at,
+                   provenance, external_link_identity, external_source_digest
+               ) VALUES (?, ?, ?, 'subject-a', 1, 'ordinary_public', NULL, NULL)""",
             (candidate_id, candidate_id, canonical_json(candidate_binding)),
         )
     for action_id, binding, state, outcome in journals.values():
@@ -278,7 +279,7 @@ def _write_v2_database(
 
 
 @pytest.mark.parametrize("version", (1, 2))
-def test_preorigin_migration_preserves_public_identity_and_recovery(
+def test_preorigin_migration_retires_unclaimed_public_candidate_and_preserves_recovery(
     tmp_path: Path, version: int
 ) -> None:
     path = tmp_path / f"v{version}-gate.db"
@@ -295,20 +296,11 @@ def test_preorigin_migration_preserves_public_identity_and_recovery(
             store.database.execute("SELECT version FROM gate_schema_meta").fetchone()[0]
             == GATE_SCHEMA_VERSION
         )
-        candidate_row = store.database.execute(
-            """SELECT action_id, binding_digest, binding_json, provenance,
-                      external_link_identity, external_source_digest
-               FROM candidate_actions WHERE action_id=?""",
-            (candidate[0],),
-        ).fetchone()
-        assert candidate_row is not None
-        assert tuple(candidate_row) == (
-            candidate[0],
-            candidate[0],
-            canonical_json(candidate[1]),
-            CandidateProvenance.ORDINARY_PUBLIC.value,
-            None,
-            None,
+        assert (
+            store.database.execute(
+                "SELECT 1 FROM candidate_actions WHERE action_id=?", (candidate[0],)
+            ).fetchone()
+            is None
         )
         migrated = store.database.execute(
             """SELECT action_id, binding_digest, binding_json, state, outcome, origin
@@ -329,36 +321,15 @@ def test_preorigin_migration_preserves_public_identity_and_recovery(
         assert not any(
             str(row["origin"]) == ActionOrigin.OWNER_EXTERNAL.value for row in migrated
         )
-
         executor = MockExecutor()
         service = PolicyGateService(
             store,
             executor,
             policy=PolicyConfig(enabled_operations=frozenset({Operation.TASK_CREATE})),
         )
-        service.register_subject("subject-a", {"action": candidate[0]})
-        assert service.activate_receipt(
-            "subject-a",
-            "integration-v2",
-            2,
-            {"Todoist": ("external task creation",)},
-        )
-        prepared = service.prepare_admin(
-            TrustedReference("action", candidate[0]),
-            AdminDraft(AdminKind.GRANT, scope=Scope.EXACT),
-            owner_id=101,
-            control_chat_id=101,
-            preview_message_id=77,
-        )
-        confirmed = service.confirm_admin(
-            prepared.intent_id,
-            owner_id=101,
-            control_chat_id=101,
-            preview_message_id=77,
-        )
-        assert confirmed.action_result is not None
-        assert confirmed.action_result.outcome == "verified_success"
-
+        retired = ActionBinding.from_legacy_public_dict(candidate[1])
+        assert service.submit_action(retired).outcome == "denied"
+        assert executor.calls == []
         executor.queue_reconcile(
             ReconcileOutcome.VERIFIED_SUCCESS,
             ReconcileOutcome.VERIFIED_ABSENT,
@@ -374,8 +345,8 @@ def test_preorigin_migration_preserves_public_identity_and_recovery(
             binding.origin is ActionOrigin.PUBLIC_SENDER
             for binding in executor.reconcile_calls
         )
+        assert executor.calls == []
         assert service.erase_subject("subject-a") == "erased"
-        assert executor.calls[0].origin is ActionOrigin.PUBLIC_SENDER
     finally:
         store.close()
 

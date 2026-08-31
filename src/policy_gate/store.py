@@ -11,14 +11,14 @@ from typing import Callable
 from src.encrypted_sqlite import EncryptedStoreError, SqlCipherDatabase
 from src.policy_gate.types import ActionBinding, ActionOrigin, Operation
 
-GATE_SCHEMA_VERSION = 6
+GATE_SCHEMA_VERSION = 7
 
 GATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS gate_schema_meta (
     version INTEGER NOT NULL
 );
 INSERT INTO gate_schema_meta(version)
-SELECT 6 WHERE NOT EXISTS (SELECT 1 FROM gate_schema_meta);
+SELECT 7 WHERE NOT EXISTS (SELECT 1 FROM gate_schema_meta);
 CREATE TABLE IF NOT EXISTS subjects (
     subject_id TEXT PRIMARY KEY,
     blocked INTEGER NOT NULL DEFAULT 0 CHECK(blocked IN (0, 1)),
@@ -127,6 +127,8 @@ CREATE TABLE IF NOT EXISTS candidate_actions (
         ('ordinary_public', 'external_untrusted')),
     external_link_identity TEXT,
     external_source_digest TEXT,
+    public_candidate_identity TEXT,
+    public_candidate_digest TEXT,
     CHECK(
         (provenance = 'ordinary_public'
          AND external_link_identity IS NULL
@@ -276,9 +278,21 @@ class GateStore:
                     "SELECT version FROM gate_schema_meta"
                 ).fetchone()[0]
             )
+        if version == 6:
+            self._migrate_v6_to_v7()
+            version = int(
+                self.database.execute(
+                    "SELECT version FROM gate_schema_meta"
+                ).fetchone()[0]
+            )
         if version != GATE_SCHEMA_VERSION:
             self.database.close()
             raise EncryptedStoreError("gate database schema migration is incomplete")
+        self.database.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_public_candidate_identity
+               ON candidate_actions(public_candidate_identity)
+               WHERE public_candidate_identity IS NOT NULL"""
+        )
 
     def _migrate_v1_to_v2(self) -> None:
         """Classify pre-origin Unit 3 state as ordinary public without rewriting it."""
@@ -502,6 +516,36 @@ class GateStore:
 
         with self.database.transaction() as connection:
             connection.execute("UPDATE gate_schema_meta SET version=6")
+
+    def _migrate_v6_to_v7(self) -> None:
+        """Do not infer source proof for legacy unclaimed public task proposals.
+
+        Claimed/terminal journals and Todoist mappings remain intact for recovery;
+        only unclaimed candidate rows from the retired capture-to-Gate shortcut
+        are removed.  Fresh Unit 6 candidates live solely in the public store.
+        """
+
+        with self.database.transaction() as connection:
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(candidate_actions)"
+                ).fetchall()
+            }
+            if "public_candidate_identity" not in columns:
+                connection.execute(
+                    "ALTER TABLE candidate_actions ADD COLUMN public_candidate_identity TEXT"
+                )
+            if "public_candidate_digest" not in columns:
+                connection.execute(
+                    "ALTER TABLE candidate_actions ADD COLUMN public_candidate_digest TEXT"
+                )
+            connection.execute(
+                """DELETE FROM candidate_actions
+                   WHERE public_candidate_identity IS NULL
+                     AND action_id NOT IN (SELECT action_id FROM action_journal)"""
+            )
+            connection.execute("UPDATE gate_schema_meta SET version=7")
 
     def now(self) -> int:
         return int(self._clock())

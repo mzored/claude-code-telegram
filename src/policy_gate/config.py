@@ -319,6 +319,10 @@ class GateConfig:
             raise GateConfigurationError(
                 "Todoist erasure credential is invalid"
             ) from exc
-        if credentials.scopes != frozenset({TODOIST_DELETE_SCOPE}):
+        if (
+            credentials.scopes != frozenset({TODOIST_DELETE_SCOPE})
+            or credentials.external_requests_project_id
+            != self.todoist.external_requests_project_id
+        ):
             raise GateConfigurationError("Todoist erasure credential scope is invalid")
         return credentials

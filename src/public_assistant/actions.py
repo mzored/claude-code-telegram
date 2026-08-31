@@ -257,57 +257,6 @@ class ActionCoordinator:
             self.store.finish_action(result)
             return result
 
-    def stage_exact_task_candidate(
-        self,
-        message: InboundMessage,
-        request_id: str,
-        title: str,
-        due_date: str | None,
-        retention_seconds: int,
-        discovery: ActionDiscovery,
-    ) -> ActionBinding | None:
-        """Persist a public-sender task for the owner-only exact-control flow.
-
-        This deliberately stages but never submits: public schema discovery does
-        not reveal exact authority, and the owner must use the existing fresh
-        draft/preview/confirm controls against this immutable action reference.
-        """
-
-        if (
-            discovery.authorization is None
-            or not isinstance(title, str)
-            or not 0 < len(title.strip()) <= 200
-            or due_date is not None
-            and not isinstance(due_date, str)
-        ):
-            return None
-        subject = self.store.subject_ref(
-            message.connection_id, message.conversation_id, message.sender_id
-        )
-        with self._subject_lock(subject):
-            if not self._current_authorization(message, discovery):
-                return None
-            binding = self.store.prepare_action(
-                message,
-                request_id,
-                Operation.TASK_CREATE,
-                {"title": title.strip(), "due_date": due_date},
-                discovery.authorization.version,
-                discovery.authorization.revision,
-                retention_seconds,
-            )
-            self.gate.register_subject(
-                binding.subject_id,
-                {"request": request_id, "action": binding.action_id},
-            )
-            if not self._current_authorization(message, discovery):
-                self.store.finish_action(ActionResult("denied", binding.action_id))
-                return None
-            if not self.gate.stage_action(binding):
-                self.store.finish_action(ActionResult("denied", binding.action_id))
-                return None
-            return binding
-
     def meeting_options(
         self,
         message: InboundMessage,
@@ -634,14 +583,14 @@ class ActionAssistantService(AssistantService):
             return self._fallback_request(message, "action_denied")
 
         request_id = None
-        staged_task = False
         reply_text = turn.reply_text
         if turn.turn_kind == "task":
             if turn.task_candidate is None:
                 return self._fallback_request(message, "model_fallback")
-            # Persist only model-minimized typed fields: never the sender's
-            # free-form message. The action remains staged until a fresh direct
-            # owner confirmation grants exact authority for this same binding.
+            # Persist only model-minimized typed fields: capture is neither a
+            # Gate action nor a provider request.  Direct-owner control later
+            # resolves this immutable public candidate through its isolated
+            # broker and creates the exact binding in Gate atomically.
             candidate_content = canonical_json(
                 {
                     "due_date": turn.task_candidate.due_date,
@@ -651,18 +600,13 @@ class ActionAssistantService(AssistantService):
             request_id = self.store.upsert_request(
                 message, candidate_content, self.config.retention_seconds
             )
-            staged_task = (
-                self.coordinator.stage_exact_task_candidate(
-                    message,
-                    request_id,
-                    turn.task_candidate.title,
-                    turn.task_candidate.due_date,
-                    self.config.retention_seconds,
-                    discovery,
-                )
-                is not None
+            self.store.upsert_public_task_candidate(
+                message,
+                request_id,
+                title=turn.task_candidate.title,
+                due_date=turn.task_candidate.due_date,
+                retention_seconds=self.config.retention_seconds,
             )
-            self._register_request(message, request_id)
             # An unavailable current receipt leaves the typed Inbox record and
             # owner alert intact, but never creates an executable public action.
             reply_text = REQUEST_CONFIRMED[_language(message.text)]
@@ -684,13 +628,9 @@ class ActionAssistantService(AssistantService):
             message, reply_text, self.config.retention_seconds
         )
         outcome = (
-            "task_exact_staged"
-            if turn.turn_kind == "task" and staged_task
-            else (
-                "task_inbox_captured"
-                if turn.turn_kind == "task" and request_id is not None
-                else "request_captured" if request_id is not None else turn.turn_kind
-            )
+            "task_inbox_captured"
+            if turn.turn_kind == "task" and request_id is not None
+            else "request_captured" if request_id is not None else turn.turn_kind
         )
         self.store.set_update_outcome(message.update_id, outcome, reply.reply_id)
         return ProcessingResult(outcome, reply)

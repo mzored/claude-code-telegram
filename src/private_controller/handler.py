@@ -23,6 +23,8 @@ _EXTERNAL_USAGE = (
     "/external prepare <inbox|todoist>:<opaque-reference> <owner task title>\n"
     "/external confirm <intent-id> <preview-message-id> "
     "<inbox|todoist>:<opaque-reference>"
+    "\n/external task-prepare <inbox:request-id>"
+    "\n/external task-confirm <intent-id> <preview-message-id> <inbox:request-id>"
 )
 
 
@@ -124,6 +126,38 @@ async def external_control(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"/external confirm {prepared.intent_id} {placeholder.message_id} "
             f"{arguments[1]}"
         )
+        return
+    if len(arguments) == 2 and arguments[0].casefold() == "task-prepare":
+        placeholder = await message.reply_text("Preparing immutable task preview…")
+        try:
+            prepared = controller.prepare_public_task(
+                run.run_id,
+                ExternalRecordRef.parse(arguments[1]),
+                preview_message_id=placeholder.message_id,
+            )
+        except (ExternalReadError, GateRpcError, PermissionError, ValueError):
+            await placeholder.edit_text("Public task preview was rejected.")
+            return
+        await placeholder.edit_text(
+            "Public task preview (no authority changed):\n"
+            f"{canonical_json(dict(prepared.preview))}\n\n"
+            "Confirm from a fresh owner message with:\n"
+            f"/external task-confirm {prepared.intent_id} {placeholder.message_id} "
+            f"{arguments[1]}"
+        )
+        return
+    if len(arguments) == 4 and arguments[0].casefold() == "task-confirm":
+        try:
+            result = controller.confirm_public_task(
+                run.run_id,
+                arguments[1],
+                ExternalRecordRef.parse(arguments[3]),
+                preview_message_id=int(arguments[2]),
+            )
+        except (ExternalReadError, GateRpcError, PermissionError, ValueError):
+            await message.reply_text("Public task confirmation was rejected.")
+            return
+        await message.reply_text(f"Public task confirmation result: {result.outcome}.")
         return
     if len(arguments) == 4 and arguments[0].casefold() == "confirm":
         try:

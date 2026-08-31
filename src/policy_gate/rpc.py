@@ -590,6 +590,32 @@ class GateRpcDispatcher:
                         ttl_seconds=_integer(fields["ttl_seconds"]),
                     )
                 )
+            if operation == "prepare_public_task_exact":
+                fields = _object(
+                    payload,
+                    frozenset(
+                        {
+                            "request_reference",
+                            "binding",
+                            "candidate_link",
+                            "owner_id",
+                            "control_chat_id",
+                            "preview_message_id",
+                            "ttl_seconds",
+                        }
+                    ),
+                )
+                return _prepared_to_wire(
+                    self.service.prepare_public_task_exact(
+                        _reference_from_wire(fields["request_reference"]),
+                        _action_from_wire(fields["binding"]),
+                        _external_link_from_wire(fields["candidate_link"]),
+                        owner_id=_integer(fields["owner_id"]),
+                        control_chat_id=_integer(fields["control_chat_id"]),
+                        preview_message_id=_integer(fields["preview_message_id"]),
+                        ttl_seconds=_integer(fields["ttl_seconds"]),
+                    )
+                )
             if operation == "prepare_admin":
                 fields = _object(
                     payload,
@@ -655,6 +681,32 @@ class GateRpcDispatcher:
                         preview_message_id=_integer(fields["preview_message_id"]),
                         external_confirmation=_external_confirmation_from_wire(
                             fields["external_confirmation"]
+                        ),
+                    )
+                )
+            if operation == "confirm_public_task_exact":
+                fields = _object(
+                    payload,
+                    frozenset(
+                        {
+                            "intent_id",
+                            "owner_id",
+                            "control_chat_id",
+                            "preview_message_id",
+                            "binding",
+                            "candidate_link",
+                        }
+                    ),
+                )
+                return _admin_result_to_wire(
+                    self.service.confirm_public_task_exact(
+                        _text(fields["intent_id"]),
+                        owner_id=_integer(fields["owner_id"]),
+                        control_chat_id=_integer(fields["control_chat_id"]),
+                        preview_message_id=_integer(fields["preview_message_id"]),
+                        binding=_action_from_wire(fields["binding"]),
+                        candidate_link=_external_link_from_wire(
+                            fields["candidate_link"]
                         ),
                     )
                 )
@@ -1111,6 +1163,31 @@ class ControllerGateRpcClient(_GateRpcClient):
             )
         )
 
+    def prepare_public_task_exact(
+        self,
+        request_reference: TrustedReference,
+        binding: ActionBinding,
+        candidate_link: ExternalActionLink,
+        owner_id: int,
+        control_chat_id: int,
+        preview_message_id: int,
+        ttl_seconds: int = 300,
+    ) -> PreparedIntent:
+        return _prepared_from_wire(
+            self._call(
+                "prepare_public_task_exact",
+                {
+                    "request_reference": _reference_to_wire(request_reference),
+                    "binding": _action_to_wire(binding),
+                    "candidate_link": _external_link_to_wire(candidate_link),
+                    "owner_id": owner_id,
+                    "control_chat_id": control_chat_id,
+                    "preview_message_id": preview_message_id,
+                    "ttl_seconds": ttl_seconds,
+                },
+            )
+        )
+
     def external_intent_execution_started(
         self,
         intent_id: str,
@@ -1157,6 +1234,29 @@ class ControllerGateRpcClient(_GateRpcClient):
                     "external_confirmation": _external_confirmation_to_wire(
                         external_confirmation
                     ),
+                },
+            )
+        )
+
+    def confirm_public_task_exact(
+        self,
+        intent_id: str,
+        owner_id: int,
+        control_chat_id: int,
+        preview_message_id: int,
+        binding: ActionBinding,
+        candidate_link: ExternalActionLink,
+    ) -> AdminResult:
+        return _admin_result_from_wire(
+            self._call(
+                "confirm_public_task_exact",
+                {
+                    "intent_id": intent_id,
+                    "owner_id": owner_id,
+                    "control_chat_id": control_chat_id,
+                    "preview_message_id": preview_message_id,
+                    "binding": _action_to_wire(binding),
+                    "candidate_link": _external_link_to_wire(candidate_link),
                 },
             )
         )

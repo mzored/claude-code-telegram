@@ -10,13 +10,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
-from src.external_read import ExternalRecord, ExternalRecordRef, ExternalSource
+from src.external_read import (
+    ExternalRecord,
+    ExternalRecordRef,
+    ExternalSource,
+    ExternalSourceMetadata,
+    PublicTaskCandidateEnvelope,
+)
 from src.policy_gate.types import (
     ActionBinding,
     ActionOrigin,
     ActionResult,
     Operation,
     canonical_json,
+    digest,
 )
 from src.public_assistant.inbox import Unit2Store
 from src.public_assistant.types import InboundMessage
@@ -75,6 +82,21 @@ CREATE TABLE IF NOT EXISTS meeting_offer_controls (
 );
 CREATE INDEX IF NOT EXISTS idx_meeting_offer_controls_subject
     ON meeting_offer_controls(subject_ref, expires_at);
+CREATE TABLE IF NOT EXISTS public_task_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    subject_ref TEXT NOT NULL,
+    connection_id TEXT NOT NULL,
+    conversation_id INTEGER NOT NULL,
+    source_update_id INTEGER NOT NULL UNIQUE,
+    request_id TEXT NOT NULL UNIQUE,
+    arguments_json TEXT NOT NULL,
+    payload_digest TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('open', 'erased')),
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_public_task_candidates_subject
+    ON public_task_candidates(subject_ref, expires_at);
 """
 
 
@@ -103,6 +125,15 @@ class MeetingOfferControl:
     duration_minutes: int
 
 
+@dataclass(frozen=True)
+class PublicTaskCandidate:
+    candidate_id: str
+    request_id: str
+    arguments: Mapping[str, str | None]
+    payload_digest: str
+    expires_at: int
+
+
 class Unit3Store(Unit2Store):
     """Add action intents without changing Unit 1 or Unit 2 table contracts."""
 
@@ -129,6 +160,139 @@ class Unit3Store(Unit2Store):
             f"{message.connection_id}:{message.conversation_id}:{message.sender_id}"
         )
         return "MCHAT-" + self.digest("unit3_managed_chat", envelope)[:32]
+
+    @staticmethod
+    def _task_arguments(title: object, due_date: object) -> dict[str, str | None]:
+        if (
+            not isinstance(title, str)
+            or not title.strip()
+            or len(title.strip()) > 500
+            or (due_date is not None and not isinstance(due_date, str))
+            or (isinstance(due_date, str) and len(due_date) > 100)
+        ):
+            raise ValueError("public task candidate fields are invalid")
+        return {"due_date": due_date, "title": title.strip()}
+
+    def upsert_public_task_candidate(
+        self,
+        message: InboundMessage,
+        request_id: str,
+        *,
+        title: object,
+        due_date: object,
+        retention_seconds: int,
+    ) -> PublicTaskCandidate:
+        """Persist one minimized immutable candidate, or prove an identical replay."""
+
+        arguments = self._task_arguments(title, due_date)
+        arguments_json = canonical_json(arguments)
+        subject = self.subject_ref(
+            message.connection_id, message.conversation_id, message.sender_id
+        )
+        candidate_id = (
+            "PTC-"
+            + uuid.uuid5(
+                uuid.UUID("bff4b84e-6a93-4773-b3b5-96b45496c116"),
+                f"{message.connection_id}:{message.conversation_id}:{message.message_id}",
+            ).hex[:24]
+        )
+        payload_digest = digest(arguments)
+        now = self.now()
+        expires = now + retention_seconds
+        with self.public.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM public_task_candidates WHERE source_update_id=?",
+                (message.update_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["candidate_id"]) != candidate_id
+                    or str(existing["subject_ref"]) != subject
+                    or str(existing["request_id"]) != request_id
+                    or str(existing["arguments_json"]) != arguments_json
+                    or str(existing["payload_digest"]) != payload_digest
+                    or str(existing["state"]) != "open"
+                ):
+                    raise ValueError("public task candidate replay conflicts")
+                return PublicTaskCandidate(
+                    candidate_id,
+                    request_id,
+                    arguments,
+                    payload_digest,
+                    int(existing["expires_at"]),
+                )
+            connection.execute(
+                """INSERT INTO public_task_candidates VALUES
+                   (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
+                (
+                    candidate_id,
+                    subject,
+                    message.connection_id,
+                    message.conversation_id,
+                    message.update_id,
+                    request_id,
+                    arguments_json,
+                    payload_digest,
+                    now,
+                    expires,
+                ),
+            )
+        return PublicTaskCandidate(
+            candidate_id, request_id, arguments, payload_digest, expires
+        )
+
+    def resolve_public_task_candidate(
+        self, reference: ExternalRecordRef
+    ) -> PublicTaskCandidateEnvelope | None:
+        """Return only a current minimized candidate for the controller broker."""
+
+        if reference.source is not ExternalSource.INBOX:
+            return None
+        now = self.now()
+        row = self.public.execute(
+            """SELECT candidate.*, receipt.version, receipt.revision,
+                      receipt.processor_purposes_json
+               FROM public_task_candidates AS candidate
+               JOIN integration_processing_receipts AS receipt
+                 ON receipt.subject_ref=candidate.subject_ref
+               WHERE candidate.request_id=? AND candidate.state='open'
+                 AND candidate.expires_at>? AND receipt.state='active'""",
+            (reference.value, now),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            purposes = json.loads(str(row["processor_purposes_json"]))
+            arguments = json.loads(str(row["arguments_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(purposes, dict)
+            or "external task creation" not in purposes.get("Todoist", ())
+            or not isinstance(arguments, dict)
+            or digest(arguments) != str(row["payload_digest"])
+        ):
+            return None
+        try:
+            metadata = ExternalSourceMetadata(
+                reference=reference,
+                subject_id=str(row["subject_ref"]),
+                connection_id=str(row["connection_id"]),
+                conversation_id=int(row["conversation_id"]),
+                update_id=int(row["source_update_id"]),
+                request_id=str(row["request_id"]),
+                processing_authorization_version=str(row["version"]),
+                processing_authorization_revision=int(row["revision"]),
+                source_digest=str(row["payload_digest"]),
+            )
+            return PublicTaskCandidateEnvelope(
+                str(row["candidate_id"]),
+                metadata,
+                arguments,
+                str(row["payload_digest"]),
+            )
+        except ValueError:
+            return None
 
     def begin_integration_activation(
         self,
@@ -721,7 +885,15 @@ class Unit3Store(Unit2Store):
                 "DELETE FROM meeting_offer_controls WHERE expires_at<=?",
                 (self.now(),),
             )
-        return max(int(cursor.rowcount), 0) + max(int(controls.rowcount), 0)
+            candidates = connection.execute(
+                "DELETE FROM public_task_candidates WHERE expires_at<=?",
+                (self.now(),),
+            )
+        return (
+            max(int(cursor.rowcount), 0)
+            + max(int(controls.rowcount), 0)
+            + max(int(candidates.rowcount), 0)
+        )
 
     def expire_public(self, retention_seconds: int) -> int:
         return super().expire_public(retention_seconds) + self.expire_unit3()
