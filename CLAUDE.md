@@ -37,8 +37,9 @@ remote that receives pushes. `upstream` is fetch-only. Read
 The `mybots` host only runs production and accepts explicit commits already on
 `origin/main`. It must not create branches, commits, lock changes, or development
 environments. Use the tracked scripts in `ops/` and follow
-[`docs/deployment.md`](docs/deployment.md). The first cutover retires the server Git
-checkout; later deploys stream an exact tree to the stable A/B control plane.
+[`docs/deployment.md`](docs/deployment.md). Releases are immutable per-SHA directories;
+the stable direct unit follows one atomic `current` selector. The first cutover retains
+the legacy checkout until separate human decommissioning.
 
 ## Architecture
 

@@ -1,16 +1,20 @@
-# systemd deployment
+# Production systemd unit
 
-Production uses a stable four-unit control bundle:
+Production installs one user unit, [`assist-ai-bot.service`](ops/systemd/assist-ai-bot.service).
+It is server-owned and changes only during explicit cutover or a future reviewed unit
+migration.
 
-- [`assist-ai-bot.service`](ops/systemd/assist-ai-bot.service) starts the stable
-  launcher and reads the server-owned environment.
-- [`assist-ai-recover.service`](ops/systemd/assist-ai-recover.service) resolves an
-  interrupted selection before bot startup.
-- [`assist-ai-activation.path`](ops/systemd/assist-ai-activation.path) notices a
-  durable request left by a disconnected controller.
-- [`assist-ai-activation.service`](ops/systemd/assist-ai-activation.service) performs
-  the restart, runtime proof, commit, or rollback.
+The unit starts the immutable release selected by `~/.local/lib/assist-ai/current`:
 
-Application SHA deployments never replace this bundle or call `daemon-reload`. The
-prefix-safe one-time install, exact-SHA deploy, rollback, crash recovery, and real
-systemd test procedure are in [`docs/deployment.md`](docs/deployment.md).
+```ini
+WorkingDirectory=%h/.local/lib/assist-ai/current
+ExecStart=%h/.local/lib/assist-ai/current/.venv/bin/claude-telegram-bot
+```
+
+It reads the server-owned `.env`, keeps `UMask=0077` and the production memory limits,
+and uses normal systemd restart policy. It does not require an activation, recovery,
+launcher, or path unit.
+
+Use `./ops/install-host.sh` for the one-time cutover. Use `./ops/deploy.sh deploy
+<sha>` for later exact-SHA releases. Do not edit the unit on the host during a normal
+deployment.

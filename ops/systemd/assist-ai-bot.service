@@ -2,15 +2,13 @@
 Description=assist-ai-bot (claude-code-telegram)
 After=network-online.target
 Wants=network-online.target
-Requires=assist-ai-recover.service
-After=assist-ai-recover.service
 
 [Service]
 Type=exec
 EnvironmentFile=%h/projects/assist-ai/bot/.env
 Environment=PYTHONDONTWRITEBYTECODE=1
-WorkingDirectory=%h/.local/state/assist-ai
-ExecStart=/usr/bin/python3 %h/.local/lib/assist-ai/control/v1/ops/control/launcher.py
+WorkingDirectory=%h/.local/lib/assist-ai/current
+ExecStart=%h/.local/lib/assist-ai/current/.venv/bin/claude-telegram-bot
 Restart=on-failure
 RestartSec=10
 MemoryHigh=300M
