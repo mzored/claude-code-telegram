@@ -1,15 +1,16 @@
-"""Configuration for the isolated public-assistant process."""
+"""Fail-closed configuration and credential-file loading for Unit 1."""
 
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
 
 class PublicAssistantConfigurationError(ValueError):
-    """Raised before polling when required isolation settings are invalid."""
+    """Raised before network or database access when isolation is invalid."""
 
 
 def _required(environment: Mapping[str, str], name: str) -> str:
@@ -30,34 +31,127 @@ def _positive_int(environment: Mapping[str, str], name: str) -> int:
     return value
 
 
+def _credential_path(environment: Mapping[str, str], name: str) -> Path:
+    path = Path(_required(environment, name))
+    if not path.is_absolute():
+        raise PublicAssistantConfigurationError(f"{name} must be an absolute path")
+    return path
+
+
+def read_credential(path: Path, label: str, *, minimum_bytes: int = 1) -> str:
+    """Read one owner-only regular file without following symlinks."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise PublicAssistantConfigurationError(
+            f"cannot read {label} credential file"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PublicAssistantConfigurationError(
+                f"{label} credential must be a regular file"
+            )
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise PublicAssistantConfigurationError(
+                f"{label} credential file must have mode 0600"
+            )
+        if metadata.st_uid != os.geteuid():
+            raise PublicAssistantConfigurationError(
+                f"{label} credential file must be owned by the process user"
+            )
+        with os.fdopen(descriptor, encoding="utf-8") as stream:
+            descriptor = -1
+            value = stream.read().strip()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(value.encode("utf-8")) < minimum_bytes:
+        raise PublicAssistantConfigurationError(
+            f"{label} credential is missing or too short"
+        )
+    return value
+
+
+def validate_separate_roots(data_dir: Path, backup_dir: Path) -> tuple[Path, Path]:
+    data = data_dir.resolve()
+    backup = backup_dir.resolve()
+    if data == backup or data.is_relative_to(backup) or backup.is_relative_to(data):
+        raise PublicAssistantConfigurationError(
+            "live data and encrypted backups require non-overlapping directories"
+        )
+    return data, backup
+
+
 @dataclass(frozen=True)
-class PublicAssistantConfig:
-    """Validated settings that do not load the private bot configuration."""
+class RuntimeCredentials:
+    """Ephemeral runtime secrets with a deliberately redacted representation."""
 
     bot_token: str
+    pending_database_key: str
+    public_database_key: str
+    pseudonym_key: bytes
+
+    def __repr__(self) -> str:
+        return "RuntimeCredentials(<redacted>)"
+
+
+@dataclass(frozen=True)
+class PublicAssistantConfig:
+    """Non-secret settings for the isolated long-running public process."""
+
+    bot_token_file: Path
+    pending_database_key_file: Path
+    public_database_key_file: Path
+    pseudonym_key_file: Path
     owner_id: int
     selected_sender_ids: frozenset[int]
     data_dir: Path
     backup_dir: Path
-    pending_database_key: str
-    public_database_key: str
-    backup_database_key: str
-    pseudonym_key: bytes
     privacy_url: str
     privacy_policy_version: str
     processing_authorization_version: str
     pending_ttl_seconds: int = 24 * 60 * 60
     reply_window_seconds: int = 24 * 60 * 60
+    retention_seconds: int = 90 * 24 * 60 * 60
     rate_limit_count: int = 20
     rate_limit_window_seconds: int = 60
+
+    def load_runtime_credentials(self) -> RuntimeCredentials:
+        token = read_credential(self.bot_token_file, "Telegram bot token")
+        pending = read_credential(
+            self.pending_database_key_file, "pending database key", minimum_bytes=32
+        )
+        public = read_credential(
+            self.public_database_key_file, "public database key", minimum_bytes=32
+        )
+        pseudonym = read_credential(
+            self.pseudonym_key_file, "pseudonym key", minimum_bytes=32
+        ).encode("utf-8")
+        if pending == public:
+            raise PublicAssistantConfigurationError(
+                "pending and public database keys must be distinct"
+            )
+        return RuntimeCredentials(token, pending, public, pseudonym)
 
     @classmethod
     def from_environment(
         cls, environment: Mapping[str, str] | None = None
     ) -> "PublicAssistantConfig":
-        """Read only public-assistant variables and fail before opening a store."""
-
         env = os.environ if environment is None else environment
+        forbidden_secret_values = {
+            "PUBLIC_ASSISTANT_BOT_TOKEN",
+            "PUBLIC_ASSISTANT_PENDING_DATABASE_KEY",
+            "PUBLIC_ASSISTANT_PUBLIC_DATABASE_KEY",
+            "PUBLIC_ASSISTANT_BACKUP_DATABASE_KEY",
+            "PUBLIC_ASSISTANT_PSEUDONYM_KEY",
+        }
+        if any(env.get(name, "").strip() for name in forbidden_secret_values):
+            raise PublicAssistantConfigurationError(
+                "credential values are forbidden in environment variables; use files"
+            )
         sender_text = _required(env, "PUBLIC_ASSISTANT_SELECTED_SENDERS")
         try:
             selected = frozenset(
@@ -71,61 +165,70 @@ class PublicAssistantConfig:
             raise PublicAssistantConfigurationError(
                 "PUBLIC_ASSISTANT_SELECTED_SENDERS must contain positive numeric IDs"
             )
-
         owner_id = _positive_int(env, "PUBLIC_ASSISTANT_OWNER_ID")
         if owner_id in selected:
             raise PublicAssistantConfigurationError(
                 "the owner cannot be included in selected senders"
             )
-
-        keys = {
-            "pending": _required(env, "PUBLIC_ASSISTANT_PENDING_DATABASE_KEY"),
-            "public": _required(env, "PUBLIC_ASSISTANT_PUBLIC_DATABASE_KEY"),
-            "backup": _required(env, "PUBLIC_ASSISTANT_BACKUP_DATABASE_KEY"),
-        }
-        if any(len(key.encode("utf-8")) < 32 for key in keys.values()):
-            raise PublicAssistantConfigurationError(
-                "database keys must each contain at least 32 bytes"
-            )
-        if len(set(keys.values())) != len(keys):
-            raise PublicAssistantConfigurationError(
-                "pending, public, and backup database keys must be distinct"
-            )
-
-        pseudonym = _required(env, "PUBLIC_ASSISTANT_PSEUDONYM_KEY").encode()
-        if len(pseudonym) < 32:
-            raise PublicAssistantConfigurationError(
-                "PUBLIC_ASSISTANT_PSEUDONYM_KEY must contain at least 32 bytes"
-            )
-
         privacy_url = _required(env, "PUBLIC_ASSISTANT_PRIVACY_URL")
         if not privacy_url.startswith("https://"):
             raise PublicAssistantConfigurationError(
                 "PUBLIC_ASSISTANT_PRIVACY_URL must use HTTPS"
             )
-
-        data_dir = Path(_required(env, "PUBLIC_ASSISTANT_DATA_DIR")).resolve()
-        backup_dir = Path(_required(env, "PUBLIC_ASSISTANT_BACKUP_DIR")).resolve()
-        if data_dir == backup_dir:
-            raise PublicAssistantConfigurationError(
-                "live data and encrypted backups require separate directories"
-            )
-
+        data, backup = validate_separate_roots(
+            Path(_required(env, "PUBLIC_ASSISTANT_DATA_DIR")),
+            Path(_required(env, "PUBLIC_ASSISTANT_BACKUP_DIR")),
+        )
         return cls(
-            bot_token=_required(env, "PUBLIC_ASSISTANT_BOT_TOKEN"),
+            bot_token_file=_credential_path(env, "PUBLIC_ASSISTANT_BOT_TOKEN_FILE"),
+            pending_database_key_file=_credential_path(
+                env, "PUBLIC_ASSISTANT_PENDING_DATABASE_KEY_FILE"
+            ),
+            public_database_key_file=_credential_path(
+                env, "PUBLIC_ASSISTANT_PUBLIC_DATABASE_KEY_FILE"
+            ),
+            pseudonym_key_file=_credential_path(
+                env, "PUBLIC_ASSISTANT_PSEUDONYM_KEY_FILE"
+            ),
             owner_id=owner_id,
             selected_sender_ids=selected,
-            data_dir=data_dir,
-            backup_dir=backup_dir,
-            pending_database_key=keys["pending"],
-            public_database_key=keys["public"],
-            backup_database_key=keys["backup"],
-            pseudonym_key=pseudonym,
+            data_dir=data,
+            backup_dir=backup,
             privacy_url=privacy_url,
             privacy_policy_version=_required(
                 env, "PUBLIC_ASSISTANT_PRIVACY_POLICY_VERSION"
             ),
             processing_authorization_version=_required(
                 env, "PUBLIC_ASSISTANT_PROCESSING_AUTHORIZATION_VERSION"
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class BackupConfig:
+    """Separate maintenance-process settings; never loaded by polling."""
+
+    data_dir: Path
+    backup_dir: Path
+    public_database_key_file: Path
+    backup_database_key_file: Path
+
+    @classmethod
+    def from_environment(
+        cls, environment: Mapping[str, str] | None = None
+    ) -> "BackupConfig":
+        env = os.environ if environment is None else environment
+        data, backup = validate_separate_roots(
+            Path(_required(env, "PUBLIC_ASSISTANT_DATA_DIR")),
+            Path(_required(env, "PUBLIC_ASSISTANT_BACKUP_DIR")),
+        )
+        return cls(
+            data_dir=data,
+            backup_dir=backup,
+            public_database_key_file=_credential_path(
+                env, "PUBLIC_ASSISTANT_PUBLIC_DATABASE_KEY_FILE"
+            ),
+            backup_database_key_file=_credential_path(
+                env, "PUBLIC_ASSISTANT_BACKUP_DATABASE_KEY_FILE"
             ),
         )

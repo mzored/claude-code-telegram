@@ -13,6 +13,7 @@ class DeliveryState(str, Enum):
     SENT = "sent"
     DELIVERY_UNCERTAIN = "delivery_uncertain"
     DEFINITE_FAILURE = "definite_failure"
+    RETRY_PENDING = "retry_pending"
     CANCELLED = "cancelled"
 
 
@@ -56,6 +57,7 @@ class OwnerMessage:
     message_id: int
     sender_business_bot_id: int | None
     chat_type: str = "private"
+    is_from_offline: bool = False
 
 
 @dataclass(frozen=True)
@@ -66,6 +68,8 @@ class ReplyRecord:
     text: str
     keyboard_json: str
     state: DeliveryState
+    inbound_sent_at: int
+    next_attempt_at: int | None = None
 
 
 @dataclass(frozen=True)
@@ -86,3 +90,5 @@ class ControlRecord:
     processing_authorization_version: str
     expires_at: int
     consumed_at: int | None
+    origin_reply_id: str | None
+    origin_message_id: int | None

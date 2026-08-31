@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -12,7 +13,10 @@ from src.public_assistant.config import PublicAssistantConfig
 from src.public_assistant.privacy_log import PrivacyLog
 from src.public_assistant.service import SecretaryService
 from src.public_assistant.storage import Unit1Store
-from src.public_assistant.telegram_adapter import build_application, run_polling
+from src.public_assistant.telegram_adapter import (
+    DurablePollingRunner,
+    build_application,
+)
 
 _TELEGRAM_TOKEN = re.compile(r"(?<=api\.telegram\.org/bot)[^/\s\"']+")
 
@@ -45,18 +49,20 @@ def run() -> None:
     os.umask(0o077)
     configure_logging()
     config = PublicAssistantConfig.from_environment()
+    credentials = config.load_runtime_credentials()
     store = Unit1Store(
         config.data_dir,
-        config.pending_database_key,
-        config.public_database_key,
-        config.backup_database_key,
-        config.pseudonym_key,
+        credentials.pending_database_key,
+        credentials.public_database_key,
+        credentials.pseudonym_key,
     )
-    log = PrivacyLog(config.pseudonym_key, logging.getLogger("public_assistant"))
+    log = PrivacyLog(credentials.pseudonym_key, logging.getLogger("public_assistant"))
     service = SecretaryService(config, store, logger=log)
-    application = build_application(config, service, store)
+    application, adapter = build_application(
+        config, service, store, credentials.bot_token
+    )
     try:
-        run_polling(application)
+        asyncio.run(DurablePollingRunner(application, adapter, store).run())
     finally:
         store.close()
 

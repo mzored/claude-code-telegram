@@ -30,6 +30,7 @@ Documentation = "https://github.com/richardatkinson/claude-code-telegram/blob/ma
 [project.scripts]
 claude-telegram-bot = "src.main:run"
 public-telegram-assistant = "src.public_assistant.main:run"
+public-assistant-backup = "src.public_assistant.backup:run"
 
 [build-system]
 requires = ["poetry-core>=2.0.0"]

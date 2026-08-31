@@ -1,4 +1,4 @@
-"""Durable state for deterministic Telegram Business delivery unit 1."""
+"""Encrypted durable state for public-assistant delivery unit 1."""
 
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS pending_messages (
     update_id INTEGER NOT NULL,
     body TEXT NOT NULL,
     content_digest TEXT NOT NULL,
+    sent_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('pending', 'authorized')),
@@ -40,8 +41,7 @@ CREATE TABLE IF NOT EXISTS pending_messages (
     consent_control_id TEXT NOT NULL,
     decline_control_id TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_pending_expiry
-    ON pending_messages(state, expires_at);
+CREATE INDEX IF NOT EXISTS idx_pending_expiry ON pending_messages(state, expires_at);
 """
 
 PUBLIC_SCHEMA = """
@@ -65,6 +65,12 @@ CREATE TABLE IF NOT EXISTS privacy_state (
     state TEXT NOT NULL CHECK(state IN ('revoked', 'erased')),
     changed_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS restrictive_tombstones (
+    message_key TEXT PRIMARY KEY,
+    subject_ref TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('declined', 'deleted')),
+    changed_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS consents (
     connection_id TEXT NOT NULL,
     conversation_id INTEGER NOT NULL,
@@ -72,15 +78,14 @@ CREATE TABLE IF NOT EXISTS consents (
     subject_ref TEXT NOT NULL,
     privacy_policy_version TEXT NOT NULL,
     processing_authorization_version TEXT NOT NULL,
-    processors TEXT NOT NULL,
-    purposes TEXT NOT NULL,
     granted_at INTEGER NOT NULL,
     PRIMARY KEY(connection_id, conversation_id, sender_id)
 );
 CREATE TABLE IF NOT EXISTS controls (
     control_id TEXT PRIMARY KEY,
     token_hash TEXT NOT NULL UNIQUE,
-    action TEXT NOT NULL CHECK(action IN ('consent', 'decline', 'revoke', 'delete')),
+    action TEXT NOT NULL CHECK(action IN
+        ('consent', 'reconsent', 'decline', 'revoke', 'delete')),
     connection_id TEXT NOT NULL,
     conversation_id INTEGER NOT NULL,
     sender_id INTEGER NOT NULL,
@@ -88,7 +93,9 @@ CREATE TABLE IF NOT EXISTS controls (
     pending_key TEXT,
     processing_authorization_version TEXT NOT NULL,
     expires_at INTEGER NOT NULL,
-    consumed_at INTEGER
+    consumed_at INTEGER,
+    origin_reply_id TEXT,
+    origin_message_id INTEGER
 );
 CREATE TABLE IF NOT EXISTS processed_updates (
     update_id INTEGER PRIMARY KEY,
@@ -99,22 +106,23 @@ CREATE TABLE IF NOT EXISTS processed_updates (
     subject_ref TEXT,
     message_id INTEGER,
     content_digest TEXT,
+    inbound_sent_at INTEGER,
     outcome TEXT NOT NULL,
     reply_id TEXT,
-    erased INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS messages (
     message_key TEXT PRIMARY KEY,
-    connection_id TEXT,
-    conversation_id INTEGER,
-    sender_id INTEGER,
+    connection_id TEXT NOT NULL,
+    conversation_id INTEGER NOT NULL,
+    sender_id INTEGER NOT NULL,
     subject_ref TEXT NOT NULL,
     message_id INTEGER NOT NULL,
     update_id INTEGER NOT NULL,
     body TEXT,
-    created_at INTEGER NOT NULL,
-    edited_at INTEGER,
+    sent_at INTEGER NOT NULL,
+    content_updated_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
     deleted_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS transfer_receipts (
@@ -125,53 +133,58 @@ CREATE TABLE IF NOT EXISTS replies (
     reply_id TEXT PRIMARY KEY,
     source_update_id INTEGER NOT NULL,
     purpose TEXT NOT NULL,
-    connection_id TEXT,
-    conversation_id INTEGER,
+    connection_id TEXT NOT NULL,
+    conversation_id INTEGER NOT NULL,
     subject_ref TEXT NOT NULL,
     text TEXT NOT NULL,
     keyboard_json TEXT NOT NULL,
     state TEXT NOT NULL,
     telegram_message_id INTEGER,
+    inbound_sent_at INTEGER NOT NULL,
+    next_attempt_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     UNIQUE(source_update_id, purpose)
 );
-CREATE TABLE IF NOT EXISTS rate_windows (
+CREATE TABLE IF NOT EXISTS rate_admissions (
+    update_id INTEGER PRIMARY KEY,
     subject_ref TEXT NOT NULL,
-    window_start INTEGER NOT NULL,
-    request_count INTEGER NOT NULL,
-    PRIMARY KEY(subject_ref, window_start)
+    window_start INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS poll_state (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    next_update_id INTEGER
+);
+INSERT OR IGNORE INTO poll_state(singleton, next_update_id) VALUES (1, NULL);
 """
 
 TRANSFER_STAGES = frozenset(
     {"before_copy", "after_copy", "after_receipt", "before_pending_delete"}
 )
+RESTRICTIVE_STAGES = frozenset({"after_tombstone", "before_pending_delete"})
 
 
 class TransferInterrupted(RuntimeError):
-    """Test-only failure signal raised by an injected crash hook."""
+    """Failure signal used by crash-boundary integration tests."""
 
 
-def _row_value(row: Any, key: str) -> Any:
+def _value(row: Any, key: str) -> Any:
     return row[key]
 
 
 class Unit1Store:
-    """Coordinate encrypted pending and public stores without cross-DB commits."""
+    """Coordinate encrypted pending/public stores with recovery invariants."""
 
     def __init__(
         self,
         data_dir: Path,
         pending_key: str,
         public_key: str,
-        backup_key: str,
         pseudonym_key: bytes,
         *,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.data_dir = data_dir
-        self.backup_key = backup_key
         self.pseudonym_key = pseudonym_key
         self.clock = clock
         self.pending = SqlCipherDatabase(
@@ -185,6 +198,7 @@ class Unit1Store:
             self.pending.close()
             raise
         self.recover_sending_replies()
+        self.recover_restrictions()
         self.recover_transfers()
 
     def now(self) -> int:
@@ -193,7 +207,7 @@ class Unit1Store:
     def digest(self, namespace: str, value: str) -> str:
         return hmac.new(
             self.pseudonym_key,
-            f"{namespace}:{value}".encode("utf-8"),
+            f"{namespace}:{value}".encode(),
             hashlib.sha256,
         ).hexdigest()
 
@@ -219,13 +233,9 @@ class Unit1Store:
         with self.public.transaction() as connection:
             connection.execute(
                 """
-                INSERT INTO business_connections(
-                    connection_id, owner_id, enabled, can_reply, observed_at
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(connection_id) DO UPDATE SET
-                    owner_id=excluded.owner_id,
-                    enabled=excluded.enabled,
-                    can_reply=excluded.can_reply,
+                INSERT INTO business_connections VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(connection_id) DO UPDATE SET owner_id=excluded.owner_id,
+                    enabled=excluded.enabled, can_reply=excluded.can_reply,
                     observed_at=excluded.observed_at
                 WHERE excluded.observed_at >= business_connections.observed_at
                 """,
@@ -238,77 +248,110 @@ class Unit1Store:
                 ),
             )
 
-    def connection_can_reply(self, connection_id: str, owner_id: int) -> bool:
+    def has_connection(self, connection_id: str) -> bool:
+        return (
+            self.public.execute(
+                "SELECT 1 FROM business_connections WHERE connection_id=?",
+                (connection_id,),
+            ).fetchone()
+            is not None
+        )
+
+    def connection_owner_matches(self, connection_id: str, owner_id: int) -> bool:
         row = self.public.execute(
-            """
-            SELECT owner_id, enabled, can_reply
-            FROM business_connections WHERE connection_id = ?
-            """,
+            "SELECT owner_id FROM business_connections WHERE connection_id=?",
             (connection_id,),
         ).fetchone()
-        return bool(
-            row is not None
-            and _row_value(row, "owner_id") == owner_id
-            and _row_value(row, "enabled") == 1
-            and _row_value(row, "can_reply") == 1
-        )
+        return row is not None and int(row[0]) == owner_id
+
+    def connection_can_reply(self, connection_id: str, owner_id: int) -> bool:
+        row = self.public.execute(
+            "SELECT owner_id, enabled, can_reply FROM business_connections WHERE connection_id=?",
+            (connection_id,),
+        ).fetchone()
+        return bool(row and row[0] == owner_id and row[1] == 1 and row[2] == 1)
+
+    def get_next_update_id(self) -> int | None:
+        row = self.public.execute(
+            "SELECT next_update_id FROM poll_state WHERE singleton=1"
+        ).fetchone()
+        return None if row is None or row[0] is None else int(row[0])
+
+    def commit_update_offset(self, update_id: int) -> None:
+        next_id = update_id + 1
+        with self.public.transaction() as connection:
+            row = connection.execute(
+                "SELECT next_update_id FROM poll_state WHERE singleton=1"
+            ).fetchone()
+            current = None if row is None else row[0]
+            if current is not None and update_id < int(current):
+                return
+            if current is not None and update_id > int(current):
+                # Telegram update IDs may have gaps, but an already committed lower
+                # offset may only advance through the update actually fetched.
+                pass
+            pending = connection.execute(
+                """SELECT 1 FROM replies WHERE source_update_id=?
+                   AND state IN (?, ?)""",
+                (update_id, DeliveryState.PENDING.value, DeliveryState.SENDING.value),
+            ).fetchone()
+            if pending is not None:
+                raise RuntimeError("cannot acknowledge update with unfinished reply")
+            connection.execute(
+                "UPDATE poll_state SET next_update_id=? WHERE singleton=1", (next_id,)
+            )
 
     def begin_update(
         self,
         message: InboundMessage,
         kind: str,
         outcome: str,
+        *,
+        store_digest: bool = True,
     ) -> tuple[bool, ReplyRecord | None]:
-        subject_ref = self.subject_ref(
+        subject = self.subject_ref(
             message.connection_id, message.conversation_id, message.sender_id
         )
+        digest = self.content_digest(message.text) if store_digest else None
         with self.public.transaction() as connection:
-            existing = connection.execute(
-                """
-                SELECT reply_id, kind, connection_id, conversation_id, sender_id,
-                       message_id, content_digest, outcome
-                FROM processed_updates WHERE update_id = ?
-                """,
+            row = connection.execute(
+                "SELECT * FROM processed_updates WHERE update_id=?",
                 (message.update_id,),
             ).fetchone()
-            if existing is not None:
-                same_binding = bool(
-                    _row_value(existing, "connection_id") == message.connection_id
-                    and _row_value(existing, "conversation_id")
-                    == message.conversation_id
-                    and _row_value(existing, "sender_id") == message.sender_id
-                    and _row_value(existing, "message_id") == message.message_id
-                    and _row_value(existing, "content_digest")
-                    == self.content_digest(message.text)
-                    and _row_value(existing, "kind") == kind
+            if row is not None:
+                same = bool(
+                    row["kind"] == kind
+                    and row["connection_id"] == message.connection_id
+                    and row["conversation_id"] == message.conversation_id
+                    and row["sender_id"] == message.sender_id
+                    and row["message_id"] == message.message_id
+                    and row["content_digest"] == digest
                 )
-                if not same_binding:
+                if not same:
                     return False, None
-                reply_id = _row_value(existing, "reply_id")
-                if reply_id:
-                    return False, self.get_reply(reply_id)
-                if _row_value(existing, "outcome") in {
-                    "received",
-                    "received_edit",
-                }:
+                if (
+                    row["outcome"] in {"received", "received_edit"}
+                    and not row["reply_id"]
+                ):
                     return True, None
-                return False, None
+                return False, (
+                    self.get_reply(row["reply_id"]) if row["reply_id"] else None
+                )
             connection.execute(
-                """
-                INSERT INTO processed_updates(
+                """INSERT INTO processed_updates(
                     update_id, kind, connection_id, conversation_id, sender_id,
-                    subject_ref, message_id, content_digest, outcome, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                    subject_ref, message_id, content_digest, inbound_sent_at,
+                    outcome, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     message.update_id,
                     kind,
                     message.connection_id,
                     message.conversation_id,
                     message.sender_id,
-                    subject_ref,
+                    subject,
                     message.message_id,
-                    self.content_digest(message.text),
+                    digest,
+                    int(message.sent_at.timestamp()),
                     outcome,
                     self.now(),
                 ),
@@ -325,37 +368,25 @@ class Unit1Store:
         outcome: str,
     ) -> bool:
         with self.public.transaction() as connection:
-            existing = connection.execute(
-                """
-                SELECT kind, connection_id, conversation_id, outcome
-                FROM processed_updates WHERE update_id = ?
-                """,
+            row = connection.execute(
+                "SELECT kind, connection_id, conversation_id FROM processed_updates WHERE update_id=?",
                 (update_id,),
             ).fetchone()
-            if existing is not None:
-                same_binding = bool(
-                    _row_value(existing, "kind") == kind
-                    and _row_value(existing, "connection_id") == connection_id
-                    and _row_value(existing, "conversation_id") == conversation_id
+            if row is not None:
+                return bool(
+                    row["kind"] == kind
+                    and row["connection_id"] == connection_id
+                    and row["conversation_id"] == conversation_id
+                    and connection.execute(
+                        "SELECT outcome FROM processed_updates WHERE update_id=?",
+                        (update_id,),
+                    ).fetchone()[0]
+                    == "deleting"
                 )
-                if same_binding and _row_value(existing, "outcome") == "deleting":
-                    return True
-                return False
             connection.execute(
-                """
-                INSERT INTO processed_updates(
-                    update_id, kind, connection_id, conversation_id,
-                    outcome, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    update_id,
-                    kind,
-                    connection_id,
-                    conversation_id,
-                    outcome,
-                    self.now(),
-                ),
+                """INSERT INTO processed_updates(update_id, kind, connection_id,
+                   conversation_id, outcome, created_at) VALUES (?, ?, ?, ?, ?, ?)""",
+                (update_id, kind, connection_id, conversation_id, outcome, self.now()),
             )
         return True
 
@@ -364,50 +395,56 @@ class Unit1Store:
     ) -> None:
         with self.public.transaction() as connection:
             connection.execute(
-                """
-                UPDATE processed_updates SET outcome = ?, reply_id = ?
-                WHERE update_id = ?
-                """,
+                "UPDATE processed_updates SET outcome=?, reply_id=COALESCE(?, reply_id) WHERE update_id=?",
                 (outcome, reply_id, update_id),
             )
 
-    def rate_limit(self, subject_ref: str, *, limit: int, window_seconds: int) -> bool:
+    def rate_limit(
+        self, update_id: int, subject_ref: str, *, limit: int, window_seconds: int
+    ) -> bool:
         now = self.now()
-        window = now - (now % window_seconds)
+        window = now - now % window_seconds
         with self.public.transaction() as connection:
-            connection.execute(
-                """
-                INSERT INTO rate_windows(subject_ref, window_start, request_count)
-                VALUES (?, ?, 1)
-                ON CONFLICT(subject_ref, window_start) DO UPDATE SET
-                    request_count=request_count + 1
-                """,
-                (subject_ref, window),
-            )
-            row = connection.execute(
-                """
-                SELECT request_count FROM rate_windows
-                WHERE subject_ref = ? AND window_start = ?
-                """,
-                (subject_ref, window),
+            prior = connection.execute(
+                "SELECT window_start FROM rate_admissions WHERE update_id=?",
+                (update_id,),
             ).fetchone()
-        return row is not None and _row_value(row, "request_count") <= limit
+            if prior is not None:
+                return True
+            count = connection.execute(
+                "SELECT count(*) FROM rate_admissions WHERE subject_ref=? AND window_start=?",
+                (subject_ref, window),
+            ).fetchone()[0]
+            if int(count) >= limit:
+                return False
+            connection.execute(
+                "INSERT INTO rate_admissions VALUES (?, ?, ?)",
+                (update_id, subject_ref, window),
+            )
+        return True
 
     def privacy_state(self, subject_ref: str) -> str | None:
         row = self.public.execute(
-            "SELECT state FROM privacy_state WHERE subject_ref = ?", (subject_ref,)
+            "SELECT state FROM privacy_state WHERE subject_ref=?", (subject_ref,)
         ).fetchone()
-        return None if row is None else str(_row_value(row, "state"))
+        return None if row is None else str(row[0])
 
     def is_taken_over(self, connection_id: str, conversation_id: int) -> bool:
         row = self.public.execute(
-            """
-            SELECT takeover_at FROM chat_state
-            WHERE connection_id = ? AND conversation_id = ?
-            """,
+            "SELECT takeover_at FROM chat_state WHERE connection_id=? AND conversation_id=?",
             (connection_id, conversation_id),
         ).fetchone()
-        return row is not None and _row_value(row, "takeover_at") is not None
+        return bool(row is not None and row[0] is not None)
+
+    def known_conversation(self, connection_id: str, conversation_id: int) -> bool:
+        return (
+            self.public.execute(
+                """SELECT 1 FROM processed_updates WHERE connection_id=? AND conversation_id=?
+               UNION SELECT 1 FROM chat_state WHERE connection_id=? AND conversation_id=?""",
+                (connection_id, conversation_id, connection_id, conversation_id),
+            ).fetchone()
+            is not None
+        )
 
     def record_takeover(
         self,
@@ -417,55 +454,45 @@ class Unit1Store:
         update_id: int,
         message_id: int,
     ) -> bool:
-        subject_ref = self.subject_ref(connection_id, conversation_id, sender_id)
+        subject = self.subject_ref(connection_id, conversation_id, sender_id)
         now = self.now()
         with self.public.transaction() as connection:
-            existing = connection.execute(
-                "SELECT 1 FROM processed_updates WHERE update_id = ?", (update_id,)
-            ).fetchone()
-            if existing is not None:
+            if connection.execute(
+                "SELECT 1 FROM processed_updates WHERE update_id=?", (update_id,)
+            ).fetchone():
                 return False
             connection.execute(
-                """
-                INSERT INTO processed_updates(
-                    update_id, kind, connection_id, conversation_id, sender_id,
-                    subject_ref, message_id, outcome, created_at
-                ) VALUES (?, 'owner_business_message', ?, ?, ?, ?, ?,
-                          'owner_takeover', ?)
-                """,
+                """INSERT INTO processed_updates(update_id, kind, connection_id,
+                   conversation_id, sender_id, subject_ref, message_id, outcome,
+                   created_at) VALUES (?, 'owner_business_message', ?, ?, ?, ?, ?,
+                   'owner_takeover', ?)""",
                 (
                     update_id,
                     connection_id,
                     conversation_id,
                     sender_id,
-                    subject_ref,
+                    subject,
                     message_id,
                     now,
                 ),
             )
             connection.execute(
-                """
-                INSERT INTO chat_state(
-                    connection_id, conversation_id, sender_id, subject_ref, takeover_at
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(connection_id, conversation_id) DO UPDATE SET
-                    sender_id=excluded.sender_id,
-                    subject_ref=excluded.subject_ref,
-                    takeover_at=excluded.takeover_at
-                """,
-                (connection_id, conversation_id, sender_id, subject_ref, now),
+                """INSERT INTO chat_state VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(connection_id, conversation_id) DO UPDATE SET
+                   sender_id=excluded.sender_id, subject_ref=excluded.subject_ref,
+                   takeover_at=excluded.takeover_at""",
+                (connection_id, conversation_id, sender_id, subject, now),
             )
             connection.execute(
-                """
-                UPDATE replies SET state = ?, updated_at = ?
-                WHERE connection_id = ? AND conversation_id = ? AND state = ?
-                """,
+                """UPDATE replies SET state=?, updated_at=? WHERE connection_id=?
+                   AND conversation_id=? AND state IN (?, ?)""",
                 (
                     DeliveryState.CANCELLED.value,
                     now,
                     connection_id,
                     conversation_id,
                     DeliveryState.PENDING.value,
+                    DeliveryState.RETRY_PENDING.value,
                 ),
             )
         return True
@@ -477,23 +504,22 @@ class Unit1Store:
         sender_id: int,
         processing_authorization_version: str,
     ) -> bool:
-        subject_ref = self.subject_ref(connection_id, conversation_id, sender_id)
-        if self.privacy_state(subject_ref) is not None:
+        subject = self.subject_ref(connection_id, conversation_id, sender_id)
+        if self.privacy_state(subject) is not None:
             return False
-        row = self.public.execute(
-            """
-            SELECT 1 FROM consents
-            WHERE connection_id = ? AND conversation_id = ? AND sender_id = ?
-              AND processing_authorization_version = ?
-            """,
-            (
-                connection_id,
-                conversation_id,
-                sender_id,
-                processing_authorization_version,
-            ),
-        ).fetchone()
-        return row is not None
+        return (
+            self.public.execute(
+                """SELECT 1 FROM consents WHERE connection_id=? AND conversation_id=?
+               AND sender_id=? AND processing_authorization_version=?""",
+                (
+                    connection_id,
+                    conversation_id,
+                    sender_id,
+                    processing_authorization_version,
+                ),
+            ).fetchone()
+            is not None
+        )
 
     def _new_control(
         self,
@@ -506,27 +532,23 @@ class Unit1Store:
     ) -> tuple[str, str]:
         token = secrets.token_urlsafe(24)
         control_id = uuid.uuid4().hex
-        token_hash = self.digest("control", token)
-        subject_ref = self.subject_ref(
+        subject = self.subject_ref(
             message.connection_id, message.conversation_id, message.sender_id
         )
         with self.public.transaction() as connection:
             connection.execute(
-                """
-                INSERT INTO controls(
-                    control_id, token_hash, action, connection_id, conversation_id,
-                    sender_id, subject_ref, pending_key,
-                    processing_authorization_version, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                """INSERT INTO controls(control_id, token_hash, action, connection_id,
+                   conversation_id, sender_id, subject_ref, pending_key,
+                   processing_authorization_version, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     control_id,
-                    token_hash,
+                    self.digest("control", token),
                     action,
                     message.connection_id,
                     message.conversation_id,
                     message.sender_id,
-                    subject_ref,
+                    subject,
                     pending_key,
                     processing_authorization_version,
                     expires_at,
@@ -542,130 +564,143 @@ class Unit1Store:
         processing_authorization_version: str,
         ttl_seconds: int,
     ) -> tuple[str, str, str]:
-        message_key = self.message_key(
+        key = self.message_key(
             message.connection_id, message.conversation_id, message.message_id
         )
-        expires_at = self.now() + ttl_seconds
-        consent_id, consent_token = self._new_control(
+        expires = min(self.now(), int(message.sent_at.timestamp())) + ttl_seconds
+        consent_id, consent = self._new_control(
             action="consent",
             message=message,
-            pending_key=message_key,
+            pending_key=key,
             processing_authorization_version=processing_authorization_version,
-            expires_at=expires_at,
+            expires_at=expires,
         )
-        decline_id, decline_token = self._new_control(
+        decline_id, decline = self._new_control(
             action="decline",
             message=message,
-            pending_key=message_key,
+            pending_key=key,
             processing_authorization_version=processing_authorization_version,
-            expires_at=expires_at,
+            expires_at=expires,
         )
-        subject_ref = self.subject_ref(
+        subject = self.subject_ref(
             message.connection_id, message.conversation_id, message.sender_id
         )
         with self.pending.transaction() as connection:
             connection.execute(
-                """
-                INSERT INTO pending_messages(
-                    message_key, connection_id, conversation_id, sender_id,
-                    subject_ref, message_id, update_id, body, content_digest,
-                    created_at, expires_at, state, privacy_policy_version,
-                    processing_authorization_version, consent_control_id,
-                    decline_control_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
-                ON CONFLICT(message_key) DO UPDATE SET
-                    update_id=excluded.update_id,
-                    body=excluded.body,
-                    content_digest=excluded.content_digest,
-                    expires_at=excluded.expires_at,
-                    privacy_policy_version=excluded.privacy_policy_version,
-                    processing_authorization_version=
-                        excluded.processing_authorization_version,
-                    consent_control_id=excluded.consent_control_id,
-                    decline_control_id=excluded.decline_control_id
-                """,
+                """INSERT INTO pending_messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   'pending', ?, ?, ?, ?)
+                   ON CONFLICT(message_key) DO UPDATE SET update_id=excluded.update_id,
+                   body=excluded.body, content_digest=excluded.content_digest,
+                   consent_control_id=excluded.consent_control_id,
+                   decline_control_id=excluded.decline_control_id""",
                 (
-                    message_key,
+                    key,
                     message.connection_id,
                     message.conversation_id,
                     message.sender_id,
-                    subject_ref,
+                    subject,
                     message.message_id,
                     message.update_id,
                     message.text,
                     self.content_digest(message.text),
+                    int(message.sent_at.timestamp()),
                     self.now(),
-                    expires_at,
+                    expires,
                     privacy_policy_version,
                     processing_authorization_version,
                     consent_id,
                     decline_id,
                 ),
             )
-        return message_key, consent_token, decline_token
+        return key, consent, decline
 
     def create_maintenance_controls(
         self,
         message: InboundMessage,
         processing_authorization_version: str,
         ttl_seconds: int,
+        *,
+        reconsent: bool = False,
     ) -> tuple[str, str]:
-        expires_at = self.now() + ttl_seconds
-        _, revoke_token = self._new_control(
-            action="revoke",
+        expires = self.now() + ttl_seconds
+        action = "reconsent" if reconsent else "revoke"
+        _, first = self._new_control(
+            action=action,
             message=message,
             pending_key=None,
             processing_authorization_version=processing_authorization_version,
-            expires_at=expires_at,
+            expires_at=expires,
         )
-        _, delete_token = self._new_control(
+        _, delete = self._new_control(
             action="delete",
             message=message,
             pending_key=None,
             processing_authorization_version=processing_authorization_version,
-            expires_at=expires_at,
+            expires_at=expires,
         )
-        return revoke_token, delete_token
+        return first, delete
 
     def resolve_control(
-        self, token: str, actor_id: int, conversation_id: int
+        self,
+        token: str,
+        actor_id: int,
+        conversation_id: int,
+        connection_id: str,
+        origin_message_id: int,
     ) -> ControlRecord | None:
         if not token.startswith("pa:"):
             return None
-        token_hash = self.digest("control", token[3:])
         row = self.public.execute(
-            "SELECT * FROM controls WHERE token_hash = ?", (token_hash,)
+            "SELECT * FROM controls WHERE token_hash=?",
+            (self.digest("control", token[3:]),),
         ).fetchone()
-        if row is None:
-            return None
-        if (
-            _row_value(row, "sender_id") != actor_id
-            or _row_value(row, "conversation_id") != conversation_id
+        if row is None or any(
+            (
+                row["sender_id"] != actor_id,
+                row["conversation_id"] != conversation_id,
+                row["connection_id"] != connection_id,
+                row["origin_message_id"] != origin_message_id,
+                row["origin_reply_id"] is None,
+            )
         ):
             return None
         return ControlRecord(
-            control_id=str(_row_value(row, "control_id")),
-            action=str(_row_value(row, "action")),
-            connection_id=str(_row_value(row, "connection_id")),
-            conversation_id=int(_row_value(row, "conversation_id")),
-            sender_id=int(_row_value(row, "sender_id")),
-            subject_ref=str(_row_value(row, "subject_ref")),
-            pending_key=_row_value(row, "pending_key"),
+            control_id=str(row["control_id"]),
+            action=str(row["action"]),
+            connection_id=str(row["connection_id"]),
+            conversation_id=int(row["conversation_id"]),
+            sender_id=int(row["sender_id"]),
+            subject_ref=str(row["subject_ref"]),
+            pending_key=row["pending_key"],
             processing_authorization_version=str(
-                _row_value(row, "processing_authorization_version")
+                row["processing_authorization_version"]
             ),
-            expires_at=int(_row_value(row, "expires_at")),
-            consumed_at=_row_value(row, "consumed_at"),
+            expires_at=int(row["expires_at"]),
+            consumed_at=row["consumed_at"],
+            origin_reply_id=str(row["origin_reply_id"]),
+            origin_message_id=int(row["origin_message_id"]),
         )
 
-    def _consume_controls(self, control_ids: tuple[str, ...], when: int) -> None:
-        placeholders = ",".join("?" for _ in control_ids)
+    def _consume(self, control_ids: tuple[str, ...], when: int) -> None:
+        if not control_ids:
+            return
+        marks = ",".join("?" for _ in control_ids)
         with self.public.transaction() as connection:
             connection.execute(
-                f"UPDATE controls SET consumed_at = COALESCE(consumed_at, ?) "
-                f"WHERE control_id IN ({placeholders})",
+                f"UPDATE controls SET consumed_at=COALESCE(consumed_at, ?) WHERE control_id IN ({marks})",
                 (when, *control_ids),
             )
+
+    def _is_restricted(self, message_key: str, subject_ref: str) -> bool:
+        return bool(
+            self.public.execute(
+                "SELECT 1 FROM privacy_state WHERE subject_ref=?", (subject_ref,)
+            ).fetchone()
+            or self.public.execute(
+                "SELECT 1 FROM restrictive_tombstones WHERE message_key=?",
+                (message_key,),
+            ).fetchone()
+        )
 
     def accept_consent(
         self,
@@ -675,7 +710,7 @@ class Unit1Store:
         crash_hook: Callable[[str], None] | None = None,
     ) -> str:
         now = self.now()
-        if control.action != "consent":
+        if control.action != "consent" or control.pending_key is None:
             return "invalid"
         if control.consumed_at is not None:
             return "replayed"
@@ -683,163 +718,220 @@ class Unit1Store:
             return "expired"
         if control.processing_authorization_version != expected_processing_version:
             return "stale_version"
-        if control.pending_key is None:
-            return "invalid"
         with self.pending.transaction() as connection:
             row = connection.execute(
-                "SELECT * FROM pending_messages WHERE message_key = ?",
+                "SELECT * FROM pending_messages WHERE message_key=?",
                 (control.pending_key,),
             ).fetchone()
             if row is None:
                 return "replayed"
-            if _row_value(row, "expires_at") <= now:
+            if row["expires_at"] <= now:
                 connection.execute(
-                    "DELETE FROM pending_messages WHERE message_key = ?",
+                    "DELETE FROM pending_messages WHERE message_key=?",
                     (control.pending_key,),
                 )
                 return "expired"
-            if (
-                _row_value(row, "sender_id") != control.sender_id
-                or _row_value(row, "conversation_id") != control.conversation_id
-                or _row_value(row, "connection_id") != control.connection_id
-                or _row_value(row, "consent_control_id") != control.control_id
-            ):
+            if row["consent_control_id"] != control.control_id:
                 return "invalid"
             connection.execute(
-                "UPDATE pending_messages SET state = 'authorized' WHERE message_key = ?",
+                "UPDATE pending_messages SET state='authorized' WHERE message_key=?",
                 (control.pending_key,),
             )
         self._finish_transfer(control.pending_key, crash_hook=crash_hook)
         return "accepted"
 
-    def _finish_transfer(
-        self,
-        message_key: str,
-        *,
-        crash_hook: Callable[[str], None] | None = None,
-    ) -> None:
-        row = self.pending.execute(
-            "SELECT * FROM pending_messages WHERE message_key = ? AND state = 'authorized'",
-            (message_key,),
-        ).fetchone()
-        if row is None:
-            return
-        consent_id = str(_row_value(row, "consent_control_id"))
-        decline_id = str(_row_value(row, "decline_control_id"))
+    def reconsent(
+        self, control: ControlRecord, expected_processing_version: str
+    ) -> str:
+        if control.action != "reconsent":
+            return "invalid"
+        if control.consumed_at is not None:
+            return "replayed"
+        if control.expires_at <= self.now():
+            return "expired"
+        if control.processing_authorization_version != expected_processing_version:
+            return "stale_version"
         now = self.now()
         with self.public.transaction() as connection:
             connection.execute(
-                """
-                INSERT INTO consents(
-                    connection_id, conversation_id, sender_id, subject_ref,
-                    privacy_policy_version, processing_authorization_version,
-                    processors, purposes, granted_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(connection_id, conversation_id, sender_id) DO UPDATE SET
-                    privacy_policy_version=excluded.privacy_policy_version,
-                    processing_authorization_version=
-                        excluded.processing_authorization_version,
-                    processors=excluded.processors,
-                    purposes=excluded.purposes,
-                    granted_at=excluded.granted_at
-                """,
+                "DELETE FROM privacy_state WHERE subject_ref=?", (control.subject_ref,)
+            )
+            connection.execute(
+                """INSERT INTO consents VALUES (?, ?, ?, ?, '', ?, ?)
+                   ON CONFLICT(connection_id, conversation_id, sender_id) DO UPDATE SET
+                   processing_authorization_version=excluded.processing_authorization_version,
+                   granted_at=excluded.granted_at""",
                 (
-                    _row_value(row, "connection_id"),
-                    _row_value(row, "conversation_id"),
-                    _row_value(row, "sender_id"),
-                    _row_value(row, "subject_ref"),
-                    _row_value(row, "privacy_policy_version"),
-                    _row_value(row, "processing_authorization_version"),
-                    json.dumps(["OpenAI", "Google Calendar", "Todoist"]),
-                    json.dumps(
-                        ["assistant replies", "meeting actions", "external tasks"]
-                    ),
+                    control.connection_id,
+                    control.conversation_id,
+                    control.sender_id,
+                    control.subject_ref,
+                    expected_processing_version,
                     now,
                 ),
             )
             connection.execute(
-                "UPDATE controls SET consumed_at = COALESCE(consumed_at, ?) "
-                "WHERE control_id IN (?, ?)",
-                (now, consent_id, decline_id),
+                "UPDATE controls SET consumed_at=? WHERE control_id=?",
+                (now, control.control_id),
             )
-        if crash_hook is not None:
+        return "accepted"
+
+    def _finish_transfer(
+        self, message_key: str, *, crash_hook: Callable[[str], None] | None = None
+    ) -> None:
+        row = self.pending.execute(
+            "SELECT * FROM pending_messages WHERE message_key=? AND state='authorized'",
+            (message_key,),
+        ).fetchone()
+        if row is None:
+            return
+        if self._is_restricted(message_key, row["subject_ref"]):
+            with self.pending.transaction() as connection:
+                connection.execute(
+                    "DELETE FROM pending_messages WHERE message_key=?", (message_key,)
+                )
+            return
+        if crash_hook:
             crash_hook("before_copy")
+        now = self.now()
         with self.public.transaction() as connection:
-            connection.execute(
-                """
-                INSERT INTO messages(
-                    message_key, connection_id, conversation_id, sender_id,
-                    subject_ref, message_id, update_id, body, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(message_key) DO UPDATE SET
-                    body=excluded.body,
-                    update_id=excluded.update_id
-                """,
-                (
-                    message_key,
-                    _row_value(row, "connection_id"),
-                    _row_value(row, "conversation_id"),
-                    _row_value(row, "sender_id"),
-                    _row_value(row, "subject_ref"),
-                    _row_value(row, "message_id"),
-                    _row_value(row, "update_id"),
-                    _row_value(row, "body"),
-                    _row_value(row, "created_at"),
-                ),
-            )
-        if crash_hook is not None:
+            restricted = connection.execute(
+                """SELECT 1 FROM privacy_state WHERE subject_ref=? UNION
+                   SELECT 1 FROM restrictive_tombstones WHERE message_key=?""",
+                (row["subject_ref"], message_key),
+            ).fetchone()
+            if restricted is None:
+                connection.execute(
+                    """INSERT INTO consents VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(connection_id, conversation_id, sender_id) DO UPDATE SET
+                       privacy_policy_version=excluded.privacy_policy_version,
+                       processing_authorization_version=excluded.processing_authorization_version,
+                       granted_at=excluded.granted_at""",
+                    (
+                        row["connection_id"],
+                        row["conversation_id"],
+                        row["sender_id"],
+                        row["subject_ref"],
+                        row["privacy_policy_version"],
+                        row["processing_authorization_version"],
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                       ON CONFLICT(message_key) DO UPDATE SET body=excluded.body,
+                       update_id=excluded.update_id, content_updated_at=excluded.content_updated_at,
+                       expires_at=excluded.expires_at, deleted_at=NULL""",
+                    (
+                        message_key,
+                        row["connection_id"],
+                        row["conversation_id"],
+                        row["sender_id"],
+                        row["subject_ref"],
+                        row["message_id"],
+                        row["update_id"],
+                        row["body"],
+                        row["sent_at"],
+                        row["sent_at"],
+                        row["sent_at"] + 90 * 24 * 60 * 60,
+                    ),
+                )
+                connection.execute(
+                    "INSERT OR IGNORE INTO transfer_receipts VALUES (?, ?)",
+                    (message_key, now),
+                )
+                connection.execute(
+                    "UPDATE controls SET consumed_at=COALESCE(consumed_at, ?) WHERE control_id IN (?, ?)",
+                    (now, row["consent_control_id"], row["decline_control_id"]),
+                )
+        if crash_hook:
             crash_hook("after_copy")
-        with self.public.transaction() as connection:
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO transfer_receipts(message_key, copied_at)
-                VALUES (?, ?)
-                """,
-                (message_key, now),
-            )
-        if crash_hook is not None:
             crash_hook("after_receipt")
             crash_hook("before_pending_delete")
         with self.pending.transaction() as connection:
             connection.execute(
-                "DELETE FROM pending_messages WHERE message_key = ?", (message_key,)
+                "DELETE FROM pending_messages WHERE message_key=?", (message_key,)
             )
 
     def recover_transfers(self) -> int:
         rows = self.pending.execute(
-            "SELECT message_key FROM pending_messages WHERE state = 'authorized'"
+            "SELECT message_key FROM pending_messages WHERE state='authorized'"
         ).fetchall()
         for row in rows:
-            self._finish_transfer(str(_row_value(row, "message_key")))
+            self._finish_transfer(str(row[0]))
         return len(rows)
 
-    def decline(self, control: ControlRecord) -> str:
-        now = self.now()
-        if control.action != "decline":
+    def recover_restrictions(self) -> int:
+        rows = self.pending.execute(
+            "SELECT message_key, subject_ref FROM pending_messages"
+        ).fetchall()
+        restricted = [
+            str(row["message_key"])
+            for row in rows
+            if self._is_restricted(str(row["message_key"]), str(row["subject_ref"]))
+        ]
+        if restricted:
+            marks = ",".join("?" for _ in restricted)
+            with self.pending.transaction() as connection:
+                connection.execute(
+                    f"DELETE FROM pending_messages WHERE message_key IN ({marks})",
+                    tuple(restricted),
+                )
+        self.prune_restrictive_tombstones()
+        return len(restricted)
+
+    def prune_restrictive_tombstones(self) -> int:
+        rows = self.public.execute(
+            "SELECT message_key FROM restrictive_tombstones"
+        ).fetchall()
+        stale = [
+            str(row[0])
+            for row in rows
+            if self.pending.execute(
+                "SELECT 1 FROM pending_messages WHERE message_key=?", (row[0],)
+            ).fetchone()
+            is None
+        ]
+        if stale:
+            marks = ",".join("?" for _ in stale)
+            with self.public.transaction() as connection:
+                connection.execute(
+                    f"DELETE FROM restrictive_tombstones WHERE message_key IN ({marks})",
+                    tuple(stale),
+                )
+        return len(stale)
+
+    def decline(
+        self, control: ControlRecord, crash_hook: Callable[[str], None] | None = None
+    ) -> str:
+        if control.action != "decline" or control.pending_key is None:
             return "invalid"
         if control.consumed_at is not None:
             return "replayed"
-        if control.expires_at <= now:
+        if control.expires_at <= self.now():
             return "expired"
-        if control.pending_key is None:
-            return "invalid"
         row = self.pending.execute(
-            "SELECT consent_control_id, decline_control_id FROM pending_messages "
-            "WHERE message_key = ?",
+            "SELECT consent_control_id, decline_control_id FROM pending_messages WHERE message_key=?",
             (control.pending_key,),
         ).fetchone()
         if row is None:
             return "replayed"
-        self._consume_controls(
-            (
-                str(_row_value(row, "consent_control_id")),
-                str(_row_value(row, "decline_control_id")),
-            ),
-            now,
-        )
+        now = self.now()
+        with self.public.transaction() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO restrictive_tombstones VALUES (?, ?, 'declined', ?)",
+                (control.pending_key, control.subject_ref, now),
+            )
+            connection.execute(
+                "UPDATE controls SET consumed_at=COALESCE(consumed_at, ?) WHERE control_id IN (?, ?)",
+                (now, row[0], row[1]),
+            )
+        if crash_hook:
+            crash_hook("after_tombstone")
+            crash_hook("before_pending_delete")
         with self.pending.transaction() as connection:
             connection.execute(
-                "DELETE FROM pending_messages WHERE message_key = ?",
+                "DELETE FROM pending_messages WHERE message_key=?",
                 (control.pending_key,),
             )
         return "declined"
@@ -848,62 +940,134 @@ class Unit1Store:
         now = self.now()
         with self.pending.transaction() as connection:
             rows = connection.execute(
-                """
-                SELECT consent_control_id, decline_control_id
-                FROM pending_messages WHERE state = 'pending' AND expires_at <= ?
-                """,
+                """SELECT message_key, update_id, consent_control_id,
+                   decline_control_id FROM pending_messages WHERE expires_at<=?""",
                 (now,),
             ).fetchall()
             connection.execute(
-                "DELETE FROM pending_messages "
-                "WHERE state = 'pending' AND expires_at <= ?",
-                (now,),
+                "DELETE FROM pending_messages WHERE expires_at<=?", (now,)
             )
-        for row in rows:
-            self._consume_controls(
-                (
-                    str(_row_value(row, "consent_control_id")),
-                    str(_row_value(row, "decline_control_id")),
-                ),
-                now,
-            )
+        with self.public.transaction() as connection:
+            for row in rows:
+                connection.execute(
+                    "DELETE FROM controls WHERE control_id IN (?, ?)",
+                    (row["consent_control_id"], row["decline_control_id"]),
+                )
+                connection.execute(
+                    "DELETE FROM replies WHERE source_update_id=?", (row["update_id"],)
+                )
+                connection.execute(
+                    "DELETE FROM processed_updates WHERE update_id=?",
+                    (row["update_id"],),
+                )
+                connection.execute(
+                    "DELETE FROM rate_admissions WHERE update_id=?", (row["update_id"],)
+                )
         return len(rows)
 
-    def store_consented_message(self, message: InboundMessage) -> None:
+    def expire_public(self, retention_seconds: int) -> int:
+        cutoff = self.now()
+        with self.public.transaction() as connection:
+            connection.execute("DELETE FROM controls WHERE expires_at<=?", (cutoff,))
+            rows = connection.execute(
+                """SELECT message_key, subject_ref, update_id FROM messages
+                   WHERE content_updated_at + ? <= ?""",
+                (retention_seconds, cutoff),
+            ).fetchall()
+            for row in rows:
+                connection.execute(
+                    "DELETE FROM replies WHERE source_update_id=?", (row["update_id"],)
+                )
+                connection.execute(
+                    "DELETE FROM processed_updates WHERE update_id=?",
+                    (row["update_id"],),
+                )
+                connection.execute(
+                    "DELETE FROM transfer_receipts WHERE message_key=?",
+                    (row["message_key"],),
+                )
+                connection.execute(
+                    "DELETE FROM restrictive_tombstones WHERE message_key=?",
+                    (row["message_key"],),
+                )
+                connection.execute(
+                    "DELETE FROM messages WHERE message_key=?", (row["message_key"],)
+                )
+            subjects = {str(row["subject_ref"]) for row in rows}
+            for subject in subjects:
+                remaining = connection.execute(
+                    "SELECT 1 FROM messages WHERE subject_ref=?", (subject,)
+                ).fetchone()
+                if remaining is None:
+                    connection.execute(
+                        "DELETE FROM controls WHERE subject_ref=?", (subject,)
+                    )
+                    connection.execute(
+                        "DELETE FROM consents WHERE subject_ref=?", (subject,)
+                    )
+                    connection.execute(
+                        "DELETE FROM chat_state WHERE subject_ref=?", (subject,)
+                    )
+                    connection.execute(
+                        "DELETE FROM rate_admissions WHERE subject_ref=?", (subject,)
+                    )
+                    connection.execute(
+                        "DELETE FROM replies WHERE subject_ref=?", (subject,)
+                    )
+                    connection.execute(
+                        "DELETE FROM processed_updates WHERE subject_ref=?", (subject,)
+                    )
+        return len(rows)
+
+    def stored_message_binding(
+        self,
+        connection_id: str,
+        conversation_id: int,
+        message_id: int,
+        sender_id: int | None = None,
+    ) -> bool:
+        key = self.message_key(connection_id, conversation_id, message_id)
+        params: tuple[Any, ...] = (key,) if sender_id is None else (key, sender_id)
+        suffix = "" if sender_id is None else " AND sender_id=?"
+        if self.pending.execute(
+            f"SELECT 1 FROM pending_messages WHERE message_key=?{suffix}", params
+        ).fetchone():
+            return True
+        return (
+            self.public.execute(
+                f"SELECT 1 FROM messages WHERE message_key=?{suffix}", params
+            ).fetchone()
+            is not None
+        )
+
+    def store_consented_message(
+        self, message: InboundMessage, retention_seconds: int
+    ) -> None:
         key = self.message_key(
             message.connection_id, message.conversation_id, message.message_id
         )
-        subject_ref = self.subject_ref(
+        subject = self.subject_ref(
             message.connection_id, message.conversation_id, message.sender_id
         )
+        changed = int((message.edited_at or message.sent_at).timestamp())
         with self.public.transaction() as connection:
             connection.execute(
-                """
-                INSERT INTO messages(
-                    message_key, connection_id, conversation_id, sender_id,
-                    subject_ref, message_id, update_id, body, created_at, edited_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(message_key) DO UPDATE SET
-                    update_id=excluded.update_id,
-                    body=excluded.body,
-                    edited_at=excluded.edited_at,
-                    deleted_at=NULL
-                """,
+                """INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                   ON CONFLICT(message_key) DO UPDATE SET update_id=excluded.update_id,
+                   body=excluded.body, content_updated_at=excluded.content_updated_at,
+                   expires_at=excluded.expires_at, deleted_at=NULL""",
                 (
                     key,
                     message.connection_id,
                     message.conversation_id,
                     message.sender_id,
-                    subject_ref,
+                    subject,
                     message.message_id,
                     message.update_id,
                     message.text,
                     int(message.sent_at.timestamp()),
-                    (
-                        int(message.edited_at.timestamp())
-                        if message.edited_at is not None
-                        else None
-                    ),
+                    changed,
+                    changed + retention_seconds,
                 ),
             )
 
@@ -913,10 +1077,8 @@ class Unit1Store:
         )
         with self.pending.transaction() as connection:
             cursor = connection.execute(
-                """
-                UPDATE pending_messages SET body = ?, content_digest = ?, update_id = ?
-                WHERE message_key = ? AND state = 'pending'
-                """,
+                """UPDATE pending_messages SET body=?, content_digest=?, update_id=?
+                   WHERE message_key=? AND state='pending'""",
                 (
                     message.text,
                     self.content_digest(message.text),
@@ -926,71 +1088,75 @@ class Unit1Store:
             )
         return int(cursor.rowcount) == 1
 
+    def edit_public(self, message: InboundMessage, retention_seconds: int) -> bool:
+        key = self.message_key(
+            message.connection_id, message.conversation_id, message.message_id
+        )
+        changed = int((message.edited_at or message.sent_at).timestamp())
+        with self.public.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE messages SET body=?, update_id=?, content_updated_at=?,
+                   expires_at=?, deleted_at=NULL WHERE message_key=? AND sender_id=?""",
+                (
+                    message.text,
+                    message.update_id,
+                    changed,
+                    changed + retention_seconds,
+                    key,
+                    message.sender_id,
+                ),
+            )
+        return int(cursor.rowcount) == 1
+
     def delete_messages(
-        self,
-        connection_id: str,
-        conversation_id: int,
-        message_ids: tuple[int, ...],
+        self, connection_id: str, conversation_id: int, message_ids: tuple[int, ...]
     ) -> int:
         deleted = 0
         now = self.now()
         for message_id in message_ids:
             key = self.message_key(connection_id, conversation_id, message_id)
-            with self.pending.transaction() as connection:
-                pending = connection.execute(
-                    "SELECT consent_control_id, decline_control_id, update_id "
-                    "FROM pending_messages "
-                    "WHERE message_key = ?",
-                    (key,),
+            with self.public.transaction() as connection:
+                connection.execute(
+                    "INSERT OR IGNORE INTO restrictive_tombstones VALUES (?, '', 'deleted', ?)",
+                    (key, now),
+                )
+                source = connection.execute(
+                    "SELECT update_id FROM messages WHERE message_key=?", (key,)
                 ).fetchone()
                 cursor = connection.execute(
-                    "DELETE FROM pending_messages WHERE message_key = ?", (key,)
-                )
-                deleted += max(cursor.rowcount, 0)
-            if pending is not None:
-                self._consume_controls(
-                    (
-                        str(_row_value(pending, "consent_control_id")),
-                        str(_row_value(pending, "decline_control_id")),
-                    ),
-                    now,
-                )
-                with self.public.transaction() as connection:
-                    connection.execute(
-                        """
-                        UPDATE replies SET state = ?, updated_at = ?
-                        WHERE source_update_id = ? AND state = ?
-                        """,
-                        (
-                            DeliveryState.CANCELLED.value,
-                            now,
-                            _row_value(pending, "update_id"),
-                            DeliveryState.PENDING.value,
-                        ),
-                    )
-            with self.public.transaction() as connection:
-                cursor = connection.execute(
-                    """
-                    UPDATE messages SET body = NULL, deleted_at = ?
-                    WHERE message_key = ? AND deleted_at IS NULL
-                    """,
+                    "UPDATE messages SET body=NULL, deleted_at=? WHERE message_key=? AND deleted_at IS NULL",
                     (now, key),
                 )
                 deleted += max(cursor.rowcount, 0)
-                source = connection.execute(
-                    "SELECT update_id FROM messages WHERE message_key = ?", (key,)
-                ).fetchone()
-                if source is not None:
+                if source:
                     connection.execute(
-                        """
-                        UPDATE replies SET state = ?, updated_at = ?
-                        WHERE source_update_id = ? AND state = ?
-                        """,
+                        "UPDATE replies SET state=?, updated_at=? WHERE source_update_id=? AND state IN (?, ?)",
                         (
                             DeliveryState.CANCELLED.value,
                             now,
-                            _row_value(source, "update_id"),
+                            source[0],
                             DeliveryState.PENDING.value,
+                            DeliveryState.RETRY_PENDING.value,
+                        ),
+                    )
+            with self.pending.transaction() as connection:
+                row = connection.execute(
+                    "SELECT update_id FROM pending_messages WHERE message_key=?", (key,)
+                ).fetchone()
+                cursor = connection.execute(
+                    "DELETE FROM pending_messages WHERE message_key=?", (key,)
+                )
+                deleted += max(cursor.rowcount, 0)
+            if row:
+                with self.public.transaction() as connection:
+                    connection.execute(
+                        "UPDATE replies SET state=?, updated_at=? WHERE source_update_id=? AND state IN (?, ?)",
+                        (
+                            DeliveryState.CANCELLED.value,
+                            now,
+                            row[0],
+                            DeliveryState.PENDING.value,
+                            DeliveryState.RETRY_PENDING.value,
                         ),
                     )
         return deleted
@@ -1006,38 +1172,44 @@ class Unit1Store:
             uuid.UUID("91c1e00b-d0b9-4abe-b377-5bd1f7dc08b1"),
             f"{message.update_id}:{purpose}",
         ).hex
+        keyboard_json = json.dumps(keyboard, separators=(",", ":"), sort_keys=True)
         now = self.now()
-        subject_ref = self.subject_ref(
+        subject = self.subject_ref(
             message.connection_id, message.conversation_id, message.sender_id
         )
-        keyboard_json = json.dumps(keyboard, separators=(",", ":"), sort_keys=True)
         with self.public.transaction() as connection:
             connection.execute(
-                """
-                INSERT OR IGNORE INTO replies(
-                    reply_id, source_update_id, purpose, connection_id,
-                    conversation_id, subject_ref, text, keyboard_json,
-                    state, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                """INSERT OR IGNORE INTO replies(reply_id, source_update_id, purpose,
+                   connection_id, conversation_id, subject_ref, text, keyboard_json,
+                   state, inbound_sent_at, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     reply_id,
                     message.update_id,
                     purpose,
                     message.connection_id,
                     message.conversation_id,
-                    subject_ref,
+                    subject,
                     text,
                     keyboard_json,
                     DeliveryState.PENDING.value,
+                    int(message.sent_at.timestamp()),
                     now,
                     now,
                 ),
             )
             connection.execute(
-                "UPDATE processed_updates SET reply_id = ? WHERE update_id = ?",
+                "UPDATE processed_updates SET reply_id=? WHERE update_id=?",
                 (reply_id, message.update_id),
             )
+            for row in keyboard:
+                for item in row:
+                    token = item.get("callback_data")
+                    if token and token.startswith("pa:"):
+                        connection.execute(
+                            "UPDATE controls SET origin_reply_id=? WHERE token_hash=?",
+                            (reply_id, self.digest("control", token[3:])),
+                        )
         record = self.get_reply(reply_id)
         if record is None:
             raise RuntimeError("durable reply was not created")
@@ -1045,36 +1217,47 @@ class Unit1Store:
 
     def get_reply(self, reply_id: str) -> ReplyRecord | None:
         row = self.public.execute(
-            "SELECT * FROM replies WHERE reply_id = ?", (reply_id,)
+            "SELECT * FROM replies WHERE reply_id=?", (reply_id,)
         ).fetchone()
         if row is None:
             return None
-        if (
-            _row_value(row, "connection_id") is None
-            or _row_value(row, "conversation_id") is None
-        ):
-            return None
         return ReplyRecord(
-            reply_id=str(_row_value(row, "reply_id")),
-            connection_id=str(_row_value(row, "connection_id")),
-            conversation_id=int(_row_value(row, "conversation_id")),
-            text=str(_row_value(row, "text")),
-            keyboard_json=str(_row_value(row, "keyboard_json")),
-            state=DeliveryState(str(_row_value(row, "state"))),
+            reply_id=str(row["reply_id"]),
+            connection_id=str(row["connection_id"]),
+            conversation_id=int(row["conversation_id"]),
+            text=str(row["text"]),
+            keyboard_json=str(row["keyboard_json"]),
+            state=DeliveryState(str(row["state"])),
+            inbound_sent_at=int(row["inbound_sent_at"]),
+            next_attempt_at=row["next_attempt_at"],
         )
+
+    def due_replies(self) -> list[ReplyRecord]:
+        rows = self.public.execute(
+            """SELECT reply_id FROM replies WHERE state=? OR
+               (state=? AND next_attempt_at<=?) ORDER BY created_at""",
+            (
+                DeliveryState.PENDING.value,
+                DeliveryState.RETRY_PENDING.value,
+                self.now(),
+            ),
+        ).fetchall()
+        return [
+            reply for row in rows if (reply := self.get_reply(str(row[0]))) is not None
+        ]
 
     def mark_reply_sending(self, reply_id: str) -> bool:
         with self.public.transaction() as connection:
             cursor = connection.execute(
-                """
-                UPDATE replies SET state = ?, updated_at = ?
-                WHERE reply_id = ? AND state = ?
-                """,
+                """UPDATE replies SET state=?, next_attempt_at=NULL, updated_at=?
+                   WHERE reply_id=? AND (state=? OR (state=? AND next_attempt_at<=?))""",
                 (
                     DeliveryState.SENDING.value,
                     self.now(),
                     reply_id,
                     DeliveryState.PENDING.value,
+                    DeliveryState.RETRY_PENDING.value,
+                    self.now(),
                 ),
             )
         return int(cursor.rowcount) == 1
@@ -1082,31 +1265,23 @@ class Unit1Store:
     def reply_allowed(
         self, reply_id: str, *, owner_id: int, reply_window_seconds: int
     ) -> bool:
-        """Recheck rights, takeover, and age immediately before Telegram I/O."""
-
         row = self.public.execute(
-            """
-            SELECT r.state, u.created_at, c.owner_id, c.enabled, c.can_reply,
-                   s.takeover_at
-            FROM replies r
-            JOIN processed_updates u ON u.update_id = r.source_update_id
-            LEFT JOIN business_connections c
-              ON c.connection_id = r.connection_id
-            LEFT JOIN chat_state s
-              ON s.connection_id = r.connection_id
-             AND s.conversation_id = r.conversation_id
-            WHERE r.reply_id = ?
-            """,
+            """SELECT r.state, r.inbound_sent_at, c.owner_id, c.enabled, c.can_reply,
+               s.takeover_at FROM replies r LEFT JOIN business_connections c
+               ON c.connection_id=r.connection_id LEFT JOIN chat_state s
+               ON s.connection_id=r.connection_id AND s.conversation_id=r.conversation_id
+               WHERE r.reply_id=?""",
             (reply_id,),
         ).fetchone()
         return bool(
-            row is not None
-            and _row_value(row, "state") == DeliveryState.PENDING.value
-            and _row_value(row, "owner_id") == owner_id
-            and _row_value(row, "enabled") == 1
-            and _row_value(row, "can_reply") == 1
-            and _row_value(row, "takeover_at") is None
-            and self.now() - int(_row_value(row, "created_at")) < reply_window_seconds
+            row
+            and row["state"]
+            in {DeliveryState.PENDING.value, DeliveryState.RETRY_PENDING.value}
+            and row["owner_id"] == owner_id
+            and row["enabled"] == 1
+            and row["can_reply"] == 1
+            and row["takeover_at"] is None
+            and self.now() - int(row["inbound_sent_at"]) < reply_window_seconds
         )
 
     def finalize_reply(
@@ -1114,23 +1289,27 @@ class Unit1Store:
         reply_id: str,
         state: DeliveryState,
         telegram_message_id: int | None = None,
+        retry_after_seconds: int | None = None,
     ) -> None:
+        next_attempt = (
+            None if retry_after_seconds is None else self.now() + retry_after_seconds
+        )
         with self.public.transaction() as connection:
             connection.execute(
-                """
-                UPDATE replies
-                SET state = ?, telegram_message_id = ?, updated_at = ?
-                WHERE reply_id = ?
-                """,
-                (state.value, telegram_message_id, self.now(), reply_id),
+                """UPDATE replies SET state=?, telegram_message_id=COALESCE(?, telegram_message_id),
+                   next_attempt_at=?, updated_at=? WHERE reply_id=?""",
+                (state.value, telegram_message_id, next_attempt, self.now(), reply_id),
             )
+            if state is DeliveryState.SENT and telegram_message_id is not None:
+                connection.execute(
+                    "UPDATE controls SET origin_message_id=? WHERE origin_reply_id=?",
+                    (telegram_message_id, reply_id),
+                )
 
     def recover_sending_replies(self) -> int:
         with self.public.transaction() as connection:
             cursor = connection.execute(
-                """
-                UPDATE replies SET state = ?, updated_at = ? WHERE state = ?
-                """,
+                "UPDATE replies SET state=?, updated_at=? WHERE state=?",
                 (
                     DeliveryState.DELIVERY_UNCERTAIN.value,
                     self.now(),
@@ -1139,77 +1318,60 @@ class Unit1Store:
             )
         return max(int(cursor.rowcount), 0)
 
-    def apply_privacy_control(self, control: ControlRecord) -> str:
+    def apply_privacy_control(
+        self, control: ControlRecord, crash_hook: Callable[[str], None] | None = None
+    ) -> str:
+        if control.action not in {"revoke", "delete"}:
+            return "invalid"
         if control.consumed_at is not None:
             return "replayed"
         if control.expires_at <= self.now():
             return "expired"
-        if control.action not in {"revoke", "delete"}:
-            return "invalid"
-        now = self.now()
         state = "revoked" if control.action == "revoke" else "erased"
+        now = self.now()
         with self.public.transaction() as connection:
+            message_keys = [
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT message_key FROM messages WHERE subject_ref=?",
+                    (control.subject_ref,),
+                ).fetchall()
+            ]
             connection.execute(
-                "UPDATE controls SET consumed_at = ? WHERE control_id = ?",
-                (now, control.control_id),
-            )
-            connection.execute(
-                """
-                INSERT INTO privacy_state(subject_ref, state, changed_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(subject_ref) DO UPDATE SET
-                    state=excluded.state, changed_at=excluded.changed_at
-                """,
+                """INSERT INTO privacy_state VALUES (?, ?, ?)
+                   ON CONFLICT(subject_ref) DO UPDATE SET state=excluded.state,
+                   changed_at=excluded.changed_at""",
                 (control.subject_ref, state, now),
             )
+            for table in (
+                "consents",
+                "controls",
+                "chat_state",
+                "messages",
+                "replies",
+                "processed_updates",
+                "rate_admissions",
+            ):
+                connection.execute(
+                    f"DELETE FROM {table} WHERE subject_ref=?", (control.subject_ref,)
+                )
+            for message_key in message_keys:
+                connection.execute(
+                    "DELETE FROM transfer_receipts WHERE message_key=?", (message_key,)
+                )
             connection.execute(
-                "DELETE FROM consents WHERE subject_ref = ?", (control.subject_ref,)
-            )
-            connection.execute(
-                "DELETE FROM controls WHERE subject_ref = ?", (control.subject_ref,)
-            )
-            connection.execute(
-                "DELETE FROM chat_state WHERE subject_ref = ?", (control.subject_ref,)
-            )
-            connection.execute(
-                """
-                UPDATE replies SET connection_id = NULL, conversation_id = NULL,
-                    text = '', keyboard_json = '[]', state = ?, updated_at = ?
-                WHERE subject_ref = ?
-                """,
-                (DeliveryState.CANCELLED.value, now, control.subject_ref),
-            )
-            connection.execute(
-                """
-                UPDATE processed_updates
-                SET connection_id = NULL, conversation_id = NULL, sender_id = NULL,
-                    content_digest = NULL, erased = 1
-                WHERE subject_ref = ?
-                """,
+                "DELETE FROM restrictive_tombstones WHERE subject_ref=?",
                 (control.subject_ref,),
             )
-            if state == "erased":
-                connection.execute(
-                    "DELETE FROM messages WHERE subject_ref = ?", (control.subject_ref,)
-                )
-            else:
-                connection.execute(
-                    """
-                    UPDATE messages
-                    SET connection_id = NULL, conversation_id = NULL, sender_id = NULL
-                    WHERE subject_ref = ?
-                    """,
-                    (control.subject_ref,),
-                )
+        if crash_hook:
+            crash_hook("after_tombstone")
+            crash_hook("before_pending_delete")
         with self.pending.transaction() as connection:
             connection.execute(
-                "DELETE FROM pending_messages WHERE subject_ref = ?",
+                "DELETE FROM pending_messages WHERE subject_ref=?",
                 (control.subject_ref,),
             )
         return state
-
-    def backup_public(self, destination: Path) -> None:
-        self.public.encrypted_backup(destination, self.backup_key)
 
     def close(self) -> None:
         self.pending.close()

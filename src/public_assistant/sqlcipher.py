@@ -29,7 +29,6 @@ class SqlCipherDatabase:
 
     def __init__(self, path: Path, key: str, schema: str) -> None:
         self.path = path
-        self._key = key
         self._lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.path.parent, 0o700)
