@@ -187,6 +187,7 @@ _ACTION_KEYS = frozenset(
         "origin",
     }
 )
+_LEGACY_PUBLIC_ACTION_KEYS = _ACTION_KEYS - frozenset({"origin"})
 _ACTION_RESULT_KEYS = frozenset({"outcome", "action_id"})
 _EXTERNAL_LINK_KEYS = frozenset({"link_identity", "source_digest"})
 _EXTERNAL_CONFIRMATION_KEYS = frozenset({"link", "confirmation_sequence"})
@@ -216,32 +217,42 @@ def _action_to_wire(binding: ActionBinding) -> dict[str, object]:
     return binding.as_dict()
 
 
-def _action_from_wire(value: object) -> ActionBinding:
-    fields = _object(value, _ACTION_KEYS)
+def _action_from_wire(
+    value: object, *, allow_legacy_public: bool = False
+) -> ActionBinding:
+    fields = _object(value)
+    legacy_public = set(fields) == _LEGACY_PUBLIC_ACTION_KEYS
+    if set(fields) != _ACTION_KEYS and not (allow_legacy_public and legacy_public):
+        raise GateRpcProtocolError("RPC object fields do not match the DTO")
     arguments = _object(fields["arguments"])
     try:
         operation = Operation(_text(fields["operation"]))
-        origin = ActionOrigin(_text(fields["origin"]))
     except ValueError as exc:
-        raise GateRpcProtocolError("RPC action origin or operation is invalid") from exc
-    return ActionBinding(
-        action_id=_text(fields["action_id"]),
-        subject_id=_text(fields["subject_id"]),
-        connection_id=_text(fields["connection_id"]),
-        conversation_id=_integer(fields["conversation_id"]),
-        update_id=_integer(fields["update_id"]),
-        request_id=_text(fields["request_id"]),
-        operation=operation,
-        arguments=arguments,
-        processing_authorization_version=_text(
+        raise GateRpcProtocolError("RPC action operation is invalid") from exc
+    normalized: dict[str, object] = {
+        "action_id": _text(fields["action_id"]),
+        "subject_id": _text(fields["subject_id"]),
+        "connection_id": _text(fields["connection_id"]),
+        "conversation_id": _integer(fields["conversation_id"]),
+        "update_id": _integer(fields["update_id"]),
+        "request_id": _text(fields["request_id"]),
+        "operation": operation.value,
+        "arguments": arguments,
+        "processing_authorization_version": _text(
             fields["processing_authorization_version"]
         ),
-        processing_authorization_revision=_integer(
+        "processing_authorization_revision": _integer(
             fields["processing_authorization_revision"]
         ),
-        processor_purpose=_text(fields["processor_purpose"]),
-        origin=origin,
-    )
+        "processor_purpose": _text(fields["processor_purpose"]),
+    }
+    try:
+        if legacy_public:
+            return ActionBinding.from_legacy_public_dict(normalized)
+        normalized["origin"] = ActionOrigin(_text(fields["origin"])).value
+        return ActionBinding.from_dict(normalized)
+    except ValueError as exc:
+        raise GateRpcProtocolError("RPC action binding is invalid") from exc
 
 
 def _action_result_to_wire(result: ActionResult) -> dict[str, object]:
@@ -444,11 +455,15 @@ class GateRpcDispatcher:
                 ]
             if operation == "stage_action":
                 fields = _object(payload, frozenset({"binding"}))
-                return self.service.stage_action(_action_from_wire(fields["binding"]))
+                return self.service.stage_action(
+                    _action_from_wire(fields["binding"], allow_legacy_public=True)
+                )
             if operation == "submit_action":
                 fields = _object(payload, frozenset({"binding"}))
                 return _action_result_to_wire(
-                    self.service.submit_action(_action_from_wire(fields["binding"]))
+                    self.service.submit_action(
+                        _action_from_wire(fields["binding"], allow_legacy_public=True)
+                    )
                 )
             if operation == "activate_receipt":
                 fields = _object(

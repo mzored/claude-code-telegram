@@ -31,7 +31,6 @@ from src.policy_gate.types import (
     Scope,
     TrustedReference,
     canonical_json,
-    digest,
 )
 
 _PURPOSES: dict[Operation, tuple[str, str]] = {
@@ -108,6 +107,19 @@ class PolicyGateService:
     def _action_lock(self, action_id: str) -> threading.Lock:
         with self._locks_guard:
             return self._action_locks.setdefault(action_id, threading.Lock())
+
+    @staticmethod
+    def _stored_binding(value: object, *, allow_legacy_public: bool) -> ActionBinding:
+        """Load a new binding or one verified pre-origin public envelope."""
+
+        if not isinstance(value, dict):
+            raise ValueError("stored action binding is invalid")
+        try:
+            return ActionBinding.from_dict(value)
+        except (TypeError, ValueError):
+            if not allow_legacy_public:
+                raise
+        return ActionBinding.from_legacy_public_dict(value)
 
     def register_subject(self, subject_id: str, references: Mapping[str, str]) -> None:
         if not subject_id or not references:
@@ -209,13 +221,15 @@ class PolicyGateService:
                 return False
             existing = connection.execute(
                 """SELECT binding_digest, provenance, external_link_identity,
-                          external_source_digest
+                          external_source_digest, binding_json
                    FROM candidate_actions WHERE action_id=?""",
                 (binding.action_id,),
             ).fetchone()
             if existing is not None:
                 return (
                     str(existing["binding_digest"]) == binding.binding_digest
+                    and str(existing["binding_json"])
+                    == canonical_json(binding.as_dict())
                     and str(existing["provenance"]) == provenance.value
                     and (
                         provenance is CandidateProvenance.ORDINARY_PUBLIC
@@ -228,6 +242,11 @@ class PolicyGateService:
                         )
                     )
                 )
+            if binding.uses_legacy_public_identity:
+                # A pre-origin identity is recoverable only when the migrated
+                # candidate already proves it.  No post-upgrade caller may
+                # manufacture a second origin-free action ID.
+                return False
             connection.execute(
                 """INSERT INTO candidate_actions(
                        action_id, binding_digest, binding_json, subject_id, created_at,
@@ -306,7 +325,11 @@ class PolicyGateService:
             raise ValueError("exact action reference is not staged")
         try:
             provenance = CandidateProvenance(str(row["provenance"]))
-            binding = ActionBinding.from_dict(json.loads(str(row["binding_json"])))
+            value = json.loads(str(row["binding_json"]))
+            binding = self._stored_binding(
+                value,
+                allow_legacy_public=(provenance is CandidateProvenance.ORDINARY_PUBLIC),
+            )
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError("staged exact action is invalid") from exc
         if not binding.verify() or binding.subject_id != subject_id:
@@ -960,7 +983,9 @@ class PolicyGateService:
                     if not isinstance(exact, dict):
                         return AdminResult("denied")
                     try:
-                        exact_binding = ActionBinding.from_dict(exact)
+                        exact_binding = self._stored_binding(
+                            exact, allow_legacy_public=True
+                        )
                     except (TypeError, ValueError):
                         return AdminResult("denied")
                     if (
@@ -1020,7 +1045,9 @@ class PolicyGateService:
                             exact_binding = (
                                 None
                                 if exact is None
-                                else ActionBinding.from_dict(exact)
+                                else self._stored_binding(
+                                    exact, allow_legacy_public=True
+                                )
                             )
                         except (TypeError, ValueError):
                             return AdminResult("denied")
@@ -1542,10 +1569,47 @@ class PolicyGateService:
     ) -> ActionResult:
         """Public RPC execution accepts only public-sender bindings."""
 
-        if binding.origin is not ActionOrigin.PUBLIC_SENDER:
+        if binding.origin is not ActionOrigin.PUBLIC_SENDER or (
+            binding.uses_legacy_public_identity
+            and not self._legacy_public_binding_is_recoverable(binding)
+        ):
             return ActionResult("denied", binding.action_id)
         with self._action_lock(binding.action_id):
             return self._submit_locked(binding, ActionOrigin.PUBLIC_SENDER, crash_hook)
+
+    def _legacy_public_binding_is_recoverable(self, binding: ActionBinding) -> bool:
+        """Require a durable Unit 3 record before accepting old wire identity.
+
+        An origin-free binding can only represent an already-persisted Unit 3
+        candidate or journal.  Fresh callers must use the explicit public
+        origin form, so no RPC or recovery path can create an owner-external
+        effect by omitting an origin.
+        """
+
+        if not binding.uses_legacy_public_identity:
+            return True
+        stored_json = canonical_json(binding.as_dict())
+        candidate = self.store.database.execute(
+            """SELECT binding_digest FROM candidate_actions WHERE action_id=?
+               AND provenance='ordinary_public'
+               AND external_link_identity IS NULL
+               AND external_source_digest IS NULL AND binding_json=?""",
+            (binding.action_id, stored_json),
+        ).fetchone()
+        if (
+            candidate is not None
+            and str(candidate["binding_digest"]) == binding.binding_digest
+        ):
+            return True
+        journal = self.store.database.execute(
+            """SELECT binding_digest FROM action_journal WHERE action_id=?
+               AND origin=? AND binding_json=?""",
+            (binding.action_id, ActionOrigin.PUBLIC_SENDER.value, stored_json),
+        ).fetchone()
+        return (
+            journal is not None
+            and str(journal["binding_digest"]) == binding.binding_digest
+        )
 
     def _submit_owner_external_action(self, binding: ActionBinding) -> ActionResult:
         """Execute only from a confirmed external exact-intent commit path."""
@@ -1788,9 +1852,7 @@ class PolicyGateService:
     def reconcile_action(self, action_id: str) -> ActionResult:
         """Public reconciliation is intentionally limited to public-origin work."""
 
-        return self._reconcile_action_for_origin(
-            action_id, ActionOrigin.PUBLIC_SENDER, allow_legacy_owner_binding=False
-        )
+        return self._reconcile_action_for_origin(action_id, ActionOrigin.PUBLIC_SENDER)
 
     def _reconcile_owner_external_for_erasure(self, action_id: str) -> ActionResult:
         """Settle one pre-existing external effect while erasure is pending.
@@ -1800,16 +1862,12 @@ class PolicyGateService:
         and has no route to action claiming, authority lookup, or execution.
         """
 
-        return self._reconcile_action_for_origin(
-            action_id, ActionOrigin.OWNER_EXTERNAL, allow_legacy_owner_binding=True
-        )
+        return self._reconcile_action_for_origin(action_id, ActionOrigin.OWNER_EXTERNAL)
 
     def _reconcile_action_for_origin(
         self,
         action_id: str,
         expected_origin: ActionOrigin,
-        *,
-        allow_legacy_owner_binding: bool,
     ) -> ActionResult:
         with self._action_lock(action_id):
             row = self.store.database.execute(
@@ -1824,7 +1882,6 @@ class PolicyGateService:
             binding = self._journal_binding_for_reconciliation(
                 row,
                 expected_origin,
-                allow_legacy_owner_binding=allow_legacy_owner_binding,
             )
             if binding is None:
                 # A malformed owner-external legacy journal is retained as
@@ -1851,8 +1908,6 @@ class PolicyGateService:
         self,
         row: Any,
         expected_origin: ActionOrigin,
-        *,
-        allow_legacy_owner_binding: bool,
     ) -> ActionBinding | None:
         """Validate a durable binding without ever assigning or changing origin."""
 
@@ -1864,74 +1919,19 @@ class PolicyGateService:
         if not isinstance(value, dict):
             return None
         try:
-            binding = ActionBinding.from_dict(value)
-        except (TypeError, ValueError):
-            binding = None
-        if binding is not None:
-            if (
-                binding.origin is expected_origin
-                and binding.action_id == action_id
-                and binding.binding_digest == str(row["binding_digest"])
-                and binding.subject_id == str(row["subject_id"])
-                and binding.operation.value == str(row["operation"])
-                and binding.verify()
-                and self._validate_arguments(binding)
-            ):
-                return binding
-            return None
-        if (
-            expected_origin is not ActionOrigin.OWNER_EXTERNAL
-            or not allow_legacy_owner_binding
-        ):
-            return None
-        return self._legacy_owner_external_binding(row, value)
-
-    def _legacy_owner_external_binding(
-        self, row: Any, value: dict[str, object]
-    ) -> ActionBinding | None:
-        """Read, but never re-authorize, one pre-origin journal envelope.
-
-        The v2-to-v3 migration deliberately labels unknown legacy journals
-        owner-external.  Their old action identifier did not include an origin,
-        so they are usable solely by the internal erasure reconciler after a
-        complete verification of their legacy canonical bytes.
-        """
-
-        expected_fields = {
-            "action_id",
-            "subject_id",
-            "connection_id",
-            "conversation_id",
-            "update_id",
-            "request_id",
-            "operation",
-            "arguments",
-            "processing_authorization_version",
-            "processing_authorization_revision",
-            "processor_purpose",
-        }
-        if set(value) != expected_fields:
-            return None
-        old_action_id = value.get("action_id")
-        legacy_fields = dict(value)
-        legacy_fields.pop("action_id")
-        if (
-            not isinstance(old_action_id, str)
-            or old_action_id != str(row["action_id"])
-            or digest(legacy_fields) != old_action_id
-            or digest(legacy_fields) != str(row["binding_digest"])
-        ):
-            return None
-        value_with_origin = dict(value)
-        value_with_origin["origin"] = ActionOrigin.OWNER_EXTERNAL.value
-        try:
-            binding = ActionBinding.from_dict(value_with_origin)
+            binding = self._stored_binding(
+                value,
+                allow_legacy_public=(expected_origin is ActionOrigin.PUBLIC_SENDER),
+            )
         except (TypeError, ValueError):
             return None
         if (
-            binding.action_id != str(row["action_id"])
+            binding.origin is not expected_origin
+            or binding.action_id != action_id
+            or binding.binding_digest != str(row["binding_digest"])
             or binding.subject_id != str(row["subject_id"])
             or binding.operation.value != str(row["operation"])
+            or not binding.verify()
             or not self._validate_arguments(binding)
         ):
             return None

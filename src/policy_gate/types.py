@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Mapping
 
@@ -154,6 +154,16 @@ class ActionBinding:
     processing_authorization_revision: int
     processor_purpose: str
     origin: ActionOrigin = ActionOrigin.PUBLIC_SENDER
+    _legacy_public_identity: bool = field(default=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.origin, ActionOrigin):
+            raise ValueError("action origin is invalid")
+        if (
+            self._legacy_public_identity
+            and self.origin is not ActionOrigin.PUBLIC_SENDER
+        ):
+            raise ValueError("legacy action identity must be public")
 
     @classmethod
     def create(
@@ -208,6 +218,17 @@ class ActionBinding:
         )
 
     @property
+    def uses_legacy_public_identity(self) -> bool:
+        """Whether this is a pre-origin Unit 3 public binding.
+
+        The flag is deliberately not serialised.  It exists only while a
+        trusted durable pre-origin envelope is being recovered, so fresh
+        callers cannot choose an origin-free external identity.
+        """
+
+        return self._legacy_public_identity
+
+    @property
     def payload_digest(self) -> str:
         return digest(dict(self.arguments))
 
@@ -230,8 +251,9 @@ class ActionBinding:
             "processing_authorization_version": self.processing_authorization_version,
             "processing_authorization_revision": self.processing_authorization_revision,
             "processor_purpose": self.processor_purpose,
-            "origin": self.origin.value,
         }
+        if not self._legacy_public_identity:
+            value["origin"] = self.origin.value
         if include_action_id:
             value["action_id"] = self.action_id
         return value
@@ -272,6 +294,66 @@ class ActionBinding:
             processor_purpose=str(value["processor_purpose"]),
             origin=origin,
         )
+
+    @classmethod
+    def from_legacy_public_dict(cls, value: Mapping[str, object]) -> "ActionBinding":
+        """Hydrate one exact pre-origin Unit 3 binding as public-only.
+
+        This parser is intentionally separate from :meth:`from_dict`.  New
+        wire and storage envelopes must carry an explicit origin; only a
+        verified migration/recovery path may use the historic origin-free
+        identity format.
+        """
+
+        expected_fields = {
+            "action_id",
+            "subject_id",
+            "connection_id",
+            "conversation_id",
+            "update_id",
+            "request_id",
+            "operation",
+            "arguments",
+            "processing_authorization_version",
+            "processing_authorization_revision",
+            "processor_purpose",
+        }
+        if set(value) != expected_fields:
+            raise ValueError("legacy action binding fields are invalid")
+        arguments = value.get("arguments")
+        conversation_id = value.get("conversation_id")
+        update_id = value.get("update_id")
+        if not isinstance(arguments, dict):
+            raise ValueError("stored action arguments are invalid")
+        if not isinstance(conversation_id, int) or not isinstance(update_id, int):
+            raise ValueError("stored action envelope is invalid")
+        authorization_revision = value.get("processing_authorization_revision")
+        if (
+            not isinstance(authorization_revision, int)
+            or isinstance(authorization_revision, bool)
+            or authorization_revision <= 0
+        ):
+            raise ValueError("stored action authorization revision is invalid")
+        binding = cls(
+            action_id=str(value["action_id"]),
+            subject_id=str(value["subject_id"]),
+            connection_id=str(value["connection_id"]),
+            conversation_id=conversation_id,
+            update_id=update_id,
+            request_id=str(value["request_id"]),
+            operation=Operation(str(value["operation"])),
+            arguments=arguments,
+            processing_authorization_version=str(
+                value["processing_authorization_version"]
+            ),
+            processing_authorization_revision=authorization_revision,
+            processor_purpose=str(value["processor_purpose"]),
+            origin=ActionOrigin.PUBLIC_SENDER,
+            _legacy_public_identity=True,
+        )
+        if not binding.verify():
+            raise ValueError("legacy action binding identity is invalid")
+        return binding
 
 
 @dataclass(frozen=True)

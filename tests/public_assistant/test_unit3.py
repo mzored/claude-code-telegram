@@ -18,6 +18,8 @@ from src.policy_gate.types import (
     Operation,
     Scope,
     TrustedReference,
+    canonical_json,
+    digest,
 )
 from src.private_controller.erasure import ExternalIntentLinkEraseRequest
 from src.private_controller.origin import external_subject_hash
@@ -690,6 +692,73 @@ def test_public_action_state_converges_after_retry_and_unresolved_is_retained(
     assert store.action_state(action.action_id) == "succeeded"
     assert store.expire_unit3() == 0
     store.close()
+
+
+def test_preorigin_public_intent_reuses_its_exact_legacy_binding(
+    tmp_path: Path,
+) -> None:
+    """A Unit 3 retry must not change the durable action identity after upgrade."""
+
+    store = Unit3Store(tmp_path / "public", PENDING_KEY, PUBLIC_KEY, PSEUDONYM_KEY)
+    message = inbound(44)
+    request_id = "REQ-LEGACY-RETRY"
+    arguments = {"title": "Recover existing Unit 3 action", "due_date": None}
+    subject = store.subject_ref(
+        message.connection_id, message.conversation_id, message.sender_id
+    )
+    current = ActionBinding.create(
+        subject_id=subject,
+        connection_id=message.connection_id,
+        conversation_id=message.conversation_id,
+        update_id=message.update_id,
+        request_id=request_id,
+        operation=Operation.TASK_CREATE,
+        arguments=arguments,
+        processing_authorization_version="integration-v2",
+        processing_authorization_revision=2,
+        processor_purpose="external task creation",
+    )
+    legacy_fields = current.as_dict(include_action_id=False)
+    legacy_fields.pop("origin")
+    legacy_id = digest(legacy_fields)
+    legacy = ActionBinding.from_legacy_public_dict(
+        {"action_id": legacy_id, **legacy_fields}
+    )
+    now = store.now()
+    try:
+        with store.public.transaction() as connection:
+            connection.execute(
+                """INSERT INTO public_action_intents VALUES
+                   (?, ?, ?, ?, ?, ?, ?, ?, ?, 'uncertain', 'uncertain', ?, ?, ?)""",
+                (
+                    legacy.action_id,
+                    message.update_id,
+                    subject,
+                    request_id,
+                    Operation.TASK_CREATE.value,
+                    canonical_json(arguments),
+                    "integration-v2",
+                    2,
+                    legacy.processor_purpose,
+                    now,
+                    now,
+                    now + 3600,
+                ),
+            )
+        recovered = store.prepare_action(
+            message,
+            request_id,
+            Operation.TASK_CREATE,
+            arguments,
+            "integration-v2",
+            2,
+            3600,
+        )
+        assert recovered.uses_legacy_public_identity
+        assert recovered.action_id == legacy.action_id
+        assert recovered.as_dict() == legacy.as_dict()
+    finally:
+        store.close()
 
 
 def test_unit3_runtime_boundary_is_disabled_by_default(tmp_path: Path) -> None:

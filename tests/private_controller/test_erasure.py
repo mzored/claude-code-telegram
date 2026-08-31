@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import pytest
 
+import src.private_controller.erasure as erasure_module
 from src.external_read import (
     ExternalRecord,
     ExternalRecordRef,
@@ -94,7 +95,6 @@ def _raw_request(socket_path: Path, payload: object) -> dict[str, object]:
     try:
         connection.connect(str(socket_path))
         connection.sendall(canonical_json(payload).encode("utf-8") + b"\n")
-        connection.shutdown(socket.SHUT_WR)
         response = bytearray()
         while b"\n" not in response:
             chunk = connection.recv(4096)
@@ -119,6 +119,54 @@ def _server(
         public_pid=os.getpid(),
         client_gid=os.getgid(),
     )
+
+
+def test_controller_erasure_client_uses_newline_without_half_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ImmediateResponseSocket:
+        def __init__(self) -> None:
+            self.sent: list[bytes] = []
+            self.closed = False
+
+        def set_inheritable(self, inheritable: bool) -> None:
+            assert not inheritable
+
+        def settimeout(self, timeout: float) -> None:
+            assert timeout == 3.0
+
+        def connect(self, address: str) -> None:
+            assert address == str(
+                (Path("/tmp") / "assist-ai-erasure-test.sock").resolve()
+            )
+
+        def sendall(self, payload: bytes) -> None:
+            self.sent.append(payload)
+
+        def shutdown(self, how: int) -> None:
+            raise AssertionError("newline-framed client must not half-close")
+
+        def recv(self, size: int) -> bytes:
+            assert size > 0
+            return b'{"ok":true,"result":null}\n'
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = ImmediateResponseSocket()
+    monkeypatch.setattr(
+        erasure_module.socket, "socket", lambda *_args, **_kwargs: connection
+    )
+
+    client = ControllerExternalErasureRpcClient(
+        (Path("/tmp") / "assist-ai-erasure-test.sock").resolve()
+    )
+    client.erase_external_links(ExternalIntentLinkEraseRequest("a" * 64))
+
+    assert connection.sent == [
+        b'{"subject_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","version":1}\n'
+    ]
+    assert connection.closed
 
 
 def test_ledger_erasure_scrubs_only_matching_links_and_blocks_stale_activation(

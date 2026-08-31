@@ -216,7 +216,6 @@ class ControllerExternalErasureRpcClient(ExternalIntentLinkEraser):
                         "subject_hash": request.subject_hash,
                     },
                 )
-                connection.shutdown(socket.SHUT_WR)
                 response = _read_frame(connection)
             except (OSError, ValueError) as exc:
                 raise ExternalIntentLinkErasureError(

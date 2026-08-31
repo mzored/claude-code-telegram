@@ -305,13 +305,22 @@ class Unit3Store(Unit2Store):
                 (message.update_id,),
             ).fetchone()
             if row is not None:
-                if str(row["action_id"]) != binding.action_id or str(
-                    row["arguments_json"]
-                ) != canonical_json(dict(arguments)):
+                if str(row["arguments_json"]) != canonical_json(dict(arguments)):
                     raise ValueError(
                         "one update cannot change its durable action binding"
                     )
-                return binding
+                existing_action_id = str(row["action_id"])
+                if existing_action_id == binding.action_id:
+                    return binding
+                legacy_fields = binding.as_dict()
+                legacy_fields.pop("origin")
+                legacy_fields["action_id"] = existing_action_id
+                try:
+                    return ActionBinding.from_legacy_public_dict(legacy_fields)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "one update cannot change its durable action binding"
+                    ) from exc
             connection.execute(
                 """INSERT INTO public_action_intents VALUES
                    (?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL, ?, ?, ?)""",

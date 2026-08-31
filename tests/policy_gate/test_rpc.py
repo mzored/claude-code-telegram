@@ -21,6 +21,7 @@ from src.policy_gate.rpc import (
     GateRpcProtocolError,
     GateRpcRejectedError,
     PublicGateRpcClient,
+    _action_from_wire,
 )
 from src.policy_gate.service import PolicyConfig, PolicyGateService
 from src.policy_gate.store import GateStore
@@ -35,6 +36,7 @@ from src.policy_gate.types import (
     Scope,
     TrustedReference,
     canonical_json,
+    digest,
 )
 
 GATE_KEY = "rpc-gate-key-" + "r" * 40
@@ -122,6 +124,34 @@ def _raw_request(path: Path, wire: bytes) -> dict[str, object]:
 def test_canonical_json_rejects_duplicate_keys_after_unicode_normalization() -> None:
     with pytest.raises(ValueError, match="normalization"):
         canonical_json({"\u00e9": 1, "e\u0301": 2})
+
+
+def test_legacy_public_wire_requires_the_narrow_public_compatibility_path() -> None:
+    current = ActionBinding.create(
+        subject_id="subject-legacy-rpc",
+        connection_id="connection-rpc",
+        conversation_id=202002,
+        update_id=51,
+        request_id="REQ-LEGACY-RPC",
+        operation=Operation.TASK_CREATE,
+        arguments={"title": "Recover old public action", "due_date": None},
+        processing_authorization_version="integration-v2",
+        processing_authorization_revision=2,
+        processor_purpose="external task creation",
+    )
+    fields = current.as_dict(include_action_id=False)
+    fields.pop("origin")
+    legacy_wire = {"action_id": digest(fields), **fields}
+
+    # Controller/external routes use the default strict parser and cannot
+    # interpret a missing origin as owner_external.
+    with pytest.raises(GateRpcProtocolError):
+        _action_from_wire(legacy_wire)
+
+    recovered = _action_from_wire(legacy_wire, allow_legacy_public=True)
+    assert recovered.uses_legacy_public_identity
+    assert recovered.origin is ActionOrigin.PUBLIC_SENDER
+    assert recovered.as_dict() == legacy_wire
 
 
 def test_mocked_gate_process_enforces_rpc_and_peer_boundary(tmp_path: Path) -> None:
