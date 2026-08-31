@@ -34,10 +34,9 @@ chmod 600 .env
 install -d -m 700 data "$HOME/.config/systemd/user"
 find data -type d -exec chmod 700 {} +
 find data -type f \( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -exec chmod 600 {} +
-ops/sync-production-env.sh
-[[ -x .venv/bin/python ]]
 install -m 644 ops/systemd/assist-ai-bot.service "$HOME/.config/systemd/user/assist-ai-bot.service"
 systemctl --user daemon-reload
+ops/remote-deploy.sh deploy "$(git rev-parse HEAD)"
 systemctl --user enable assist-ai-bot.service
 restarts_before=$(systemctl --user show assist-ai-bot.service -p NRestarts --value)
 systemctl --user restart assist-ai-bot.service
@@ -46,7 +45,7 @@ for _ in {1..10}; do
     systemctl --user is-active --quiet assist-ai-bot.service
 done
 [[ $(systemctl --user show assist-ai-bot.service -p NRestarts --value) == "$restarts_before" ]]
-[[ $(systemctl --user show assist-ai-bot.service -p WorkingDirectory --value) == "$canonical_repo" ]]
+[[ $(systemctl --user show assist-ai-bot.service -p WorkingDirectory --value) == "$canonical_repo/current" ]]
 exec_start=$(systemctl --user show assist-ai-bot.service -p ExecStart --value)
-[[ $exec_start == *"path=$canonical_repo/.venv/bin/python"* ]]
+[[ $exec_start == *"path=$canonical_repo/current/.venv/bin/python"* ]]
 echo "INSTALLED_SHA=$(git rev-parse HEAD)"

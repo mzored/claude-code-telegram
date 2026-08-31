@@ -105,6 +105,10 @@ celerybeat.pid
 .env
 .venv
 .venv.next.*
+releases/
+current
+.current.next.*
+.deploy-transaction
 env/
 venv/
 ENV/
