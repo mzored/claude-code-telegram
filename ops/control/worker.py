@@ -384,6 +384,7 @@ class RealSystemd:
         ):
             raise ActivationError("service restarted before stabilization began")
         deadline = time.monotonic() + self.stabilization_seconds
+        runtime_error = "bot MainPID did not reach the selected release"
         while True:
             properties = self._properties()
             if (
@@ -405,20 +406,26 @@ class RealSystemd:
                 cwd = Path(f"/proc/{pid}/cwd").resolve()
                 cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
             except OSError as error:
-                raise ActivationError("could not inspect the bot MainPID") from error
-            if cwd != release_path:
-                raise ActivationError(
-                    "bot MainPID working directory is not the selected release"
-                )
-            expected_python = str(release_path / ".venv/bin/python").encode()
-            if expected_python not in cmdline:
-                raise ActivationError(
-                    "bot MainPID command does not use the selected interpreter"
-                )
+                runtime_error = f"could not inspect the bot MainPID: {error}"
+            else:
+                if cwd != release_path:
+                    runtime_error = (
+                        "bot MainPID working directory is not the selected release"
+                    )
+                else:
+                    expected_python = str(release_path / ".venv/bin/python").encode()
+                    if expected_python not in cmdline:
+                        runtime_error = (
+                            "bot MainPID command does not use the selected interpreter"
+                        )
+                    else:
+                        runtime_error = ""
             if time.monotonic() >= deadline:
                 final_restarts = int(properties.get("NRestarts", "-1"))
                 if final_restarts != initial_restarts:
                     raise ActivationError("service restarted during stabilization")
+                if runtime_error:
+                    raise ActivationError(runtime_error)
                 return final_restarts
             time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
