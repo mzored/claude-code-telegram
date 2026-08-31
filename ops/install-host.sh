@@ -1,51 +1,64 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-source "$repo_dir/ops/deploy-common.sh"
-CANONICAL_ORIGIN=https://github.com/mzored/claude-code-telegram.git
-canonical_repo="$HOME/projects/assist-ai/bot"
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ssh_bin=${SSH_BIN:-ssh}
+host=mybots
+origin=https://github.com/mzored/claude-code-telegram.git
 
-if [[ $(uname -s) != Linux ]]; then
-    echo "error: host installation is Linux-only" >&2
+if [[ -n $(git -C "$repo" status --porcelain --untracked-files=normal) ]]; then
+    echo "error: host bootstrap requires a clean local checkout" >&2
+    exit 1
+fi
+if [[ $(git -C "$repo" remote get-url origin) != "$origin" ]]; then
+    echo "error: bootstrap origin must be $origin" >&2
+    exit 1
+fi
+local_head=$(git -C "$repo" rev-parse HEAD)
+remote_main=$(git -C "$repo" ls-remote origin refs/heads/main | awk '{print $1}')
+if [[ $local_head != "$remote_main" ]]; then
+    echo "error: bootstrap must run from the exact current origin/main commit" >&2
     exit 1
 fi
 
-cd "$repo_dir"
-if [[ $(readlink -f "$repo_dir") != "$canonical_repo" ]]; then
-    echo "error: host checkout must be $canonical_repo" >&2
+bootstrap_output=$(
+    tar -C "$repo" -cf - \
+        ops/__init__.py \
+        ops/control/__init__.py \
+        ops/control/bootstrap.py \
+        ops/control/integrity.py \
+        ops/control/launcher.py \
+        ops/control/manifest.py \
+        ops/control/state.py \
+        ops/control/worker.py \
+        ops/systemd/assist-ai-bot.service \
+        ops/systemd/assist-ai-recover.service \
+        ops/systemd/assist-ai-activation.service \
+        ops/systemd/assist-ai-activation.path |
+        "$ssh_bin" "$host" 'set -e; stage=$(mktemp -d); trap '\''rm -rf "$stage"'\'' EXIT; tar -xf - -C "$stage"; /usr/bin/python3 "$stage/ops/control/bootstrap.py" prepare-legacy'
+)
+printf '%s\n' "$bootstrap_output"
+legacy_sha=$(sed -n 's/^LEGACY_SHA=//p' <<<"$bootstrap_output")
+cutover_action=$(sed -n 's/^CUTOVER_ACTION=//p' <<<"$bootstrap_output")
+if [[ ! $legacy_sha =~ ^[0-9a-f]{40}$ ]]; then
+    echo "error: mybots did not report the inspected legacy commit" >&2
     exit 1
 fi
-if [[ $(git config --get remote.origin.url 2>/dev/null || true) != "$CANONICAL_ORIGIN" ]]; then
-    echo "error: origin URL must be $CANONICAL_ORIGIN" >&2
+if [[ $cutover_action != deploy && $cutover_action != retire && $cutover_action != complete ]]; then
+    echo "error: mybots did not report a valid durable cutover action" >&2
     exit 1
 fi
-require_clean_checkout
-git fetch --quiet origin main
-require_nondivergent_checkout
-require_origin_commit "$(git rev-parse HEAD)"
 
-if [[ ! -f .env ]]; then
-    echo "error: create the production .env on this host before installation" >&2
-    exit 1
+if [[ $cutover_action == deploy ]]; then
+    "$repo/ops/deploy.sh" deploy "$legacy_sha"
 fi
-
-chmod 600 .env
-install -d -m 700 data "$HOME/.config/systemd/user"
-find data -type d -exec chmod 700 {} +
-find data -type f \( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -exec chmod 600 {} +
-install -m 644 ops/systemd/assist-ai-bot.service "$HOME/.config/systemd/user/assist-ai-bot.service"
-systemctl --user daemon-reload
-ops/remote-deploy.sh deploy "$(git rev-parse HEAD)"
-systemctl --user enable assist-ai-bot.service
-restarts_before=$(systemctl --user show assist-ai-bot.service -p NRestarts --value)
-systemctl --user restart assist-ai-bot.service
-for _ in {1..10}; do
-    sleep 1
-    systemctl --user is-active --quiet assist-ai-bot.service
-done
-[[ $(systemctl --user show assist-ai-bot.service -p NRestarts --value) == "$restarts_before" ]]
-[[ $(systemctl --user show assist-ai-bot.service -p WorkingDirectory --value) == "$canonical_repo/current" ]]
-exec_start=$(systemctl --user show assist-ai-bot.service -p ExecStart --value)
-[[ $exec_start == *"path=$canonical_repo/current/.venv/bin/python"* ]]
-echo "INSTALLED_SHA=$(git rev-parse HEAD)"
+if [[ $cutover_action != complete ]]; then
+    retire_output=$(
+        "$ssh_bin" "$host" /usr/bin/python3 \
+            /home/mzored/.local/lib/assist-ai/control/v1/ops/control/worker.py \
+            retire-legacy "$legacy_sha"
+    )
+    printf '%s\n' "$retire_output"
+    grep -Fxq "RETIRED_LEGACY_SHA=$legacy_sha" <<<"$retire_output"
+fi
+echo "INSTALLED_SHA=$legacy_sha"

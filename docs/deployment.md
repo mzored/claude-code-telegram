@@ -1,72 +1,144 @@
 # Deploying to `mybots`
 
-`mybots` is a deploy-only Linux host. Development, lock updates, tests, commits, and
-pushes happen on the local Mac. Production keeps its own `.env` and `data/`; neither
-is copied back into Git.
+`mybots` runs production. It does not host a development checkout, create commits,
+update lockfiles, run tests, or execute deployment files from the commit being
+deployed. Development and deployment control stay in a clean local macOS or Linux
+checkout.
 
-## One-time host installation
+## Production layout
 
-The host must already have Linux, Python 3.11 or 3.12, Claude Code authentication, and
-a clean clone from `https://github.com/mzored/claude-code-telegram.git` at
-`/home/mzored/projects/assist-ai/bot`. The tracked bootstrap installs Poetry 2.4.1 into
-the control-checkout cache, builds a complete environment inside an immutable release,
-and atomically points `current` at that release; no global Poetry is needed. On the
-first immutable deployment, an existing checkout `.venv` is retained in a complete
-rollback release. Create `.env` from
-`config/env.production.example`, insert production values directly on the host, then
-run:
+The one-time bootstrap installs a stable control plane and two permanent release
+slots:
+
+```text
+~/.local/lib/assist-ai/control/v1/ops/control/  launcher and activation worker
+~/.local/lib/assist-ai/releases/slot-a/         final release path
+~/.local/lib/assist-ai/releases/slot-b/         final release path
+~/.local/state/assist-ai/active.json            durable release selection
+~/.local/state/assist-ai/activation-request.json
+~/projects/assist-ai/bot/.env                    server-owned credentials
+~/projects/assist-ai/bot/data/                   server-owned data
+```
+
+The two release directory names never change. Poetry creates each virtual environment
+inside its final slot, so its absolute interpreter paths remain valid. At most the
+running release and one other release occupy the server. Building a new candidate
+retires the older rollback slot first; a failed build never changes the running slot.
+
+The stable systemd unit starts the stable launcher. The launcher reads `active.json`,
+accepts only `legacy`, `slot-a`, or `slot-b`, verifies the selected ready manifest,
+then executes that release. An application deploy never replaces or reloads the unit.
+
+## First cutover from the legacy checkout
+
+Run the bootstrap from a clean local checkout after the change has merged and all
+required checks are green:
 
 ```bash
-chmod 600 .env
 ./ops/install-host.sh
 ```
 
-The installer installs production dependencies from `poetry.lock`, installs the
-tracked user unit, sets `.env` to `0600`, `data/` to `0700`, databases to `0600`, and
-enables `assist-ai-bot.service`. It refuses non-Linux hosts, dirty checkouts, and
-commits that are not on `origin/main`.
+Before this command, the existing host must still have:
+
+- A clean checkout at `/home/mzored/projects/assist-ai/bot` whose `origin` is this
+  fork and whose current commit is on its existing `origin/main` ref.
+- Its working `.venv`, `.env`, and `data/` directory.
+- An active user systemd manager.
+
+The local bootstrap streams only the reviewed stable controller and unit bundle to a
+temporary directory. The host performs all preflight checks before changing its unit.
+It installs the launcher and recovery units first, writes a durable `legacy` selection,
+and atomically installs the bot unit last. Every on-disk prefix remains bootable: a
+reboot sees either the old unit, or a complete new unit with a valid legacy selection.
+
+The bootstrap changes the relative SQLite URL to the absolute stable data path,
+restricts `.env` and data permissions, and preserves the bot unit's prior enabled and
+active state. It then deploys the live SHA fresh into `slot-a`. After the same-SHA
+release passes runtime stabilization, it removes tracked application files, `.git`,
+the legacy `.venv`, and old deployment caches. `.env`, `data/`, and any unrelated
+untracked server configuration remain in place. Interrupted cleanup is idempotent.
+
+Do not run the bootstrap against a partially repaired release layout. It refuses an
+existing state that does not match the inspected legacy commit.
 
 ## Deploy an exact commit
 
-Run deployments from a clean local checkout after the pull request has merged. Use
-the full 40-character commit ID from `origin/main`:
+The commit must be a full lowercase SHA already reachable from `origin/main`:
 
 ```bash
-git fetch origin main
 ./ops/deploy.sh deploy <full-commit-sha>
 ```
 
-The local and remote preflight checks both require clean, non-divergent Git state.
-The deployment target is always the `mybots` host and its canonical checkout; caller
-arguments cannot select a different host or repository. The host fetches but never
-pushes. It archives the requested reviewed commit into a final immutable release
-directory, builds that release's `.venv` before stopping the service, and then
-atomically replaces the same-filesystem `current` symlink. The unit always starts
-`current/.venv/bin/python`, so it is stable across release directories. The host
-rejects a cutover when free disk cannot hold the current release, candidate release,
-and reserve, and removes failed candidate and transaction files. A failed release
-restores the prior `current` pointer and the separately saved unit directly, then
-reloads systemd and restores the prior enabled and active service state. The rollback
-code never runs a helper from the failed target or renames a live environment. Targets
-older than the automation may not contain a unit; in that case the already-installed
-canonical unit remains in place. A mismatched handshake fails the deployment.
+The controller:
 
-The first deploy from an older mutable checkout can fail because that checkout has a
-local-only commit or uncommitted file. Preserve or integrate that work before retrying;
-the deploy script will not discard it.
+1. Captures the caller checkout's HEAD, index, tracked diff, and untracked status.
+2. Fetches `origin/main` into a temporary bare repository, not the caller checkout.
+3. Verifies the exact commit and exports its Git tree as a tar archive.
+4. Streams the archive to the installed worker on the fixed `mybots` host.
+5. Requires a matching `DEPLOYED_SHA=<sha>` receipt and the unchanged checkout
+   identity.
+
+The worker extracts only regular files, directories, and safe relative symlinks. It
+rejects credentials, persistent data, path traversal, hard links, and special files.
+It installs locked production dependencies with stable Poetry 2.4.1 and `--no-root`.
+It does not run a target helper, import `src.main`, or read a target unit.
+
+The worker records file contents, modes, symlink targets, archive digest, exact SHA,
+Git tree, Python identity, builder identity, and allocated bytes. It writes the ready
+marker last and makes the release read-only. It measures free space after the real
+build and refuses activation if the 512 MiB reserve is not present.
+
+## Activation and recovery
+
+An activation request is a new immutable JSON file. The activation worker atomically
+changes the complete selection record to `pending`, asks systemd for one bot restart,
+and verifies the real `MainPID` for ten seconds. Verification includes:
+
+- Expected unit `FragmentPath` and `NeedDaemonReload=no`.
+- Active and running service state.
+- `/proc/<MainPID>/cwd` matching the selected slot.
+- `/proc/<MainPID>/cmdline` naming that slot's interpreter.
+- No increase in systemd's automatic restart count.
+
+Only then does the worker commit the candidate and keep the old current release as the
+rollback slot. A failed candidate writes `rollback-pending`, restarts the old release,
+verifies it, and commits the restored selection. If rollback cannot stabilize, the
+request and state remain for diagnosis.
+
+The worker uses file `fsync`, atomic same-directory replacement, and parent-directory
+`fsync` for every durable state change. SIGKILL restarts the activation service. On
+reboot, `assist-ai-recover.service` runs before the bot and conservatively restores the
+previous release for an uncommitted activation. A committed selection with a leftover
+request is finalized instead of rolled back.
 
 ## Roll back
 
-Rollback uses the same safeguards and an earlier full commit ID that remains on
-`origin/main`:
+Immediate rollback and historical rollback use the same exact-SHA path:
 
 ```bash
 ./ops/deploy.sh rollback <full-commit-sha>
 ```
 
-Check the named destination after either operation:
+The requested commit may predate all deployment automation. It only needs a compatible
+locked Python project on `origin/main`; no helper or unit from that commit runs.
+
+## Inspect production without changing it
 
 ```bash
-ssh mybots 'systemctl --user status assist-ai-bot.service --no-pager'
-ssh mybots 'readlink -f /home/mzored/projects/assist-ai/bot/current && cat /home/mzored/projects/assist-ai/bot/current/.release-meta'
+ssh mybots 'systemctl --user show assist-ai-bot.service -p ActiveState -p SubState -p MainPID -p NRestarts -p FragmentPath -p NeedDaemonReload'
+ssh mybots 'python3 -m json.tool ~/.local/state/assist-ai/active.json'
+ssh mybots 'ls -l ~/.local/state/assist-ai/receipts/'
 ```
+
+Never copy `.env`, the database, media, or logs into a deployment archive or Git.
+Ordinary deploy and rollback leave the credential and data bytes, inode, owner, and
+mode unchanged.
+
+## Verification contract
+
+`make check` runs the state-machine, SIGKILL, manifest tamper, fixed-slot, measured
+disk, credential/data invariance, and checkout identity tests on macOS and Ubuntu. CI
+also runs `tests/deploy/test_systemd_integration.sh` as root on a disposable Ubuntu
+24.04 runner. That lane requires real systemd 255 and proves the loaded fragment,
+`MainPID` working directory and interpreter, failed-candidate restart, and rollback.
+A fake `systemctl` is not runtime acceptance evidence.

@@ -1,0 +1,9 @@
+[Unit]
+Description=Recover an interrupted assist-ai activation before bot startup
+Before=assist-ai-bot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/lib/assist-ai/control/v1/ops/control/worker.py recover
+RemainAfterExit=yes
+UMask=0077

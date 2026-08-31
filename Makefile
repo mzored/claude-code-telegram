@@ -31,9 +31,9 @@ test:
 	poetry run pytest
 
 lint:
-	poetry run black --check src tests
-	poetry run isort --check-only src tests
-	poetry run flake8 src tests
+	poetry run black --check src tests ops/control
+	poetry run isort --check-only src tests ops/control
+	poetry run flake8 src tests ops/control
 
 typecheck:
 	poetry run mypy src
@@ -42,14 +42,13 @@ check-lock:
 	poetry check --lock
 
 test-deploy:
-	bash tests/deploy/test_deploy.sh
-	bash tests/deploy/test_host_automation.sh
+	poetry run pytest tests/deploy/test_control_plane.py tests/deploy/test_bootstrap.py
 
 check: check-lock lint test test-deploy
 
 format:
-	poetry run black src tests
-	poetry run isort src tests
+	poetry run black src tests ops/control
+	poetry run isort src tests ops/control
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
