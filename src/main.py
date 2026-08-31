@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import logging
+import re
 import signal
 import sys
 from pathlib import Path
@@ -38,6 +39,19 @@ from src.security.validators import SecurityValidator
 from src.storage.facade import Storage
 from src.storage.session_storage import SQLiteSessionStorage
 
+_TELEGRAM_BOT_TOKEN_IN_URL = re.compile(
+    r"(?P<prefix>api\.telegram\.org/(?:file/)?bot)[^/\s\"']+",
+    re.IGNORECASE,
+)
+
+
+class TelegramTokenRedactingFormatter(logging.Formatter):
+    """Remove Telegram bot credentials from rendered log messages."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        rendered = super().format(record)
+        return _TELEGRAM_BOT_TOKEN_IN_URL.sub(r"\g<prefix><redacted>", rendered)
+
 
 def setup_logging(debug: bool = False) -> None:
     """Configure structured logging."""
@@ -49,6 +63,16 @@ def setup_logging(debug: bool = False) -> None:
         format="%(message)s",
         stream=sys.stdout,
     )
+
+    redacting_formatter = TelegramTokenRedactingFormatter("%(message)s")
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(redacting_formatter)
+
+    # httpx logs complete request URLs, and Telegram embeds the bot token in
+    # the URL path. Keep routine transport logs out even in application debug
+    # mode; the formatter above is the backstop for warnings and errors.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     # Configure structlog
     structlog.configure(
