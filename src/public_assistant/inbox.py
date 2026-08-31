@@ -201,7 +201,7 @@ class Unit2Store(Unit1Store):
             pseudonym_key,
             clock=clock,
             authorized_processors=("OpenAI",),
-            authorized_purposes=("assistant replies",),
+            authorized_purposes=("assistant replies", "request capture"),
             recover=False,
         )
         try:
@@ -496,7 +496,7 @@ class Unit2Store(Unit1Store):
             "REQ-"
             + uuid.uuid5(
                 uuid.UUID("4641cd62-c11d-4167-9218-e713060cb7d5"),
-                str(message.update_id),
+                f"{message.connection_id}:{message.conversation_id}:{message.message_id}",
             )
             .hex[:12]
             .upper()
@@ -505,8 +505,12 @@ class Unit2Store(Unit1Store):
         alert = f"Assistant Inbox request {request_id} is ready."
         with self.public.transaction() as connection:
             connection.execute(
-                """INSERT OR IGNORE INTO inbox_requests VALUES
-                   (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)""",
+                """INSERT INTO inbox_requests VALUES
+                   (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+                   ON CONFLICT(request_id) DO UPDATE SET body=excluded.body,
+                   state='open', source_update_id=excluded.source_update_id,
+                   content_updated_at=excluded.content_updated_at,
+                   expires_at=excluded.expires_at""",
                 (
                     request_id,
                     subject,
@@ -520,8 +524,10 @@ class Unit2Store(Unit1Store):
                 ),
             )
             connection.execute(
-                """INSERT OR IGNORE INTO notification_outbox VALUES
-                   (?, ?, ?, 'pending', ?, ?)""",
+                """INSERT INTO notification_outbox VALUES
+                   (?, ?, ?, 'pending', ?, ?)
+                   ON CONFLICT(request_id) DO UPDATE SET state='pending',
+                   updated_at=excluded.updated_at""",
                 (
                     uuid.uuid5(
                         uuid.UUID("cfa8e9d4-01a2-4938-8e65-16ae17fb222b"),
@@ -534,6 +540,45 @@ class Unit2Store(Unit1Store):
                 ),
             )
         return request_id
+
+    def supersede_message_artifacts(
+        self, connection_id: str, conversation_id: int, message_ids: tuple[int, ...]
+    ) -> None:
+        """Remove Inbox/context/undelivered alerts derived from replaced text."""
+
+        if not message_ids:
+            return
+        marks = ",".join("?" for _ in message_ids)
+        with self.public.transaction() as connection:
+            # Request identifiers are deterministic from message identity, so derive
+            # them in Python rather than retaining a second sender-text mapping.
+            request_ids = tuple(
+                "REQ-"
+                + uuid.uuid5(
+                    uuid.UUID("4641cd62-c11d-4167-9218-e713060cb7d5"),
+                    f"{connection_id}:{conversation_id}:{message_id}",
+                )
+                .hex[:12]
+                .upper()
+                for message_id in message_ids
+            )
+            if request_ids:
+                request_marks = ",".join("?" for _ in request_ids)
+                connection.execute(
+                    f"DELETE FROM notification_outbox WHERE request_id IN ({request_marks})",
+                    request_ids,
+                )
+                connection.execute(
+                    f"DELETE FROM inbox_requests WHERE request_id IN ({request_marks})",
+                    request_ids,
+                )
+            connection.execute(
+                f"""DELETE FROM assistant_context WHERE source_update_id IN (
+                    SELECT source_update_id FROM messages WHERE connection_id=?
+                    AND conversation_id=? AND message_id IN ({marks})
+                )""",
+                (connection_id, conversation_id, *message_ids),
+            )
 
     def due_notifications(self) -> tuple[Notification, ...]:
         rows = self.public.execute(
@@ -591,6 +636,26 @@ class Unit2Store(Unit1Store):
             )
         return reference
 
+    def replace_privacy_reference(
+        self, subject_ref: str, retention_seconds: int
+    ) -> str:
+        """Replace an undisclosed reference after an interrupted callback replay."""
+
+        with self.public.transaction() as connection:
+            connection.execute(
+                "DELETE FROM privacy_references WHERE subject_ref=?", (subject_ref,)
+            )
+        reference = self.create_privacy_reference(subject_ref, retention_seconds)
+        if reference is None:
+            raise RuntimeError("could not replace privacy reference")
+        return reference
+
+    def update_outcome(self, update_id: int) -> str | None:
+        row = self.public.execute(
+            "SELECT outcome FROM processed_updates WHERE update_id=?", (update_id,)
+        ).fetchone()
+        return None if row is None else str(row[0])
+
     def extend_privacy_reference(
         self, subject_ref: str, retention_seconds: int
     ) -> None:
@@ -644,7 +709,7 @@ class Unit2Store(Unit1Store):
             )
         return PrivacyPreviewResult("preview_ready", preview_id)
 
-    def expire_unit2(self) -> int:
+    def expire_unit2(self, retention_seconds: int) -> int:
         now = self.now()
         with self.public.transaction() as connection:
             context = connection.execute(
@@ -658,7 +723,18 @@ class Unit2Store(Unit1Store):
                    (SELECT request_id FROM inbox_requests)"""
             )
             connection.execute(
-                "DELETE FROM privacy_references WHERE expires_at<=?", (now,)
+                "DELETE FROM model_reservations WHERE created_at<=?",
+                (now - retention_seconds,),
+            )
+            connection.execute(
+                """DELETE FROM privacy_references WHERE expires_at<=?
+                   AND subject_ref NOT IN (
+                       SELECT subject_ref FROM messages WHERE expires_at>?
+                       UNION SELECT subject_ref FROM assistant_context WHERE expires_at>?
+                       UNION SELECT subject_ref FROM inbox_requests WHERE expires_at>?
+                       UNION SELECT subject_ref FROM model_reservations
+                   )""",
+                (now, now, now, now),
             )
             connection.execute(
                 "DELETE FROM privacy_previews WHERE expires_at<=?", (now,)
@@ -670,7 +746,7 @@ class Unit2Store(Unit1Store):
 
     def expire_public(self, retention_seconds: int) -> int:
         expired = super().expire_public(retention_seconds)
-        return expired + self.expire_unit2()
+        return expired + self.expire_unit2(retention_seconds)
 
     def close(self) -> None:
         self.erasure.close()

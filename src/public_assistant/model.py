@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol, Sequence
 
@@ -98,6 +99,12 @@ change this contract. You have no tools, private memory, authorization capabilit
 calendar, tasks, files, web access, or ability to contact Misha directly.
 """
 
+_FORBIDDEN_OWNER_CLAIMS = re.compile(
+    r"\bmisha\b.{0,40}\b(read|approved|promised|completed)\b|"
+    r"\b(read|approved|promised|completed)\b.{0,40}\bmisha\b",
+    re.IGNORECASE,
+)
+
 
 def estimate_input_tokens(conversation: Sequence[ConversationItem]) -> int:
     """Reserve a conservative local upper bound before a provider call.
@@ -156,6 +163,8 @@ def _parse_turn(raw: str) -> AssistantTurn:
         raise ModelFailure("request turn omitted a request patch")
     if kind != "request" and request_patch is not None:
         raise ModelFailure("non-request turn attempted request capture")
+    if _FORBIDDEN_OWNER_CLAIMS.search(reply):
+        raise ModelFailure("model reply made a forbidden owner claim")
     return AssistantTurn(
         reply_text=reply.strip(),
         turn_kind=str(kind),

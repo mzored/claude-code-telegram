@@ -11,7 +11,12 @@ from src.public_assistant.inbox import Unit2Store
 from src.public_assistant.model import PublicModel
 from src.public_assistant.privacy_log import PrivacyLog
 from src.public_assistant.service import SecretaryService, _language
-from src.public_assistant.types import InboundMessage, ProcessingResult, ReplyRecord
+from src.public_assistant.types import (
+    DeleteNotice,
+    InboundMessage,
+    ProcessingResult,
+    ReplyRecord,
+)
 
 REQUEST_CONFIRMED = {
     "en": "I passed this request to Misha. He will respond directly if appropriate.",
@@ -116,6 +121,27 @@ class AssistantService(SecretaryService):
             return ProcessingResult("privacy", reply)
         return self._process_consented(message)
 
+    def handle_edit(self, message: InboundMessage) -> ProcessingResult:
+        result = super().handle_edit(message)
+        if result.outcome != "consented_body_replaced":
+            return result
+        message_key = self.store.message_key(
+            message.connection_id, message.conversation_id, message.message_id
+        )
+        self.store.cancel_linked_replies(message_key)
+        self.store.supersede_message_artifacts(
+            message.connection_id, message.conversation_id, (message.message_id,)
+        )
+        return self._process_consented(message)
+
+    def handle_delete(self, notice: DeleteNotice) -> ProcessingResult:
+        result = super().handle_delete(notice)
+        if result.outcome == "deleted":
+            self.store.supersede_message_artifacts(
+                notice.connection_id, notice.conversation_id, notice.message_ids
+            )
+        return result
+
     def handle_control(
         self,
         token: str,
@@ -138,16 +164,31 @@ class AssistantService(SecretaryService):
             crash_hook=crash_hook,
         )
         if (
-            result == "accepted"
+            result in {"accepted", "replayed"}
             and control is not None
             and control.action in {"consent", "reconsent"}
         ):
-            reference = self.store.create_privacy_reference(
-                control.subject_ref, self.config.retention_seconds
+            message = (
+                self.store.message_for_key(control.pending_key)
+                if control.pending_key is not None
+                else None
+            )
+            replay_pending = (
+                result == "replayed"
+                and message is not None
+                and self.store.update_outcome(message.update_id) == "received"
+            )
+            reference = (
+                self.store.replace_privacy_reference(
+                    control.subject_ref, self.config.retention_seconds
+                )
+                if replay_pending
+                else self.store.create_privacy_reference(
+                    control.subject_ref, self.config.retention_seconds
+                )
             )
             if control.pending_key is not None:
-                message = self.store.message_for_key(control.pending_key)
-                if message is not None:
+                if message is not None and (result == "accepted" or replay_pending):
                     self._process_consented(message)
             if reference is not None:
                 return f"accepted:{reference}"

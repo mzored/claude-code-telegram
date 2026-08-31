@@ -40,6 +40,7 @@ from src.public_assistant.storage import Unit1Store
 from src.public_assistant.telegram_adapter import TelegramBusinessAdapter
 from src.public_assistant.types import (
     ConnectionObservation,
+    DeleteNotice,
     DeliveryState,
     InboundMessage,
 )
@@ -293,7 +294,7 @@ def test_consent_binds_current_version_and_revocation_stops_next_model_call(
         ).fetchone()
         assert consent is not None
         assert json.loads(consent[0]) == ["OpenAI"]
-        assert json.loads(consent[1]) == ["assistant replies"]
+        assert json.loads(consent[1]) == ["assistant replies", "request capture"]
 
         changed_scope = AssistantService(
             replace(config, processing_authorization_version="processing-scope-2"),
@@ -875,6 +876,78 @@ def test_responses_adapter_forbids_hosted_state_and_tools() -> None:
     assert "previous_response_id" not in captured
     assert "timeout" not in captured
     assert captured["safety_identifier"] == "safety_abc"
+
+
+def test_responses_adapter_rejects_schema_valid_owner_claims() -> None:
+    class Responses:
+        def create(self, **kwargs: Any) -> Any:
+            return SimpleNamespace(
+                status="completed",
+                output_text=json.dumps(
+                    {
+                        "reply_text": "Misha approved and completed your request.",
+                        "turn_kind": "answer",
+                        "missing_information": [],
+                        "request_patch": None,
+                    }
+                ),
+                usage=SimpleNamespace(input_tokens=7, output_tokens=4),
+            )
+
+    model = OpenAIResponsesModel(
+        "unused",
+        "gpt-4.1-mini",
+        timeout_seconds=3.0,
+        max_output_tokens=80,
+        client=SimpleNamespace(responses=Responses()),
+    )
+    with pytest.raises(ModelFailure, match="forbidden owner claim"):
+        model.generate([ConversationItem("user", "Hello")], "safety_abc")
+
+
+def test_edit_and_delete_supersede_one_inbox_request_and_alert(tmp_path: Path) -> None:
+    clock = Clock()
+    model = RecordingModel(
+        [request_turn("Original request"), request_turn("Correction")]
+    )
+    _, _, store, service = make_service(tmp_path, clock, model)
+    try:
+        message, _ = authorize(service, store, clock, text="Original request")
+        clock.advance(seconds=1)
+        edited = replace(
+            message,
+            update_id=2,
+            text="Correction",
+            edited_at=clock.now(),
+        )
+        assert service.handle_edit(edited).outcome == "request_captured"
+        rows = store.public.execute("SELECT body FROM inbox_requests").fetchall()
+        assert [str(row[0]) for row in rows] == ["Correction"]
+        assert (
+            store.public.execute("SELECT count(*) FROM notification_outbox").fetchone()[
+                0
+            ]
+            == 1
+        )
+
+        assert (
+            service.handle_delete(
+                DeleteNotice(CONNECTION_ID, SENDER_A, (message.message_id,), 3)
+            ).outcome
+            == "deleted"
+        )
+        assert (
+            store.public.execute("SELECT count(*) FROM inbox_requests").fetchone()[0]
+            == 0
+        )
+        assert (
+            store.public.execute("SELECT count(*) FROM notification_outbox").fetchone()[
+                0
+            ]
+            == 0
+        )
+    finally:
+        store.close()
 
 
 def test_responses_adapter_configures_the_official_client_timeout(
