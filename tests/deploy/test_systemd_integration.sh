@@ -26,6 +26,14 @@ units=(
     assist-ai-bot.service
 )
 
+report_failure() {
+    local line=$1
+    echo "error: systemd integration failed at line $line" >&2
+    systemctl status "${units[@]}" --no-pager -l >&2 || true
+    journalctl -b -u assist-ai-recover.service -u assist-ai-activation.service \
+        -u assist-ai-bot.service --no-pager -n 200 >&2 || true
+}
+
 cleanup() {
     systemctl stop assist-ai-activation.path assist-ai-activation.service assist-ai-bot.service assist-ai-recover.service >/dev/null 2>&1 || true
     for unit in "${units[@]}"; do
@@ -34,6 +42,7 @@ cleanup() {
     systemctl daemon-reload
     rm -rf "$test_root"
 }
+trap 'report_failure "$LINENO"' ERR
 trap cleanup EXIT
 
 mkdir -p "$test_home/.local/lib/assist-ai/control/v1"
