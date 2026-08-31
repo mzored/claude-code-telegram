@@ -271,48 +271,6 @@ RATE_LIMIT_REQUESTS=100
 CLAUDE_TIMEOUT_SECONDS=600
 ```
 
-## Running on a Remote Mac (SSH)
-
-If you're running the bot on a remote Mac Mini (or any Mac accessed via SSH), Claude Code's OAuth tokens stored in the macOS keychain will be inaccessible because the keychain is locked in SSH sessions. This causes Claude invocations to fail silently or with authentication errors.
-
-### Quick Start: `make run-remote`
-
-The simplest fix is to unlock the keychain before starting the bot:
-
-```bash
-make run-remote
-```
-
-This prompts for your keychain password, then starts the bot in a detached tmux session that persists after SSH disconnect. Manage the session with:
-
-```bash
-make remote-attach   # View logs
-make remote-stop     # Kill the bot
-```
-
-### Alternative: Unlock Keychain in Shell Profile
-
-Add this to your `~/.zshrc` or `~/.bash_profile` so the keychain unlocks automatically on SSH login:
-
-```bash
-if [ -n "$SSH_CONNECTION" ] && [ -z "$KEYCHAIN_UNLOCKED" ]; then
-  security unlock-keychain ~/Library/Keychains/login.keychain-db
-  export KEYCHAIN_UNLOCKED=true
-fi
-```
-
-### Extend Keychain Lock Timeout
-
-By default the keychain re-locks after a short idle period. Set it to 8 hours:
-
-```bash
-security set-keychain-settings -t 28800 ~/Library/Keychains/login.keychain-db
-```
-
-### Alternative: Use an API Key Instead
-
-Bypass the keychain entirely by using a direct API key (Option B in the authentication section above). Set `ANTHROPIC_API_KEY` in your `.env` and the keychain is never consulted.
-
 ## Troubleshooting
 
 ### Bot doesn't respond
@@ -345,7 +303,7 @@ echo $ANTHROPIC_API_KEY
 ls -la /path/to/your/projects
 ```
 
-## Production Deployment
+## Production configuration
 
 ```bash
 ENVIRONMENT=production

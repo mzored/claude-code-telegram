@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Telegram bot providing remote access to Claude Code. Python 3.10+, built with Poetry, using `python-telegram-bot` for Telegram and `claude-agent-sdk` for Claude Code integration.
+Telegram bot providing remote access to Claude Code. Python 3.11+, built with Poetry, using `python-telegram-bot` for Telegram and `claude-agent-sdk` for Claude Code integration.
 
 ## Commands
 
@@ -14,7 +14,8 @@ make install          # Production deps only
 make run              # Run the bot
 make run-debug        # Run with debug logging
 make test             # Run tests with coverage
-make lint             # Black + isort + flake8 + mypy
+make check            # Committed lock + format + lint + tests
+make lint             # Black + isort + flake8
 make format           # Auto-format with black + isort
 
 # Run a single test
@@ -23,6 +24,15 @@ poetry run pytest tests/unit/test_config.py -k test_name -v
 # Type checking only
 poetry run mypy src
 ```
+
+`make typecheck` is informative until the existing mypy debt is resolved. Do not
+weaken mypy or describe it as passing. Required CI checks are defined by `make check`.
+
+## Fork workflow
+
+Development happens in a local macOS checkout. `origin` is this fork and is the only
+remote that receives pushes. `upstream` is fetch-only. Read
+[`docs/fork-workflow.md`](docs/fork-workflow.md) before branch or remote work.
 
 ## Architecture
 

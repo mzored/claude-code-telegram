@@ -7,8 +7,11 @@ on:
     branches: [main]
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout code
@@ -29,46 +32,13 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .venv
-          key: venv-${{ runner.os }}-3.11-${{ hashFiles('**/poetry.lock') }}
+          key: venv-${{ runner.os }}-3.11-${{ hashFiles('poetry.lock') }}
 
-      - name: Install dependencies
-        run: poetry lock && poetry install
+      - name: Validate committed lock
+        run: poetry check --lock
 
-      - name: Check formatting (black)
-        run: poetry run black --check src tests
+      - name: Install committed dependencies
+        run: poetry sync
 
-      - name: Check import order (isort)
-        run: poetry run isort --check-only src tests
-
-      - name: Lint (flake8)
-        run: poetry run flake8 src tests
-
-  test:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-
-      - name: Install Poetry
-        uses: snok/install-poetry@v1
-        with:
-          virtualenvs-create: true
-          virtualenvs-in-project: true
-
-      - name: Cache dependencies
-        uses: actions/cache@v5
-        with:
-          path: .venv
-          key: venv-${{ runner.os }}-3.11-${{ hashFiles('**/poetry.lock') }}
-
-      - name: Install dependencies
-        run: poetry lock && poetry install
-
-      - name: Test
-        run: make test
+      - name: Run required checks
+        run: make check
