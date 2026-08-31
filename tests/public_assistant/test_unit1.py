@@ -18,8 +18,9 @@ from typing import Any
 import pytest
 from sqlcipher3 import dbapi2 as sqlcipher
 from telegram import Bot, Update
-from telegram.error import Conflict, NetworkError
+from telegram.error import BadRequest, Conflict, NetworkError
 
+from src.public_assistant import main as public_main
 from src.public_assistant.backup import export_public_backup
 from src.public_assistant.config import (
     BackupConfig,
@@ -394,6 +395,27 @@ def test_logs_expose_only_pseudonymous_references(caplog: Any) -> None:
     assert BODY not in rendered
 
 
+def test_top_level_crash_output_never_exposes_exception_payload(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    credential_url = (
+        "https://api.telegram.org/bot123456:credential/getUpdates?body=" + BODY
+    )
+
+    def crash() -> None:
+        raise RuntimeError(credential_url)
+
+    monkeypatch.setattr(public_main, "_run", crash)
+    with pytest.raises(SystemExit) as stopped:
+        public_main.run()
+    output = "\n".join(capsys.readouterr())
+    assert stopped.value.code == 1
+    assert "public assistant stopped due to an unrecoverable error" in output
+    assert "123456:credential" not in output
+    assert BODY not in output
+    assert credential_url not in output
+
+
 def test_sqlcipher_rejects_wrong_key_and_plaintext(
     config: PublicAssistantConfig, store: Unit1Store, tmp_path: Path
 ) -> None:
@@ -424,6 +446,33 @@ async def test_authoritative_refresh_uses_observation_time_on_admission_and_send
     ).fetchone()[0]
     assert observed == int(clock.timestamp())
     assert len(bot.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_can_reply_loss_permanently_cancels_queued_reply(
+    config: PublicAssistantConfig, store: Unit1Store, clock: Clock
+) -> None:
+    service = SecretaryService(config, store, now=clock.now)
+    service.observe_connection(
+        ConnectionObservation(CONNECTION_ID, OWNER_ID, True, True, clock.now())
+    )
+    staged = service.handle_message(inbound(clock))
+    assert staged.reply is not None
+
+    clock.advance(seconds=1)
+    service.observe_connection(
+        ConnectionObservation(CONNECTION_ID, OWNER_ID, True, False, clock.now())
+    )
+    clock.advance(seconds=1)
+    service.observe_connection(
+        ConnectionObservation(CONNECTION_ID, OWNER_ID, True, True, clock.now())
+    )
+
+    bot = BoundaryBot(clock)
+    adapter = TelegramBusinessAdapter(config, service, store, now=clock.now)
+    await adapter.deliver_due_replies(bot)
+    assert bot.sent == []
+    assert store.get_reply(staged.reply.reply_id).state == DeliveryState.CANCELLED
 
 
 @pytest.mark.asyncio
@@ -542,6 +591,51 @@ async def test_callback_consent_lookup_failure_answers_neutrally_without_accepti
         )
     assert answers == []
     assert store.counts()["pending"] == 1
+
+
+@pytest.mark.asyncio
+async def test_definite_callback_answer_failure_does_not_wedge_polling_offset(
+    config: PublicAssistantConfig,
+    service: SecretaryService,
+    store: Unit1Store,
+    clock: Clock,
+) -> None:
+    staged = service.handle_message(inbound(clock, update_id=300, message_id=301))
+    assert staged.reply is not None
+    sent_reply(store, staged.reply, 302)
+
+    async def rejected_answer(*, text: str) -> None:
+        raise BadRequest(f"query expired after processing {text}")
+
+    query = SimpleNamespace(
+        data=callback(staged.reply, "Continue"),
+        from_user=SimpleNamespace(id=SENDER_ID),
+        message=SimpleNamespace(
+            business_connection_id=CONNECTION_ID,
+            sender_business_bot=SimpleNamespace(id=303003),
+            chat=SimpleNamespace(id=SENDER_ID),
+            message_id=302,
+        ),
+        answer=rejected_answer,
+    )
+    update = SimpleNamespace(
+        update_id=303,
+        business_connection=None,
+        business_message=None,
+        edited_business_message=None,
+        deleted_business_messages=None,
+        callback_query=query,
+    )
+
+    class CallbackBot(PollBot):
+        id = 303003
+
+    bot = CallbackBot(clock, [update])  # type: ignore[list-item]
+    adapter = TelegramBusinessAdapter(config, service, store, now=clock.now)
+    runner = DurablePollingRunner(FakeApplication(bot), adapter, store)  # type: ignore[arg-type]
+    assert await runner.run_once()
+    assert store.get_next_update_id() == 304
+    assert store.counts()["pending"] == 0
 
 
 def test_restrictive_control_survives_takeover_rights_loss_and_pilot_removal(
@@ -702,6 +796,57 @@ def test_erasure_tombstone_prevents_orphan_authorized_body_resurrection(
         recovered.public.execute("SELECT count(*) FROM privacy_state").fetchone()[0]
         == 1
     )
+    recovered.close()
+
+
+@pytest.mark.parametrize(
+    "crash_stage", ["after_expiry_locator", "after_pending_delete"]
+)
+def test_pending_expiry_recovers_metadata_cleanup_after_crash(
+    config: PublicAssistantConfig,
+    clock: Clock,
+    tmp_path: Path,
+    crash_stage: str,
+) -> None:
+    data = tmp_path / crash_stage
+    first = Unit1Store(
+        data, PENDING_KEY, PUBLIC_KEY, PSEUDONYM_KEY, clock=clock.timestamp
+    )
+    service = SecretaryService(config, first, now=clock.now)
+    service.observe_connection(
+        ConnectionObservation(CONNECTION_ID, OWNER_ID, True, True, clock.now())
+    )
+    assert service.handle_message(inbound(clock)).outcome == "awaiting_consent"
+    clock.advance(days=1)
+
+    def crash(stage: str) -> None:
+        if stage == crash_stage:
+            raise TransferInterrupted(stage)
+
+    with pytest.raises(TransferInterrupted, match=crash_stage):
+        first.expire_pending(crash_hook=crash)
+    assert (
+        first.public.execute("SELECT count(*) FROM pending_expiry_cleanup").fetchone()[
+            0
+        ]
+        == 1
+    )
+    first.close()
+
+    recovered = Unit1Store(
+        data, PENDING_KEY, PUBLIC_KEY, PSEUDONYM_KEY, clock=clock.timestamp
+    )
+    assert recovered.counts()["pending"] == 0
+    for table in (
+        "pending_expiry_cleanup",
+        "controls",
+        "processed_updates",
+        "replies",
+        "rate_admissions",
+    ):
+        assert (
+            recovered.public.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+        )
     recovered.close()
 
 

@@ -249,7 +249,7 @@ class TelegramBusinessAdapter:
         if query is None or query.data is None:
             return
         if query.message is None:
-            await query.answer(text="This control is unavailable.")
+            await self._answer_callback(query, "This control is unavailable.")
             return
         message = query.message
         connection_id = getattr(message, "business_connection_id", None)
@@ -259,7 +259,7 @@ class TelegramBusinessAdapter:
             or sender_bot is None
             or sender_bot.id != context.bot.id
         ):
-            await query.answer(text="This control is unavailable.")
+            await self._answer_callback(query, "This control is unavailable.")
             return
         control = self.store.resolve_control(
             query.data,
@@ -270,7 +270,7 @@ class TelegramBusinessAdapter:
         )
         if control is not None and control.action in {"consent", "reconsent"}:
             if not await self._refresh_connection(context.bot, connection_id):
-                await query.answer(text="This control is unavailable.")
+                await self._answer_callback(query, "This control is unavailable.")
                 return
         result = self.service.handle_control(
             query.data,
@@ -288,7 +288,17 @@ class TelegramBusinessAdapter:
             "stale_version": "A new confirmation is required.",
             "replayed": "This control was already used.",
         }
-        await query.answer(text=answers.get(result, "This control is unavailable."))
+        await self._answer_callback(
+            query, answers.get(result, "This control is unavailable.")
+        )
+
+    async def _answer_callback(self, query: Any, text: str) -> None:
+        """Treat Telegram's definite answer rejection as terminal UI feedback."""
+
+        try:
+            await query.answer(text=text)
+        except (BadRequest, Forbidden):
+            self.logger.warning("callback answer rejected after durable handling")
 
     async def expire_data(self, context: CallbackContext) -> None:
         del context

@@ -63,10 +63,24 @@ def configure_logging() -> None:
 
 
 def run() -> None:
-    """Validate keys and stores before constructing a Telegram client."""
+    """Run with a fixed top-level failure message that cannot expose input data."""
 
     os.umask(0o077)
     configure_logging()
+    try:
+        _run()
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
+    except BaseException:
+        logging.getLogger("public_assistant").critical(
+            "public assistant stopped due to an unrecoverable error"
+        )
+        raise SystemExit(1) from None
+
+
+def _run() -> None:
+    """Validate keys and stores before constructing a Telegram client."""
+
     config = PublicAssistantConfig.from_environment()
     credentials = config.load_runtime_credentials()
     store = Unit1Store(

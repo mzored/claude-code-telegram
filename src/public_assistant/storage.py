@@ -159,6 +159,10 @@ CREATE TABLE IF NOT EXISTS rate_admissions (
     subject_ref TEXT NOT NULL,
     window_start INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pending_expiry_cleanup (
+    message_key TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS poll_state (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     next_update_id INTEGER
@@ -212,6 +216,7 @@ class Unit1Store:
             self.pending.close()
             raise
         self.recover_sending_replies()
+        self.recover_pending_expiry_cleanup()
         self.recover_restrictions()
         self.recover_transfers()
 
@@ -287,6 +292,23 @@ class Unit1Store:
             (connection_id,),
         ).fetchone()
         return bool(row and row[0] == owner_id and row[1] == 1 and row[2] == 1)
+
+    def cancel_connection_replies(self, connection_id: str) -> int:
+        """Permanently cancel queued replies when Telegram removes authority."""
+
+        with self.public.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE replies SET state=?, next_attempt_at=NULL, updated_at=?
+                   WHERE connection_id=? AND state IN (?, ?)""",
+                (
+                    DeliveryState.CANCELLED.value,
+                    self.now(),
+                    connection_id,
+                    DeliveryState.PENDING.value,
+                    DeliveryState.RETRY_PENDING.value,
+                ),
+            )
+        return max(int(cursor.rowcount), 0)
 
     def deny_connection(self, connection_id: str) -> None:
         with self.public.transaction() as connection:
@@ -1069,29 +1091,33 @@ class Unit1Store:
             )
         return "declined"
 
-    def expire_pending(self) -> int:
-        now = self.now()
-        with self.pending.transaction() as connection:
-            rows = connection.execute(
-                """SELECT message_key, consent_control_id,
-                   decline_control_id FROM pending_messages WHERE expires_at<=?""",
-                (now,),
+    def recover_pending_expiry_cleanup(self) -> int:
+        """Finish expiry cleanup whose cross-database sequence was interrupted."""
+
+        message_keys = [
+            str(row[0])
+            for row in self.public.execute(
+                "SELECT message_key FROM pending_expiry_cleanup"
             ).fetchall()
-            connection.execute(
-                "DELETE FROM pending_messages WHERE expires_at<=?", (now,)
-            )
-        with self.public.transaction() as connection:
-            for row in rows:
+        ]
+        if not message_keys:
+            return 0
+        with self.pending.transaction() as connection:
+            for message_key in message_keys:
                 connection.execute(
-                    "DELETE FROM controls WHERE control_id IN (?, ?)",
-                    (row["consent_control_id"], row["decline_control_id"]),
+                    "DELETE FROM pending_messages WHERE message_key=?", (message_key,)
+                )
+        with self.public.transaction() as connection:
+            for message_key in message_keys:
+                connection.execute(
+                    "DELETE FROM controls WHERE pending_key=?", (message_key,)
                 )
                 update_ids = [
                     int(item[0])
                     for item in connection.execute(
                         """SELECT update_id FROM processed_updates
                            WHERE message_key=? AND kind!='deleted_business_messages'""",
-                        (row["message_key"],),
+                        (message_key,),
                     ).fetchall()
                 ]
                 for update_id in update_ids:
@@ -1104,8 +1130,36 @@ class Unit1Store:
                 connection.execute(
                     """DELETE FROM processed_updates WHERE message_key=?
                        AND kind!='deleted_business_messages'""",
-                    (row["message_key"],),
+                    (message_key,),
                 )
+                connection.execute(
+                    "DELETE FROM pending_expiry_cleanup WHERE message_key=?",
+                    (message_key,),
+                )
+        return len(message_keys)
+
+    def expire_pending(self, crash_hook: Callable[[str], None] | None = None) -> int:
+        now = self.now()
+        rows = self.pending.execute(
+            "SELECT message_key FROM pending_messages WHERE expires_at<=?", (now,)
+        ).fetchall()
+        if not rows:
+            return 0
+        with self.public.transaction() as connection:
+            for row in rows:
+                connection.execute(
+                    "INSERT OR IGNORE INTO pending_expiry_cleanup VALUES (?, ?)",
+                    (row["message_key"], now),
+                )
+        if crash_hook is not None:
+            crash_hook("after_expiry_locator")
+        with self.pending.transaction() as connection:
+            connection.execute(
+                "DELETE FROM pending_messages WHERE expires_at<=?", (now,)
+            )
+        if crash_hook is not None:
+            crash_hook("after_pending_delete")
+        self.recover_pending_expiry_cleanup()
         return len(rows)
 
     def expire_public(self, retention_seconds: int) -> int:

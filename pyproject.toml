@@ -42,7 +42,7 @@ packages = [{include = "src"}]
 [tool.poetry.dependencies]
 python = "^3.11"
 python-telegram-bot = {version = "^22.6", extras = ["rate-limiter"]}
-sqlcipher3-binary = "0.5.4"
+sqlcipher3 = "0.6.2"
 structlog = "^25.4.0"
 pydantic = "^2.11.5"
 pydantic-settings = "^2.9.1"

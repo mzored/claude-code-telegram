@@ -92,11 +92,11 @@ class SecretaryService:
 
     def observe_connection(self, observation: ConnectionObservation) -> bool:
         self.store.observe_connection(observation)
-        accepted = bool(
-            observation.owner_id == self.config.owner_id
-            and observation.enabled
-            and observation.can_reply is True
+        accepted = self.store.connection_can_reply(
+            observation.connection_id, self.config.owner_id
         )
+        if not accepted:
+            self.store.cancel_connection_replies(observation.connection_id)
         self.log.event(
             "business_connection_observed",
             connection_id=observation.connection_id,
