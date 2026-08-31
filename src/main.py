@@ -25,6 +25,10 @@ from src.events.handlers import AgentHandler
 from src.events.middleware import EventSecurityMiddleware
 from src.exceptions import ConfigurationError
 from src.notifications.service import NotificationService
+from src.policy_gate.rpc import ControllerGateRpcClient
+from src.private_controller.interpreter import DeterministicIntentInterpreter
+from src.private_controller.origin import RunOriginLedger, origin_ledger_key
+from src.private_controller.service import PrivateControllerService
 from src.projects import ProjectThreadManager, load_project_registry
 from src.scheduler.scheduler import JobScheduler
 from src.security.audit import AuditLogger, InMemoryAuditStorage
@@ -168,11 +172,36 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     logger.info("Using Claude Python SDK integration")
     sdk_manager = ClaudeSDKManager(config, security_validator=security_validator)
 
+    database_path = config.database_path
+    if database_path is None:
+        raise ConfigurationError("Private run-origin persistence requires SQLite")
+    run_origins = RunOriginLedger(
+        database_path.with_name("private-run-origins.db"),
+        origin_ledger_key(config.telegram_bot_token.get_secret_value()),
+    )
     claude_integration = ClaudeIntegration(
         config=config,
         sdk_manager=sdk_manager,
         session_manager=session_manager,
+        run_origins=run_origins,
     )
+
+    private_controller = None
+    if config.private_controller_enabled:
+        if config.private_controller_gate_socket_path is None:
+            raise ConfigurationError("Private controller Policy Gate socket is missing")
+        if (
+            config.private_controller_owner_id is None
+            or config.private_controller_control_chat_id is None
+        ):
+            raise ConfigurationError("Private controller owner boundary is missing")
+        private_controller = PrivateControllerService(
+            ControllerGateRpcClient(config.private_controller_gate_socket_path),
+            run_origins,
+            DeterministicIntentInterpreter(),
+            config.private_controller_owner_id,
+            config.private_controller_control_chat_id,
+        )
 
     # --- Event bus and agentic platform components ---
     event_bus = EventBus()
@@ -190,7 +219,9 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         event_bus=event_bus,
         claude_integration=claude_integration,
         default_working_directory=config.approved_directory,
-        default_user_id=config.allowed_users[0] if config.allowed_users else 0,
+        # External events use a neutral session partition. Numeric owner identity
+        # is never reused as administration authority.
+        default_user_id=0,
     )
     agent_handler.register()
 
@@ -225,6 +256,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "agent_handler": agent_handler,
         "auth_manager": auth_manager,
         "security_validator": security_validator,
+        "private_controller": private_controller,
     }
 
 

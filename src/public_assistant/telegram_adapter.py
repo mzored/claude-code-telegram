@@ -309,6 +309,9 @@ class TelegramBusinessAdapter:
         del context
         self.store.expire_pending()
         self.store.expire_public(self.config.retention_seconds)
+        reconcile_erasures = getattr(self.service, "reconcile_erasures", None)
+        if callable(reconcile_erasures):
+            reconcile_erasures()
 
     async def _deliver_reply(self, reply: ReplyRecord, bot: Any) -> None:
         async def sender(stored: ReplyRecord) -> int:

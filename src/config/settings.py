@@ -48,6 +48,19 @@ class Settings(BaseSettings):
     allowed_users: Optional[List[int]] = Field(
         None, description="Allowed Telegram user IDs"
     )
+    private_controller_enabled: bool = Field(
+        False,
+        description="Enable owner administration through the isolated Policy Gate",
+    )
+    private_controller_owner_id: Optional[int] = Field(
+        None, description="Single numeric owner allowed to administer Policy Gate state"
+    )
+    private_controller_control_chat_id: Optional[int] = Field(
+        None, description="Single private chat accepted for owner administration"
+    )
+    private_controller_gate_socket_path: Optional[Path] = Field(
+        None, description="Resolved Unix socket for the isolated Policy Gate"
+    )
     enable_token_auth: bool = Field(
         False, description="Enable token-based authentication"
     )
@@ -490,6 +503,37 @@ class Settings(BaseSettings):
         if self.enable_token_auth and not self.auth_token_secret:
             raise ValueError(
                 "auth_token_secret required when enable_token_auth is True"
+            )
+
+        if self.private_controller_enabled:
+            if (
+                self.private_controller_owner_id is None
+                or self.private_controller_control_chat_id is None
+            ):
+                raise ValueError(
+                    "private controller requires one explicit owner and control chat"
+                )
+            if self.private_controller_owner_id <= 0:
+                raise ValueError("private controller owner must be positive")
+            if (
+                self.private_controller_control_chat_id
+                != self.private_controller_owner_id
+            ):
+                raise ValueError("private controller requires the owner's private chat")
+            if (
+                not self.allowed_users
+                or self.private_controller_owner_id not in self.allowed_users
+            ):
+                raise ValueError("private controller owner must be an allowed user")
+            if self.private_controller_gate_socket_path is None:
+                raise ValueError("private controller requires a Policy Gate socket")
+            if not self.private_controller_gate_socket_path.is_absolute():
+                raise ValueError(
+                    "private controller Policy Gate socket must be absolute"
+                )
+        elif self.private_controller_gate_socket_path is not None:
+            raise ValueError(
+                "private controller socket requires the controller to be enabled"
             )
 
         # Check MCP requirements

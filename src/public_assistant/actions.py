@@ -1,0 +1,405 @@
+"""Channel-neutral bridge from one bounded model proposal to Policy Gate."""
+
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass
+from typing import Callable, Mapping, Protocol, Sequence
+
+from src.policy_gate.types import (
+    ActionBinding,
+    ActionResult,
+    ActionSchema,
+    Operation,
+)
+from src.public_assistant.action_store import IntegrationAuthorization, Unit3Store
+from src.public_assistant.config import PublicAssistantConfig, Unit2Config
+from src.public_assistant.conversation import (
+    _ABUSE,
+    _GREETINGS,
+    _OWNER_STATUS_TERMS,
+    OWNER_STATUS,
+    REQUEST_CONFIRMED,
+    AssistantService,
+)
+from src.public_assistant.model import (
+    ActionProposal,
+    PublicModel,
+    action_schemas,
+)
+from src.public_assistant.privacy_log import PrivacyLog
+from src.public_assistant.service import _language
+from src.public_assistant.types import InboundMessage, ProcessingResult
+
+
+class PublicGateClient(Protocol):
+    """The public process receives decisions, never Gate storage or credentials."""
+
+    def allowed_actions(
+        self,
+        subject_id: str,
+        processing_authorization_version: str,
+        processing_authorization_revision: int,
+    ) -> tuple[Operation, ...]: ...
+
+    def submit_action(self, binding: ActionBinding) -> ActionResult: ...
+
+    def stage_action(self, binding: ActionBinding) -> bool: ...
+
+    def register_subject(
+        self, subject_id: str, references: Mapping[str, str]
+    ) -> None: ...
+
+    def activate_receipt(
+        self,
+        subject_id: str,
+        version: str,
+        revision: int,
+        processor_purposes: Mapping[str, Sequence[str]],
+    ) -> bool: ...
+
+    def revoke_receipt(self, subject_id: str, revision: int) -> bool: ...
+
+    def erase_subject(self, subject_id: str) -> str: ...
+
+
+@dataclass(frozen=True)
+class ActionDiscovery:
+    authorization: IntegrationAuthorization | None
+    schemas: tuple[ActionSchema, ...]
+
+
+class ActionCoordinator:
+    """Persist the trusted binding before asking Gate to claim it."""
+
+    def __init__(self, store: Unit3Store, gate: PublicGateClient) -> None:
+        self.store = store
+        self.gate = gate
+        self._locks_guard = threading.Lock()
+        self._subject_locks: dict[str, threading.Lock] = {}
+
+    def _subject_lock(self, subject_id: str) -> threading.Lock:
+        with self._locks_guard:
+            return self._subject_locks.setdefault(subject_id, threading.Lock())
+
+    def _current_authorization(
+        self, message: InboundMessage, discovery: ActionDiscovery
+    ) -> bool:
+        return (
+            self.store.active_integration_authorization(message)
+            == discovery.authorization
+        )
+
+    def activate_integration_authorization(
+        self,
+        message: InboundMessage,
+        version: str,
+        revision: int,
+        processor_purposes: Mapping[str, tuple[str, ...]],
+    ) -> bool:
+        authorization = self.store.begin_integration_activation(
+            message, version, revision, processor_purposes
+        )
+        acknowledged = self.gate.activate_receipt(
+            authorization.subject_id,
+            authorization.version,
+            authorization.revision,
+            authorization.processor_purposes,
+        )
+        if acknowledged:
+            self.store.acknowledge_integration_activation(authorization)
+        return acknowledged
+
+    def revoke_integration_authorization(
+        self, message: InboundMessage, revision: int
+    ) -> bool:
+        subject = self.store.subject_ref(
+            message.connection_id, message.conversation_id, message.sender_id
+        )
+        with self._subject_lock(subject):
+            subject = self.store.begin_integration_revocation(message, revision)
+            acknowledged = self.gate.revoke_receipt(subject, revision)
+            if acknowledged:
+                self.store.acknowledge_integration_revocation(subject, revision)
+            return acknowledged
+
+    def discover(self, message: InboundMessage) -> ActionDiscovery:
+        authorization = self.store.active_integration_authorization(message)
+        if authorization is None:
+            return ActionDiscovery(None, ())
+        return ActionDiscovery(
+            authorization,
+            action_schemas(
+                self.gate.allowed_actions(
+                    authorization.subject_id,
+                    authorization.version,
+                    authorization.revision,
+                )
+            ),
+        )
+
+    def register_request(self, message: InboundMessage, request_id: str) -> None:
+        subject = self.store.subject_ref(
+            message.connection_id, message.conversation_id, message.sender_id
+        )
+        self.gate.register_subject(
+            subject,
+            {
+                "managed_chat": self.store.managed_chat_reference(message),
+                "request": request_id,
+            },
+        )
+        self.gate.register_subject(
+            subject,
+            {"managed_chat": self.store.managed_chat_reference(message)},
+        )
+
+    def erase_subject(self, subject_id: str) -> str:
+        """Converge a durable public erasure with the separate Gate store."""
+
+        return self.gate.erase_subject(subject_id)
+
+    def submit(
+        self,
+        message: InboundMessage,
+        request_id: str,
+        proposal: ActionProposal,
+        retention_seconds: int,
+        discovery: ActionDiscovery,
+    ) -> ActionResult:
+        if discovery.authorization is None:
+            return ActionResult("denied", "")
+        if proposal.operation not in {action.operation for action in discovery.schemas}:
+            return ActionResult("denied", "")
+        subject = self.store.subject_ref(
+            message.connection_id, message.conversation_id, message.sender_id
+        )
+        with self._subject_lock(subject):
+            if not self._current_authorization(message, discovery):
+                return ActionResult("denied", "")
+            binding = self.store.prepare_action(
+                message,
+                request_id,
+                proposal.operation,
+                proposal.arguments,
+                discovery.authorization.version,
+                discovery.authorization.revision,
+                retention_seconds,
+            )
+            self.gate.register_subject(
+                binding.subject_id,
+                {"request": request_id, "action": binding.action_id},
+            )
+            if not self._current_authorization(message, discovery):
+                denied = ActionResult("denied", binding.action_id)
+                self.store.finish_action(denied)
+                return denied
+            if not self.gate.stage_action(binding):
+                denied = ActionResult("denied", binding.action_id)
+                self.store.finish_action(denied)
+                return denied
+            if not self._current_authorization(message, discovery):
+                denied = ActionResult("denied", binding.action_id)
+                self.store.finish_action(denied)
+                return denied
+            result = self.gate.submit_action(binding)
+            self.store.finish_action(result)
+            return result
+
+
+DRY_RUN_ACCEPTED = {
+    "en": "The requested action passed the dry-run policy check. No external provider was contacted.",
+    "ru": "Запрошенное действие прошло проверку в тестовом режиме. Внешний сервис не вызывался.",
+}
+
+
+class ActionAssistantService(AssistantService):
+    """Unit 2 conversation plus one locally schema-bounded dry-run action."""
+
+    def __init__(
+        self,
+        config: PublicAssistantConfig,
+        unit2_config: Unit2Config,
+        store: Unit3Store,
+        model: PublicModel,
+        coordinator: ActionCoordinator,
+        *,
+        logger: PrivacyLog | None = None,
+    ) -> None:
+        super().__init__(config, unit2_config, store, model, logger=logger)
+        self.store: Unit3Store = store
+        self.coordinator = coordinator
+        self.reconcile_erasures()
+
+    def reconcile_erasures(self) -> None:
+        """Retry the fixed Gate erasure operation from durable public tombstones."""
+
+        for subject_id in self.store.active_erasure_subjects():
+            self.coordinator.erase_subject(subject_id)
+
+    def handle_control(
+        self,
+        token: str,
+        *,
+        actor_id: int,
+        conversation_id: int,
+        connection_id: str,
+        origin_message_id: int,
+        crash_hook: Callable[[str], None] | None = None,
+    ) -> str:
+        control = self.store.resolve_control(
+            token, actor_id, conversation_id, connection_id, origin_message_id
+        )
+        result = super().handle_control(
+            token,
+            actor_id=actor_id,
+            conversation_id=conversation_id,
+            connection_id=connection_id,
+            origin_message_id=origin_message_id,
+            crash_hook=crash_hook,
+        )
+        if (
+            control is not None
+            and control.action == "delete"
+            and result
+            in {
+                "erased",
+                "replayed",
+            }
+        ):
+            self.coordinator.erase_subject(control.subject_ref)
+        return result
+
+    def _register_request(self, message: InboundMessage, request_id: str) -> None:
+        try:
+            self.coordinator.register_request(message, request_id)
+        except Exception:
+            return
+
+    def _process_without_actions(self, message: InboundMessage) -> ProcessingResult:
+        result = super()._process_consented(message)
+        request_id = self.store.request_id_for_update(message.update_id)
+        if request_id is not None:
+            self._register_request(message, request_id)
+        return result
+
+    def _fallback_request(
+        self, message: InboundMessage, outcome: str
+    ) -> ProcessingResult:
+        result = super()._fallback_request(message, outcome)
+        request_id = self.store.request_id_for_update(message.update_id)
+        if request_id is not None:
+            self._register_request(message, request_id)
+        return result
+
+    def _process_consented(self, message: InboundMessage) -> ProcessingResult:
+        normalized = " ".join(message.text.casefold().split()).strip(".!?,")
+        if normalized in _GREETINGS or any(marker in normalized for marker in _ABUSE):
+            return self._process_without_actions(message)
+        try:
+            discovery = self.coordinator.discover(message)
+        except Exception:
+            return self._process_without_actions(message)
+        if not discovery.schemas:
+            return self._process_without_actions(message)
+        if not self.store.has_active_consent(
+            message.connection_id,
+            message.conversation_id,
+            message.sender_id,
+            self.config.processing_authorization_version,
+        ):
+            return ProcessingResult("consent_stopped")
+        conversation = self.store.conversation(
+            message,
+            max_items=self.unit2_config.max_context_items,
+            max_characters=self.unit2_config.max_context_characters,
+        )
+        reservation = self.store.reserve_model_call(
+            message, conversation, self.unit2_config
+        )
+        if reservation is None:
+            return self._fallback_request(message, "model_budget_exhausted")
+        if not self.store.has_active_consent(
+            message.connection_id,
+            message.conversation_id,
+            message.sender_id,
+            self.config.processing_authorization_version,
+        ):
+            self.store.finish_model_call(reservation, None, self.unit2_config)
+            return ProcessingResult("consent_stopped")
+        try:
+            result = self.model.generate(
+                conversation,
+                self.store.model_safety_identifier(message),
+                policy_context={
+                    "processing_authorization_version": (
+                        None
+                        if discovery.authorization is None
+                        else discovery.authorization.version
+                    ),
+                    "processing_authorization_revision": (
+                        None
+                        if discovery.authorization is None
+                        else discovery.authorization.revision
+                    ),
+                    "allowed_actions": [
+                        action.operation.value for action in discovery.schemas
+                    ],
+                },
+                allowed_actions=discovery.schemas,
+            )
+            turn = result.turn
+            self.store.finish_model_call(reservation, result, self.unit2_config)
+        except Exception:
+            self.store.finish_model_call(reservation, None, self.unit2_config)
+            return self._fallback_request(message, "model_fallback")
+
+        if turn.action_proposal is not None:
+            if not self.store.has_active_consent(
+                message.connection_id,
+                message.conversation_id,
+                message.sender_id,
+                self.config.processing_authorization_version,
+            ):
+                return ProcessingResult("consent_stopped")
+            action_result = self.coordinator.submit(
+                message,
+                self.store.action_request_id(message),
+                turn.action_proposal,
+                self.config.retention_seconds,
+                discovery,
+            )
+            if action_result.outcome in {"verified_success", "replayed_success"}:
+                text = DRY_RUN_ACCEPTED[_language(message.text)]
+                reply = self._assistant_reply(message, text)
+                self.store.add_assistant_context(
+                    message, text, self.config.retention_seconds
+                )
+                self.store.set_update_outcome(
+                    message.update_id, "dry_run_action_validated", reply.reply_id
+                )
+                return ProcessingResult("dry_run_action_validated", reply)
+            return self._fallback_request(message, "action_denied")
+
+        request_id = None
+        reply_text = turn.reply_text
+        if turn.turn_kind == "request":
+            if turn.request_patch is None:
+                self.store.finish_model_call(reservation, None, self.unit2_config)
+                return self._fallback_request(message, "model_fallback")
+            request_id = self.store.upsert_request(
+                message,
+                turn.request_patch.content,
+                self.config.retention_seconds,
+            )
+            self._register_request(message, request_id)
+            reply_text = REQUEST_CONFIRMED[_language(message.text)]
+        elif _OWNER_STATUS_TERMS.search(reply_text):
+            reply_text = OWNER_STATUS[_language(message.text)]
+        reply = self._assistant_reply(message, reply_text)
+        self.store.add_assistant_context(
+            message, reply_text, self.config.retention_seconds
+        )
+        outcome = "request_captured" if request_id is not None else turn.turn_kind
+        self.store.set_update_outcome(message.update_id, outcome, reply.reply_id)
+        return ProcessingResult(outcome, reply)

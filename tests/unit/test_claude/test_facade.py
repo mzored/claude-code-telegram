@@ -10,6 +10,12 @@ import pytest
 from src.claude.facade import LIMIT_REACHED_MSG, ClaudeIntegration
 from src.claude.session import ClaudeSession, SessionManager
 from src.config.settings import Settings
+from src.private_controller.origin import (
+    RunOrigin,
+    RunOriginLedger,
+    RunSource,
+    RunTrigger,
+)
 
 from .conftest import InMemorySessionStorage
 
@@ -59,7 +65,7 @@ def session_manager(config):
 
 
 @pytest.fixture
-def facade(config, session_manager):
+def facade(config, session_manager, tmp_path):
     """Create facade with mocked SDK manager."""
     sdk_manager = MagicMock()
 
@@ -67,8 +73,45 @@ def facade(config, session_manager):
         config=config,
         sdk_manager=sdk_manager,
         session_manager=session_manager,
+        run_origins=RunOriginLedger(
+            tmp_path / "private-run-origins.db", "origin-key-" + "o" * 40
+        ),
     )
     return integration
+
+
+async def test_origin_is_durable_before_private_model_execution(facade, config):
+    facade.config = config.model_copy(
+        update={
+            "private_controller_enabled": True,
+            "private_controller_owner_id": 123,
+            "private_controller_control_chat_id": 123,
+            "private_controller_gate_socket_path": Path("/tmp/policy-gate.sock"),
+            "allowed_users": [123],
+        }
+    )
+    response = _make_mock_response()
+
+    async def execute(**kwargs):
+        assert facade.run_origins.origins() == (RunOrigin.DIRECT_OWNER,)
+        return response
+
+    facade._execute = execute
+    await facade.run_command(
+        "fresh owner instruction",
+        Path("/test/project"),
+        123,
+        run_trigger=RunTrigger(
+            RunSource.TELEGRAM,
+            123,
+            123,
+            1,
+            2,
+            fresh=True,
+            resumed_session=True,
+        ),
+    )
+    assert facade.run_origins.origins() == (RunOrigin.DIRECT_OWNER,)
 
 
 class TestForceNewSkipsAutoResume:

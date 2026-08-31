@@ -395,3 +395,42 @@ class Unit2Config:
             ),
             backup_retention_seconds=retention,
         )
+
+
+@dataclass(frozen=True)
+class Unit3Config:
+    """Optional mock-only Gate client boundary; disabled unless explicit."""
+
+    enabled: bool = False
+    socket_path: Path | None = None
+
+    @classmethod
+    def from_environment(
+        cls,
+        base: PublicAssistantConfig,
+        environment: Mapping[str, str] | None = None,
+    ) -> "Unit3Config":
+        env = os.environ if environment is None else environment
+        raw_enabled = env.get("PUBLIC_ASSISTANT_POLICY_GATE_ENABLED", "false")
+        normalized = raw_enabled.strip().casefold()
+        if normalized not in {"true", "false"}:
+            raise PublicAssistantConfigurationError(
+                "PUBLIC_ASSISTANT_POLICY_GATE_ENABLED must be true or false"
+            )
+        if normalized == "false":
+            if env.get("PUBLIC_ASSISTANT_POLICY_GATE_SOCKET_PATH", "").strip():
+                raise PublicAssistantConfigurationError(
+                    "Policy Gate socket requires the Unit 3 boundary to be enabled"
+                )
+            return cls()
+        socket_path = Path(_required(env, "PUBLIC_ASSISTANT_POLICY_GATE_SOCKET_PATH"))
+        if not socket_path.is_absolute():
+            raise PublicAssistantConfigurationError(
+                "PUBLIC_ASSISTANT_POLICY_GATE_SOCKET_PATH must be absolute"
+            )
+        socket_path = socket_path.resolve(strict=False)
+        if socket_path == base.data_dir or socket_path.is_relative_to(base.data_dir):
+            raise PublicAssistantConfigurationError(
+                "Policy Gate socket must stay outside public data"
+            )
+        return cls(True, socket_path)

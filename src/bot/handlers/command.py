@@ -12,6 +12,7 @@ from telegram.ext import ContextTypes
 
 from ...claude.facade import ClaudeIntegration
 from ...config.settings import Settings
+from ...private_controller.telegram import telegram_run_trigger
 from ...projects import PrivateTopicsUnavailableError, load_project_registry
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
@@ -401,6 +402,7 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 working_directory=current_dir,
                 user_id=user_id,
                 session_id=claude_session_id,
+                run_trigger=telegram_run_trigger(update, resumed_session=True),
             )
         else:
             # No session in context, try to find the most recent session
@@ -415,6 +417,7 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 user_id=user_id,
                 working_directory=current_dir,
                 prompt=prompt or default_prompt,
+                run_trigger=telegram_run_trigger(update, resumed_session=True),
             )
 
         if claude_response:

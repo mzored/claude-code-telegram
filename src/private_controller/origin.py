@@ -1,0 +1,227 @@
+"""Persisted run origin assigned before any private-model execution."""
+
+from __future__ import annotations
+
+import hashlib
+import secrets
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+
+from src.encrypted_sqlite import SqlCipherDatabase
+
+
+class RunOrigin(str, Enum):
+    DIRECT_OWNER = "direct_owner"
+    PUBLIC_SENDER = "public_sender"
+    EXTERNAL_EVENT = "external_event"
+    SCHEDULED = "scheduled"
+
+
+class RunSource(str, Enum):
+    TELEGRAM = "telegram"
+    PUBLIC = "public"
+    WEBHOOK = "webhook"
+    EXTERNAL_HANDLER = "external_handler"
+    SCHEDULED = "scheduled"
+    CONTEXT_ONLY = "context_only"
+
+
+@dataclass(frozen=True)
+class RunTrigger:
+    source: RunSource
+    actor_id: int
+    chat_id: int
+    update_id: int
+    message_id: int
+    fresh: bool
+    forwarded: bool = False
+    context_only: bool = False
+    resumed_session: bool = False
+
+
+@dataclass(frozen=True)
+class PersistedRun:
+    run_id: str
+    sequence: int
+    origin: RunOrigin
+    source: RunSource
+    actor_id: int
+    chat_id: int
+    update_id: int
+    message_id: int
+    fresh: bool
+    forwarded: bool
+    context_only: bool
+    resumed_session: bool
+
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS private_run_origins (
+    run_id TEXT PRIMARY KEY,
+    sequence INTEGER NOT NULL UNIQUE,
+    origin TEXT NOT NULL,
+    source TEXT NOT NULL,
+    actor_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    update_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    fresh INTEGER NOT NULL,
+    forwarded INTEGER NOT NULL,
+    context_only INTEGER NOT NULL,
+    resumed_session INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS controller_intent_runs (
+    intent_id TEXT PRIMARY KEY,
+    prepare_run_id TEXT NOT NULL,
+    minimum_confirmation_sequence INTEGER NOT NULL,
+    FOREIGN KEY(prepare_run_id) REFERENCES private_run_origins(run_id)
+);
+"""
+
+
+class RunOriginLedger:
+    """Small durable ledger; numeric identity never decides origin by itself."""
+
+    def __init__(self, path: Path, key: str) -> None:
+        self.database = SqlCipherDatabase(path, key, _SCHEMA)
+
+    @staticmethod
+    def classify(
+        trigger: RunTrigger, *, owner_id: int, control_chat_id: int
+    ) -> RunOrigin:
+        if trigger.source is RunSource.SCHEDULED:
+            return RunOrigin.SCHEDULED
+        if trigger.source in {
+            RunSource.WEBHOOK,
+            RunSource.EXTERNAL_HANDLER,
+            RunSource.CONTEXT_ONLY,
+        }:
+            return RunOrigin.EXTERNAL_EVENT
+        if trigger.source is RunSource.PUBLIC:
+            return RunOrigin.PUBLIC_SENDER
+        if (
+            trigger.source is RunSource.TELEGRAM
+            and trigger.fresh
+            and not trigger.forwarded
+            and not trigger.context_only
+            and trigger.actor_id == owner_id
+            and trigger.chat_id == control_chat_id
+        ):
+            return RunOrigin.DIRECT_OWNER
+        return RunOrigin.PUBLIC_SENDER
+
+    def begin(
+        self, trigger: RunTrigger, *, owner_id: int, control_chat_id: int
+    ) -> PersistedRun:
+        origin = self.classify(
+            trigger, owner_id=owner_id, control_chat_id=control_chat_id
+        )
+        run_id = "RUN-" + secrets.token_urlsafe(24)
+        with self.database.transaction() as connection:
+            sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM private_run_origins"
+                ).fetchone()[0]
+            )
+            connection.execute(
+                """INSERT INTO private_run_origins VALUES
+                   (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())""",
+                (
+                    run_id,
+                    sequence,
+                    origin.value,
+                    trigger.source.value,
+                    trigger.actor_id,
+                    trigger.chat_id,
+                    trigger.update_id,
+                    trigger.message_id,
+                    int(trigger.fresh),
+                    int(trigger.forwarded),
+                    int(trigger.context_only),
+                    int(trigger.resumed_session),
+                ),
+            )
+        return PersistedRun(run_id, sequence, origin, **trigger.__dict__)
+
+    def require(self, run_id: str) -> PersistedRun:
+        row = self.database.execute(
+            "SELECT * FROM private_run_origins WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise PermissionError("private run origin was not persisted")
+        return PersistedRun(
+            run_id=str(row["run_id"]),
+            sequence=int(row["sequence"]),
+            origin=RunOrigin(str(row["origin"])),
+            source=RunSource(str(row["source"])),
+            actor_id=int(row["actor_id"]),
+            chat_id=int(row["chat_id"]),
+            update_id=int(row["update_id"]),
+            message_id=int(row["message_id"]),
+            fresh=bool(row["fresh"]),
+            forwarded=bool(row["forwarded"]),
+            context_only=bool(row["context_only"]),
+            resumed_session=bool(row["resumed_session"]),
+        )
+
+    def origins(self) -> tuple[RunOrigin, ...]:
+        """Return origin values only; never expose prompts through diagnostics."""
+
+        rows = self.database.execute(
+            "SELECT origin FROM private_run_origins ORDER BY rowid"
+        ).fetchall()
+        return tuple(RunOrigin(str(row[0])) for row in rows)
+
+    def link_intent(self, intent_id: str, prepare_run_id: str) -> None:
+        self.require(prepare_run_id)
+        with self.database.transaction() as connection:
+            minimum_sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM private_run_origins"
+                ).fetchone()[0]
+            )
+            connection.execute(
+                "INSERT INTO controller_intent_runs VALUES (?, ?, ?)",
+                (intent_id, prepare_run_id, minimum_sequence),
+            )
+
+    def require_second_fresh_control(
+        self, intent_id: str, confirmation_run_id: str
+    ) -> PersistedRun:
+        confirmation = self.require(confirmation_run_id)
+        row = self.database.execute(
+            """SELECT prepare_run_id, minimum_confirmation_sequence
+               FROM controller_intent_runs WHERE intent_id=?""",
+            (intent_id,),
+        ).fetchone()
+        if row is None:
+            raise PermissionError("administration intent has no trusted preparation")
+        prepared = self.require(str(row[0]))
+        if (
+            confirmation.sequence <= int(row["minimum_confirmation_sequence"])
+            or confirmation.run_id == prepared.run_id
+            or confirmation.update_id == prepared.update_id
+            or confirmation.message_id == prepared.message_id
+            or not confirmation.fresh
+            or confirmation.origin is not RunOrigin.DIRECT_OWNER
+        ):
+            raise PermissionError(
+                "confirmation requires a fresh owner control after the preview"
+            )
+        return confirmation
+
+    def close(self) -> None:
+        self.database.close()
+
+
+def origin_ledger_key(telegram_bot_token: str) -> str:
+    """Derive a domain-separated at-rest key without persisting bot credentials."""
+
+    if len(telegram_bot_token.encode("utf-8")) < 16:
+        raise ValueError("Telegram credential is too short for key derivation")
+    material = b"assist-ai/private-run-origin-ledger/v1\0" + telegram_bot_token.encode(
+        "utf-8"
+    )
+    return hashlib.sha256(material).hexdigest()

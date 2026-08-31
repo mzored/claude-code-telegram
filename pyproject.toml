@@ -31,6 +31,7 @@ Documentation = "https://github.com/richardatkinson/claude-code-telegram/blob/ma
 claude-telegram-bot = "src.main:run"
 public-telegram-assistant = "src.public_assistant.main:run"
 public-assistant-backup = "src.public_assistant.backup:run"
+policy-gate = "src.policy_gate.main:run"
 
 [build-system]
 requires = ["poetry-core>=2.0.0"]

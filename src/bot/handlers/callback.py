@@ -9,6 +9,7 @@ from telegram.ext import ContextTypes
 
 from ...claude.facade import ClaudeIntegration
 from ...config.settings import Settings
+from ...private_controller.telegram import telegram_callback_run_trigger
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
 from ..utils.html_format import escape_html
@@ -565,6 +566,7 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
                 working_directory=current_dir,
                 user_id=user_id,
                 session_id=claude_session_id,
+                run_trigger=telegram_callback_run_trigger(query, resumed_session=True),
             )
         else:
             # No session in context, try to find the most recent session
@@ -578,6 +580,7 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
                 user_id=user_id,
                 working_directory=current_dir,
                 prompt=None,  # No prompt = use --continue
+                run_trigger=telegram_callback_run_trigger(query, resumed_session=True),
             )
 
         if claude_response:
@@ -920,7 +923,10 @@ async def handle_quick_action_callback(
 
         # Run the action through Claude
         claude_response = await claude_integration.run_command(
-            prompt=action.prompt, working_directory=current_dir, user_id=user_id
+            prompt=action.prompt,
+            working_directory=current_dir,
+            user_id=user_id,
+            run_trigger=telegram_callback_run_trigger(query),
         )
 
         if claude_response:
