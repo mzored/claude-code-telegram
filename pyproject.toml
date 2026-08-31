@@ -29,6 +29,7 @@ Documentation = "https://github.com/richardatkinson/claude-code-telegram/blob/ma
 
 [project.scripts]
 claude-telegram-bot = "src.main:run"
+public-telegram-assistant = "src.public_assistant.main:run"
 
 [build-system]
 requires = ["poetry-core>=2.0.0"]
@@ -40,6 +41,7 @@ packages = [{include = "src"}]
 [tool.poetry.dependencies]
 python = "^3.11"
 python-telegram-bot = {version = "^22.6", extras = ["rate-limiter"]}
+sqlcipher3-binary = "0.5.4"
 structlog = "^25.4.0"
 pydantic = "^2.11.5"
 pydantic-settings = "^2.9.1"
