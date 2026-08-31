@@ -200,6 +200,7 @@ class SecretaryService:
         lang = _language(message.text)
         revoke, delete = self.store.create_maintenance_controls(
             message,
+            self.config.privacy_policy_version,
             self.config.processing_authorization_version,
             self.config.pending_ttl_seconds,
         )
@@ -246,6 +247,7 @@ class SecretaryService:
         lang = _language(message.text)
         reconsent, delete = self.store.create_maintenance_controls(
             message,
+            self.config.privacy_policy_version,
             self.config.processing_authorization_version,
             self.config.pending_ttl_seconds,
             reconsent=True,
@@ -302,13 +304,29 @@ class SecretaryService:
         )
         if not is_new:
             return ProcessingResult("duplicate", prior)
-        if self.store.edit_pending(message):
+        if self.store.edit_pending(
+            message, self.config.processing_authorization_version
+        ):
             self.store.set_update_outcome(message.update_id, "pending_body_replaced")
             return ProcessingResult("pending_body_replaced")
-        if self.store.edit_public(message, self.config.retention_seconds):
-            self.store.set_update_outcome(message.update_id, "consented_body_replaced")
-            return ProcessingResult("consented_body_replaced")
-        return ProcessingResult("unknown_message")
+        if not self.store.has_active_consent(
+            message.connection_id,
+            message.conversation_id,
+            message.sender_id,
+            self.config.processing_authorization_version,
+        ):
+            return self._stage_consent(message)
+        message_key = self.store.message_key(
+            message.connection_id, message.conversation_id, message.message_id
+        )
+        self.store.cancel_linked_replies(message_key)
+        if not self.store.edit_public(message, self.config.retention_seconds):
+            return ProcessingResult("unknown_message")
+        reply = self._maintenance_reply(message)
+        self.store.set_update_outcome(
+            message.update_id, "consented_body_replaced", reply.reply_id
+        )
+        return ProcessingResult("consented_body_replaced", reply)
 
     def handle_delete(self, notice: DeleteNotice) -> ProcessingResult:
         if notice.chat_type != "private":
@@ -317,20 +335,39 @@ class SecretaryService:
             notice.connection_id, self.config.owner_id
         ):
             return ProcessingResult("connection_denied")
+        bindings = tuple(
+            binding
+            for message_id in notice.message_ids
+            if (
+                binding := self.store.stored_subject_binding(
+                    notice.connection_id, notice.conversation_id, message_id
+                )
+            )
+            is not None
+        )
+        if not bindings:
+            return ProcessingResult("unknown_message")
+        sender_id, subject_ref, _ = bindings[0]
+        if any(
+            binding[0] != sender_id or binding[1] != subject_ref for binding in bindings
+        ):
+            return ProcessingResult("untrusted_delete")
         trusted = tuple(
             message_id
             for message_id in notice.message_ids
-            if self.store.stored_message_binding(
+            if self.store.stored_subject_binding(
                 notice.connection_id, notice.conversation_id, message_id
             )
+            is not None
         )
-        if not trusted:
-            return ProcessingResult("unknown_message")
         if not self.store.begin_non_message_update(
             update_id=notice.update_id,
             kind="deleted_business_messages",
             connection_id=notice.connection_id,
             conversation_id=notice.conversation_id,
+            sender_id=sender_id,
+            subject_ref=subject_ref,
+            message_keys=tuple(sorted(binding[2] for binding in bindings)),
             outcome="deleting",
         ):
             return ProcessingResult("duplicate")

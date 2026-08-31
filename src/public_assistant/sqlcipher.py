@@ -27,15 +27,21 @@ def _sql_string(value: str) -> str:
 class SqlCipherDatabase:
     """Own one SQLCipher connection and enforce safe filesystem defaults."""
 
-    def __init__(self, path: Path, key: str, schema: str) -> None:
+    def __init__(
+        self, path: Path, key: str, schema: str, *, create: bool = True
+    ) -> None:
         self.path = path
         self._lock = threading.RLock()
+        if not create and not self.path.is_file():
+            raise EncryptedStoreError("encrypted source store does not exist")
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.path.parent, 0o700)
         existed = self.path.exists()
-        if not existed:
+        if not existed and create:
             descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
             os.close(descriptor)
+        elif not existed:
+            raise EncryptedStoreError("encrypted source store does not exist")
         os.chmod(self.path, 0o600)
         try:
             self.connection = sqlcipher.connect(
@@ -53,7 +59,8 @@ class SqlCipherDatabase:
             mode = self.connection.execute("PRAGMA journal_mode = WAL").fetchone()
             if mode is None or str(mode[0]).lower() != "wal":
                 raise EncryptedStoreError("encrypted store did not enter WAL mode")
-            self.connection.execute("PRAGMA wal_autocheckpoint = 0")
+            self.connection.execute("PRAGMA wal_autocheckpoint = 1000")
+            self.connection.execute("PRAGMA journal_size_limit = 67108864")
             self.connection.executescript(schema)
             self._secure_files()
         except Exception as exc:
@@ -96,6 +103,16 @@ class SqlCipherDatabase:
         with self._lock:
             return self.connection.execute(sql, parameters)
 
+    def checkpoint(self, mode: str = "PASSIVE") -> tuple[int, int, int]:
+        if mode not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
+            raise ValueError("invalid checkpoint mode")
+        with self._lock:
+            row = self.connection.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+            self._secure_files()
+        if row is None:
+            raise EncryptedStoreError("WAL checkpoint returned no result")
+        return int(row[0]), int(row[1]), int(row[2])
+
     def encrypted_backup(self, destination: Path, backup_key: str) -> None:
         """Export a transactionally consistent database under a distinct key."""
 
@@ -112,6 +129,7 @@ class SqlCipherDatabase:
         )
         try:
             with self._lock:
+                self.connection.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
                 self.connection.execute(attach)
                 self.connection.execute(f"SELECT sqlcipher_export('{alias}')")
                 self.connection.execute(f"DETACH DATABASE {alias}")

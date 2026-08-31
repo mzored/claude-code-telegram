@@ -32,9 +32,28 @@ class CredentialRedactingFormatter(logging.Formatter):
         return _TELEGRAM_TOKEN.sub("<redacted>", rendered)
 
 
+class DependencyPrivacyFilter(logging.Filter):
+    """Replace dependency diagnostics that may embed raw Telegram updates."""
+
+    _PRIVATE_PREFIXES = ("telegram", "httpx", "httpcore")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if any(
+            record.name == prefix or record.name.startswith(prefix + ".")
+            for prefix in self._PRIVATE_PREFIXES
+        ):
+            record.msg = "dependency diagnostic redacted"
+            record.args = ()
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
+        return True
+
+
 def configure_logging() -> None:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(CredentialRedactingFormatter("%(levelname)s %(message)s"))
+    handler.addFilter(DependencyPrivacyFilter())
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(logging.INFO)

@@ -87,6 +87,7 @@ class ControlRecord:
     sender_id: int
     subject_ref: str
     pending_key: str | None
+    privacy_policy_version: str
     processing_authorization_version: str
     expires_at: int
     consumed_at: int | None

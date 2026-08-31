@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, cast
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest, Forbidden, RetryAfter
+from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, RetryAfter
 from telegram.ext import (
     Application,
     BusinessConnectionHandler,
@@ -33,7 +33,6 @@ from src.public_assistant.types import (
     DeleteNotice,
     InboundMessage,
     OwnerMessage,
-    ProcessingResult,
     ReplyRecord,
 )
 
@@ -46,6 +45,10 @@ EXPLICIT_ALLOWED_UPDATES = (
 )
 
 
+class TransientConnectionError(RuntimeError):
+    """Current connection authority could not be observed after bounded retries."""
+
+
 class TelegramBusinessAdapter:
     """Normalize trusted PTB fields and propagate every handler failure."""
 
@@ -56,21 +59,55 @@ class TelegramBusinessAdapter:
         store: Unit1Store,
         *,
         now: Callable[[], datetime] | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.config = config
         self.service = service
         self.store = store
         self._now = now or (lambda: datetime.now(UTC))
+        self._sleep = sleep
         self.logger = logging.getLogger("public_assistant.telegram")
 
     async def _refresh_connection(self, bot: Any, connection_id: str) -> bool:
-        """Observe authoritative current state; lookup failure denies admission."""
+        """Observe authority; transient lookup failures must replay the update."""
 
-        try:
-            connection = await bot.get_business_connection(connection_id)
-        except Exception:
-            self.logger.warning("business connection refresh failed")
-            return False
+        connection = None
+        for attempt in range(3):
+            try:
+                connection = await bot.get_business_connection(connection_id)
+                break
+            except Conflict:
+                raise
+            except (BadRequest, Forbidden):
+                self.store.deny_connection(connection_id)
+                self.store.purge_unconsented_connection(connection_id)
+                return False
+            except RetryAfter as exc:
+                delay = exc.retry_after
+                seconds = (
+                    delay.total_seconds()
+                    if isinstance(delay, timedelta)
+                    else float(delay)
+                )
+                if attempt == 2:
+                    raise TransientConnectionError(
+                        "business connection observation unavailable"
+                    ) from exc
+                await self._sleep(max(0.0, seconds))
+            except NetworkError as exc:
+                if attempt == 2:
+                    raise TransientConnectionError(
+                        "business connection observation unavailable"
+                    ) from exc
+                await self._sleep(float(2**attempt))
+            except Exception as exc:
+                raise TransientConnectionError(
+                    "business connection observation unavailable"
+                ) from exc
+        if connection is None:
+            raise TransientConnectionError(
+                "business connection observation unavailable"
+            )
         rights = connection.rights
         self.service.observe_connection(
             ConnectionObservation(
@@ -81,6 +118,8 @@ class TelegramBusinessAdapter:
                 observed_at=self._now(),
             )
         )
+        if not connection.is_enabled or connection.user.id != self.config.owner_id:
+            self.store.purge_unconsented_connection(connection.id)
         return True
 
     async def on_business_connection(
@@ -100,6 +139,8 @@ class TelegramBusinessAdapter:
                 observed_at=self._now(),
             )
         )
+        if not connection.is_enabled or connection.user.id != self.config.owner_id:
+            self.store.purge_unconsented_connection(connection.id)
 
     async def on_business_message(
         self, update: Update, context: CallbackContext
@@ -148,7 +189,7 @@ class TelegramBusinessAdapter:
             )
         else:
             return
-        await self._deliver_result(result, context)
+        del result
 
     async def on_edited_business_message(
         self, update: Update, context: CallbackContext
@@ -181,7 +222,7 @@ class TelegramBusinessAdapter:
                 edited_at=message.edit_date,
             )
         )
-        await self._deliver_result(result, context)
+        del result
 
     async def on_deleted_business_messages(
         self, update: Update, context: CallbackContext
@@ -254,12 +295,6 @@ class TelegramBusinessAdapter:
         self.store.expire_pending()
         self.store.expire_public(self.config.retention_seconds)
 
-    async def _deliver_result(
-        self, result: ProcessingResult, context: CallbackContext
-    ) -> None:
-        if result.reply is not None:
-            await self._deliver_reply(result.reply, context.bot)
-
     async def _deliver_reply(self, reply: ReplyRecord, bot: Any) -> None:
         async def sender(stored: ReplyRecord) -> int:
             rows: list[list[InlineKeyboardButton]] = []
@@ -309,7 +344,11 @@ class TelegramBusinessAdapter:
 
     async def deliver_due_replies(self, bot: Any) -> None:
         for reply in self.store.due_replies():
-            await self._deliver_reply(reply, bot)
+            try:
+                await self._deliver_reply(reply, bot)
+            except TransientConnectionError:
+                self.logger.warning("reply authority observation deferred")
+                break
 
     async def dispatch(self, update: Update, bot: Any) -> None:
         """Dedicated sequential dispatcher whose exceptions are never swallowed."""
@@ -339,47 +378,90 @@ class DurablePollingRunner:
         store: Unit1Store,
         *,
         crash_hook: Callable[[str], None] | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.application = application
         self.adapter = adapter
         self.store = store
         self.crash_hook = crash_hook
+        self._sleep = sleep
 
     def _hook(self, stage: str) -> None:
         if self.crash_hook is not None:
             self.crash_hook(stage)
 
-    async def run_once(self) -> bool:
-        self.store.expire_pending()
-        self.store.expire_public(self.adapter.config.retention_seconds)
-        self.store.prune_restrictive_tombstones()
-        await self.adapter.deliver_due_replies(self.application.bot)
-        updates = await self.application.bot.get_updates(
-            offset=self.store.get_next_update_id(),
-            limit=1,
-            timeout=30,
-            allowed_updates=list(EXPLICIT_ALLOWED_UPDATES),
+    async def _network_call(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+        for attempt in range(3):
+            try:
+                return await operation()
+            except Conflict:
+                raise
+            except RetryAfter as exc:
+                delay = exc.retry_after
+                seconds = (
+                    delay.total_seconds()
+                    if isinstance(delay, timedelta)
+                    else float(delay)
+                )
+                if attempt == 2:
+                    raise
+                await self._sleep(max(0.0, seconds))
+            except NetworkError:
+                if attempt == 2:
+                    raise
+                await self._sleep(float(2**attempt))
+        raise RuntimeError("unreachable Telegram retry state")
+
+    async def _fetch(self, timeout: int) -> tuple[Update, ...]:
+        result = await self._network_call(
+            lambda: self.application.bot.get_updates(
+                offset=self.store.get_next_update_id(),
+                limit=1,
+                timeout=timeout,
+                allowed_updates=list(EXPLICIT_ALLOWED_UPDATES),
+            )
         )
-        if not updates:
-            return False
-        update = updates[0]
+        return tuple(result)
+
+    async def _process(self, update: Update) -> None:
         self._hook("after_fetch")
         await self.adapter.dispatch(update, self.application.bot)
         self._hook("after_handler")
         self.store.commit_update_offset(update.update_id)
         self._hook("after_offset")
+
+    async def run_once(self) -> bool:
+        self.store.expire_pending()
+        self.store.expire_public(self.adapter.config.retention_seconds)
+        self.store.prune_restrictive_tombstones()
+        updates = await self._fetch(0)
+        if not updates:
+            await self.adapter.deliver_due_replies(self.application.bot)
+            updates = await self._fetch(30)
+        processed = False
+        while updates:
+            await self._process(updates[0])
+            processed = True
+            updates = await self._fetch(0)
+        await self.adapter.deliver_due_replies(self.application.bot)
         self._hook("before_next_poll")
-        return True
+        return processed
 
     async def run(self, stop_event: asyncio.Event | None = None) -> None:
         await self.application.initialize()
-        await self.application.start()
+        started = False
         try:
+            await self._network_call(
+                lambda: self.application.bot.delete_webhook(drop_pending_updates=False)
+            )
+            await self.application.start()
+            started = True
             while stop_event is None or not stop_event.is_set():
                 await self.run_once()
                 await asyncio.sleep(0)
         finally:
-            await self.application.stop()
+            if started:
+                await self.application.stop()
             await self.application.shutdown()
 
 

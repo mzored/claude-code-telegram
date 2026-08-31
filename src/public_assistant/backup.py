@@ -10,9 +10,9 @@ from src.public_assistant.config import (
     BackupConfig,
     PublicAssistantConfigurationError,
     read_credential,
+    validate_credential_paths,
 )
 from src.public_assistant.sqlcipher import SqlCipherDatabase
-from src.public_assistant.storage import PUBLIC_SCHEMA
 
 
 def export_public_backup(config: BackupConfig, destination: Path) -> None:
@@ -25,6 +25,11 @@ def export_public_backup(config: BackupConfig, destination: Path) -> None:
         )
     if resolved.name == "pending.db":
         raise PublicAssistantConfigurationError("pending.db cannot be exported")
+    validate_credential_paths(
+        (config.public_database_key_file, config.backup_database_key_file),
+        config.data_dir,
+        config.backup_dir,
+    )
     public_key = read_credential(
         config.public_database_key_file, "public database key", minimum_bytes=32
     )
@@ -35,10 +40,24 @@ def export_public_backup(config: BackupConfig, destination: Path) -> None:
         raise PublicAssistantConfigurationError(
             "public and backup database keys must be distinct"
         )
-    database = SqlCipherDatabase(
-        config.data_dir / "public.db", public_key, PUBLIC_SCHEMA
-    )
+    source = config.data_dir / "public.db"
+    if (
+        not source.is_file()
+        or source.is_symlink()
+        or source.resolve().parent != config.data_dir.resolve()
+        or source.stat().st_size == 0
+    ):
+        raise PublicAssistantConfigurationError("public backup source does not exist")
+    database = SqlCipherDatabase(source, public_key, "", create=False)
     try:
+        required = database.execute(
+            """SELECT count(*) FROM sqlite_master WHERE type='table'
+               AND name IN ('messages', 'privacy_state', 'poll_state')"""
+        ).fetchone()[0]
+        if int(required) != 3:
+            raise PublicAssistantConfigurationError(
+                "public backup source schema is invalid"
+            )
         database.encrypted_backup(resolved, backup_key)
     finally:
         database.close()

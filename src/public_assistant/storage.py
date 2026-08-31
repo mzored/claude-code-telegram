@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS pending_messages (
     sender_id INTEGER NOT NULL,
     subject_ref TEXT NOT NULL,
     message_id INTEGER NOT NULL,
-    update_id INTEGER NOT NULL,
+    source_update_id INTEGER NOT NULL,
+    last_update_id INTEGER NOT NULL,
     body TEXT NOT NULL,
     content_digest TEXT NOT NULL,
     sent_at INTEGER NOT NULL,
@@ -53,12 +54,8 @@ CREATE TABLE IF NOT EXISTS business_connections (
     observed_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS chat_state (
-    connection_id TEXT NOT NULL,
-    conversation_id INTEGER NOT NULL,
-    sender_id INTEGER NOT NULL,
-    subject_ref TEXT NOT NULL,
-    takeover_at INTEGER,
-    PRIMARY KEY(connection_id, conversation_id)
+    chat_key TEXT PRIMARY KEY,
+    takeover_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS privacy_state (
     subject_ref TEXT PRIMARY KEY,
@@ -78,6 +75,8 @@ CREATE TABLE IF NOT EXISTS consents (
     subject_ref TEXT NOT NULL,
     privacy_policy_version TEXT NOT NULL,
     processing_authorization_version TEXT NOT NULL,
+    processors TEXT NOT NULL,
+    purposes TEXT NOT NULL,
     granted_at INTEGER NOT NULL,
     PRIMARY KEY(connection_id, conversation_id, sender_id)
 );
@@ -91,6 +90,7 @@ CREATE TABLE IF NOT EXISTS controls (
     sender_id INTEGER NOT NULL,
     subject_ref TEXT NOT NULL,
     pending_key TEXT,
+    privacy_policy_version TEXT NOT NULL,
     processing_authorization_version TEXT NOT NULL,
     expires_at INTEGER NOT NULL,
     consumed_at INTEGER,
@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS processed_updates (
     sender_id INTEGER,
     subject_ref TEXT,
     message_id INTEGER,
+    message_key TEXT,
     content_digest TEXT,
     inbound_sent_at INTEGER,
     outcome TEXT NOT NULL,
@@ -118,7 +119,8 @@ CREATE TABLE IF NOT EXISTS messages (
     sender_id INTEGER NOT NULL,
     subject_ref TEXT NOT NULL,
     message_id INTEGER NOT NULL,
-    update_id INTEGER NOT NULL,
+    source_update_id INTEGER NOT NULL,
+    last_update_id INTEGER NOT NULL,
     body TEXT,
     sent_at INTEGER NOT NULL,
     content_updated_at INTEGER NOT NULL,
@@ -128,6 +130,12 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE TABLE IF NOT EXISTS transfer_receipts (
     message_key TEXT PRIMARY KEY,
     copied_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS deletion_links (
+    update_id INTEGER NOT NULL,
+    message_key TEXT NOT NULL,
+    subject_ref TEXT NOT NULL,
+    PRIMARY KEY(update_id, message_key)
 );
 CREATE TABLE IF NOT EXISTS replies (
     reply_id TEXT PRIMARY KEY,
@@ -162,6 +170,12 @@ TRANSFER_STAGES = frozenset(
     {"before_copy", "after_copy", "after_receipt", "before_pending_delete"}
 )
 RESTRICTIVE_STAGES = frozenset({"after_tombstone", "before_pending_delete"})
+AUTHORIZED_PROCESSORS = ("OpenAI", "Google Calendar", "Todoist")
+AUTHORIZED_PURPOSES = (
+    "assistant replies",
+    "meeting actions",
+    "external tasks",
+)
 
 
 class TransferInterrupted(RuntimeError):
@@ -223,6 +237,9 @@ class Unit1Store:
             + self.digest("message", f"{connection_id}:{chat_id}:{message_id}")[:32]
         )
 
+    def chat_key(self, connection_id: str, chat_id: int) -> str:
+        return "chat_" + self.digest("chat", f"{connection_id}:{chat_id}")[:32]
+
     def content_digest(self, body: str) -> str:
         return self.digest("body", body)
 
@@ -271,6 +288,46 @@ class Unit1Store:
         ).fetchone()
         return bool(row and row[0] == owner_id and row[1] == 1 and row[2] == 1)
 
+    def deny_connection(self, connection_id: str) -> None:
+        with self.public.transaction() as connection:
+            connection.execute(
+                """UPDATE business_connections SET enabled=0, can_reply=0,
+                   observed_at=? WHERE connection_id=?""",
+                (self.now(), connection_id),
+            )
+
+    def purge_unconsented_connection(
+        self,
+        connection_id: str,
+        crash_hook: Callable[[str], None] | None = None,
+    ) -> int:
+        rows = self.pending.execute(
+            """SELECT message_key, subject_ref FROM pending_messages
+               WHERE connection_id=?""",
+            (connection_id,),
+        ).fetchall()
+        if not rows:
+            return 0
+        now = self.now()
+        with self.public.transaction() as connection:
+            for row in rows:
+                connection.execute(
+                    """INSERT OR IGNORE INTO restrictive_tombstones
+                       VALUES (?, ?, 'deleted', ?)""",
+                    (row["message_key"], row["subject_ref"], now),
+                )
+        if crash_hook is not None:
+            crash_hook("after_tombstone")
+        with self.pending.transaction() as connection:
+            connection.execute(
+                "DELETE FROM pending_messages WHERE connection_id=?", (connection_id,)
+            )
+        if crash_hook is not None:
+            crash_hook("after_pending_delete")
+        for row in rows:
+            self.cancel_linked_replies(str(row["message_key"]))
+        return len(rows)
+
     def get_next_update_id(self) -> int | None:
         row = self.public.execute(
             "SELECT next_update_id FROM poll_state WHERE singleton=1"
@@ -292,8 +349,8 @@ class Unit1Store:
                 pass
             pending = connection.execute(
                 """SELECT 1 FROM replies WHERE source_update_id=?
-                   AND state IN (?, ?)""",
-                (update_id, DeliveryState.PENDING.value, DeliveryState.SENDING.value),
+                   AND state=?""",
+                (update_id, DeliveryState.SENDING.value),
             ).fetchone()
             if pending is not None:
                 raise RuntimeError("cannot acknowledge update with unfinished reply")
@@ -340,8 +397,9 @@ class Unit1Store:
             connection.execute(
                 """INSERT INTO processed_updates(
                     update_id, kind, connection_id, conversation_id, sender_id,
-                    subject_ref, message_id, content_digest, inbound_sent_at,
-                    outcome, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    subject_ref, message_id, message_key, content_digest,
+                    inbound_sent_at, outcome, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     message.update_id,
                     kind,
@@ -350,6 +408,11 @@ class Unit1Store:
                     message.sender_id,
                     subject,
                     message.message_id,
+                    self.message_key(
+                        message.connection_id,
+                        message.conversation_id,
+                        message.message_id,
+                    ),
                     digest,
                     int(message.sent_at.timestamp()),
                     outcome,
@@ -365,18 +428,37 @@ class Unit1Store:
         kind: str,
         connection_id: str,
         conversation_id: int,
+        sender_id: int,
+        subject_ref: str,
+        message_keys: tuple[str, ...],
         outcome: str,
     ) -> bool:
+        if not message_keys:
+            return False
+        message_key = message_keys[0]
         with self.public.transaction() as connection:
             row = connection.execute(
-                "SELECT kind, connection_id, conversation_id FROM processed_updates WHERE update_id=?",
+                """SELECT kind, connection_id, conversation_id, sender_id,
+                   subject_ref, message_key FROM processed_updates WHERE update_id=?""",
                 (update_id,),
             ).fetchone()
             if row is not None:
+                linked_keys = tuple(
+                    str(item[0])
+                    for item in connection.execute(
+                        """SELECT message_key FROM deletion_links
+                           WHERE update_id=? ORDER BY message_key""",
+                        (update_id,),
+                    ).fetchall()
+                )
                 return bool(
                     row["kind"] == kind
                     and row["connection_id"] == connection_id
                     and row["conversation_id"] == conversation_id
+                    and row["sender_id"] == sender_id
+                    and row["subject_ref"] == subject_ref
+                    and row["message_key"] == message_key
+                    and linked_keys == tuple(sorted(message_keys))
                     and connection.execute(
                         "SELECT outcome FROM processed_updates WHERE update_id=?",
                         (update_id,),
@@ -385,9 +467,25 @@ class Unit1Store:
                 )
             connection.execute(
                 """INSERT INTO processed_updates(update_id, kind, connection_id,
-                   conversation_id, outcome, created_at) VALUES (?, ?, ?, ?, ?, ?)""",
-                (update_id, kind, connection_id, conversation_id, outcome, self.now()),
+                   conversation_id, sender_id, subject_ref, message_key, outcome,
+                   created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    update_id,
+                    kind,
+                    connection_id,
+                    conversation_id,
+                    sender_id,
+                    subject_ref,
+                    message_key,
+                    outcome,
+                    self.now(),
+                ),
             )
+            for linked_key in message_keys:
+                connection.execute(
+                    "INSERT OR IGNORE INTO deletion_links VALUES (?, ?, ?)",
+                    (update_id, linked_key, subject_ref),
+                )
         return True
 
     def set_update_outcome(
@@ -431,17 +529,17 @@ class Unit1Store:
 
     def is_taken_over(self, connection_id: str, conversation_id: int) -> bool:
         row = self.public.execute(
-            "SELECT takeover_at FROM chat_state WHERE connection_id=? AND conversation_id=?",
-            (connection_id, conversation_id),
+            "SELECT takeover_at FROM chat_state WHERE chat_key=?",
+            (self.chat_key(connection_id, conversation_id),),
         ).fetchone()
-        return bool(row is not None and row[0] is not None)
+        return row is not None
 
     def known_conversation(self, connection_id: str, conversation_id: int) -> bool:
-        return (
+        return self.is_taken_over(connection_id, conversation_id) or (
             self.public.execute(
-                """SELECT 1 FROM processed_updates WHERE connection_id=? AND conversation_id=?
-               UNION SELECT 1 FROM chat_state WHERE connection_id=? AND conversation_id=?""",
-                (connection_id, conversation_id, connection_id, conversation_id),
+                """SELECT 1 FROM processed_updates
+                   WHERE connection_id=? AND conversation_id=?""",
+                (connection_id, conversation_id),
             ).fetchone()
             is not None
         )
@@ -477,11 +575,10 @@ class Unit1Store:
                 ),
             )
             connection.execute(
-                """INSERT INTO chat_state VALUES (?, ?, ?, ?, ?)
-                   ON CONFLICT(connection_id, conversation_id) DO UPDATE SET
-                   sender_id=excluded.sender_id, subject_ref=excluded.subject_ref,
+                """INSERT INTO chat_state VALUES (?, ?)
+                   ON CONFLICT(chat_key) DO UPDATE SET
                    takeover_at=excluded.takeover_at""",
-                (connection_id, conversation_id, sender_id, subject, now),
+                (self.chat_key(connection_id, conversation_id), now),
             )
             connection.execute(
                 """UPDATE replies SET state=?, updated_at=? WHERE connection_id=?
@@ -527,6 +624,7 @@ class Unit1Store:
         action: str,
         message: InboundMessage,
         pending_key: str | None,
+        privacy_policy_version: str,
         processing_authorization_version: str,
         expires_at: int,
     ) -> tuple[str, str]:
@@ -539,8 +637,8 @@ class Unit1Store:
             connection.execute(
                 """INSERT INTO controls(control_id, token_hash, action, connection_id,
                    conversation_id, sender_id, subject_ref, pending_key,
-                   processing_authorization_version, expires_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   privacy_policy_version, processing_authorization_version,
+                   expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     control_id,
                     self.digest("control", token),
@@ -550,6 +648,7 @@ class Unit1Store:
                     message.sender_id,
                     subject,
                     pending_key,
+                    privacy_policy_version,
                     processing_authorization_version,
                     expires_at,
                 ),
@@ -572,6 +671,7 @@ class Unit1Store:
             action="consent",
             message=message,
             pending_key=key,
+            privacy_policy_version=privacy_policy_version,
             processing_authorization_version=processing_authorization_version,
             expires_at=expires,
         )
@@ -579,6 +679,7 @@ class Unit1Store:
             action="decline",
             message=message,
             pending_key=key,
+            privacy_policy_version=privacy_policy_version,
             processing_authorization_version=processing_authorization_version,
             expires_at=expires,
         )
@@ -587,10 +688,15 @@ class Unit1Store:
         )
         with self.pending.transaction() as connection:
             connection.execute(
-                """INSERT INTO pending_messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                """INSERT INTO pending_messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    'pending', ?, ?, ?, ?)
-                   ON CONFLICT(message_key) DO UPDATE SET update_id=excluded.update_id,
+                   ON CONFLICT(message_key) DO UPDATE SET
+                   last_update_id=excluded.last_update_id,
                    body=excluded.body, content_digest=excluded.content_digest,
+                   sent_at=excluded.sent_at, created_at=excluded.created_at,
+                   expires_at=excluded.expires_at, state='pending',
+                   privacy_policy_version=excluded.privacy_policy_version,
+                   processing_authorization_version=excluded.processing_authorization_version,
                    consent_control_id=excluded.consent_control_id,
                    decline_control_id=excluded.decline_control_id""",
                 (
@@ -600,6 +706,7 @@ class Unit1Store:
                     message.sender_id,
                     subject,
                     message.message_id,
+                    message.update_id,
                     message.update_id,
                     message.text,
                     self.content_digest(message.text),
@@ -617,6 +724,7 @@ class Unit1Store:
     def create_maintenance_controls(
         self,
         message: InboundMessage,
+        privacy_policy_version: str,
         processing_authorization_version: str,
         ttl_seconds: int,
         *,
@@ -628,6 +736,7 @@ class Unit1Store:
             action=action,
             message=message,
             pending_key=None,
+            privacy_policy_version=privacy_policy_version,
             processing_authorization_version=processing_authorization_version,
             expires_at=expires,
         )
@@ -635,6 +744,7 @@ class Unit1Store:
             action="delete",
             message=message,
             pending_key=None,
+            privacy_policy_version=privacy_policy_version,
             processing_authorization_version=processing_authorization_version,
             expires_at=expires,
         )
@@ -672,6 +782,7 @@ class Unit1Store:
             sender_id=int(row["sender_id"]),
             subject_ref=str(row["subject_ref"]),
             pending_key=row["pending_key"],
+            privacy_policy_version=str(row["privacy_policy_version"]),
             processing_authorization_version=str(
                 row["processing_authorization_version"]
             ),
@@ -757,16 +868,22 @@ class Unit1Store:
                 "DELETE FROM privacy_state WHERE subject_ref=?", (control.subject_ref,)
             )
             connection.execute(
-                """INSERT INTO consents VALUES (?, ?, ?, ?, '', ?, ?)
+                """INSERT INTO consents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(connection_id, conversation_id, sender_id) DO UPDATE SET
+                   privacy_policy_version=excluded.privacy_policy_version,
                    processing_authorization_version=excluded.processing_authorization_version,
+                   processors=excluded.processors,
+                   purposes=excluded.purposes,
                    granted_at=excluded.granted_at""",
                 (
                     control.connection_id,
                     control.conversation_id,
                     control.sender_id,
                     control.subject_ref,
+                    control.privacy_policy_version,
                     expected_processing_version,
+                    json.dumps(AUTHORIZED_PROCESSORS),
+                    json.dumps(AUTHORIZED_PURPOSES),
                     now,
                 ),
             )
@@ -802,10 +919,12 @@ class Unit1Store:
             ).fetchone()
             if restricted is None:
                 connection.execute(
-                    """INSERT INTO consents VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """INSERT INTO consents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(connection_id, conversation_id, sender_id) DO UPDATE SET
                        privacy_policy_version=excluded.privacy_policy_version,
                        processing_authorization_version=excluded.processing_authorization_version,
+                       processors=excluded.processors,
+                       purposes=excluded.purposes,
                        granted_at=excluded.granted_at""",
                     (
                         row["connection_id"],
@@ -814,13 +933,16 @@ class Unit1Store:
                         row["subject_ref"],
                         row["privacy_policy_version"],
                         row["processing_authorization_version"],
+                        json.dumps(AUTHORIZED_PROCESSORS),
+                        json.dumps(AUTHORIZED_PURPOSES),
                         now,
                     ),
                 )
                 connection.execute(
-                    """INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    """INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                        ON CONFLICT(message_key) DO UPDATE SET body=excluded.body,
-                       update_id=excluded.update_id, content_updated_at=excluded.content_updated_at,
+                       last_update_id=excluded.last_update_id,
+                       content_updated_at=excluded.content_updated_at,
                        expires_at=excluded.expires_at, deleted_at=NULL""",
                     (
                         message_key,
@@ -829,7 +951,8 @@ class Unit1Store:
                         row["sender_id"],
                         row["subject_ref"],
                         row["message_id"],
-                        row["update_id"],
+                        row["source_update_id"],
+                        row["last_update_id"],
                         row["body"],
                         row["sent_at"],
                         row["sent_at"],
@@ -862,6 +985,14 @@ class Unit1Store:
         return len(rows)
 
     def recover_restrictions(self) -> int:
+        tombstones = [
+            str(row[0])
+            for row in self.public.execute(
+                "SELECT message_key FROM restrictive_tombstones"
+            ).fetchall()
+        ]
+        for message_key in tombstones:
+            self.cancel_linked_replies(message_key)
         rows = self.pending.execute(
             "SELECT message_key, subject_ref FROM pending_messages"
         ).fetchall()
@@ -877,6 +1008,8 @@ class Unit1Store:
                     f"DELETE FROM pending_messages WHERE message_key IN ({marks})",
                     tuple(restricted),
                 )
+            for message_key in restricted:
+                self.cancel_linked_replies(message_key)
         self.prune_restrictive_tombstones()
         return len(restricted)
 
@@ -940,7 +1073,7 @@ class Unit1Store:
         now = self.now()
         with self.pending.transaction() as connection:
             rows = connection.execute(
-                """SELECT message_key, update_id, consent_control_id,
+                """SELECT message_key, consent_control_id,
                    decline_control_id FROM pending_messages WHERE expires_at<=?""",
                 (now,),
             ).fetchall()
@@ -953,15 +1086,25 @@ class Unit1Store:
                     "DELETE FROM controls WHERE control_id IN (?, ?)",
                     (row["consent_control_id"], row["decline_control_id"]),
                 )
+                update_ids = [
+                    int(item[0])
+                    for item in connection.execute(
+                        """SELECT update_id FROM processed_updates
+                           WHERE message_key=? AND kind!='deleted_business_messages'""",
+                        (row["message_key"],),
+                    ).fetchall()
+                ]
+                for update_id in update_ids:
+                    connection.execute(
+                        "DELETE FROM replies WHERE source_update_id=?", (update_id,)
+                    )
+                    connection.execute(
+                        "DELETE FROM rate_admissions WHERE update_id=?", (update_id,)
+                    )
                 connection.execute(
-                    "DELETE FROM replies WHERE source_update_id=?", (row["update_id"],)
-                )
-                connection.execute(
-                    "DELETE FROM processed_updates WHERE update_id=?",
-                    (row["update_id"],),
-                )
-                connection.execute(
-                    "DELETE FROM rate_admissions WHERE update_id=?", (row["update_id"],)
+                    """DELETE FROM processed_updates WHERE message_key=?
+                       AND kind!='deleted_business_messages'""",
+                    (row["message_key"],),
                 )
         return len(rows)
 
@@ -970,18 +1113,45 @@ class Unit1Store:
         with self.public.transaction() as connection:
             connection.execute("DELETE FROM controls WHERE expires_at<=?", (cutoff,))
             rows = connection.execute(
-                """SELECT message_key, subject_ref, update_id FROM messages
+                """SELECT message_key, subject_ref FROM messages
                    WHERE content_updated_at + ? <= ?""",
                 (retention_seconds, cutoff),
             ).fetchall()
             for row in rows:
+                update_ids = [
+                    int(item[0])
+                    for item in connection.execute(
+                        """SELECT update_id FROM processed_updates
+                           WHERE message_key=? AND kind!='deleted_business_messages'""",
+                        (row["message_key"],),
+                    ).fetchall()
+                ]
+                for update_id in update_ids:
+                    connection.execute(
+                        "DELETE FROM replies WHERE source_update_id=?", (update_id,)
+                    )
+                    connection.execute(
+                        "DELETE FROM rate_admissions WHERE update_id=?", (update_id,)
+                    )
                 connection.execute(
-                    "DELETE FROM replies WHERE source_update_id=?", (row["update_id"],)
+                    """DELETE FROM processed_updates WHERE message_key=?
+                       AND kind!='deleted_business_messages'""",
+                    (row["message_key"],),
                 )
-                connection.execute(
-                    "DELETE FROM processed_updates WHERE update_id=?",
-                    (row["update_id"],),
-                )
+                deletion_updates = [
+                    int(item[0])
+                    for item in connection.execute(
+                        "SELECT update_id FROM deletion_links WHERE message_key=?",
+                        (row["message_key"],),
+                    ).fetchall()
+                ]
+                for update_id in deletion_updates:
+                    connection.execute(
+                        "DELETE FROM deletion_links WHERE update_id=?", (update_id,)
+                    )
+                    connection.execute(
+                        "DELETE FROM processed_updates WHERE update_id=?", (update_id,)
+                    )
                 connection.execute(
                     "DELETE FROM transfer_receipts WHERE message_key=?",
                     (row["message_key"],),
@@ -1006,9 +1176,6 @@ class Unit1Store:
                         "DELETE FROM consents WHERE subject_ref=?", (subject,)
                     )
                     connection.execute(
-                        "DELETE FROM chat_state WHERE subject_ref=?", (subject,)
-                    )
-                    connection.execute(
                         "DELETE FROM rate_admissions WHERE subject_ref=?", (subject,)
                     )
                     connection.execute(
@@ -1016,6 +1183,9 @@ class Unit1Store:
                     )
                     connection.execute(
                         "DELETE FROM processed_updates WHERE subject_ref=?", (subject,)
+                    )
+                    connection.execute(
+                        "DELETE FROM deletion_links WHERE subject_ref=?", (subject,)
                     )
         return len(rows)
 
@@ -1040,6 +1210,39 @@ class Unit1Store:
             is not None
         )
 
+    def stored_subject_binding(
+        self, connection_id: str, conversation_id: int, message_id: int
+    ) -> tuple[int, str, str] | None:
+        key = self.message_key(connection_id, conversation_id, message_id)
+        pending = self.pending.execute(
+            "SELECT sender_id, subject_ref FROM pending_messages WHERE message_key=?",
+            (key,),
+        ).fetchone()
+        if pending is not None:
+            return int(pending["sender_id"]), str(pending["subject_ref"]), key
+        public = self.public.execute(
+            "SELECT sender_id, subject_ref FROM messages WHERE message_key=?", (key,)
+        ).fetchone()
+        if public is None:
+            return None
+        return int(public["sender_id"]), str(public["subject_ref"]), key
+
+    def cancel_linked_replies(self, message_key: str) -> int:
+        with self.public.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE replies SET state=?, updated_at=? WHERE source_update_id IN
+                   (SELECT update_id FROM processed_updates WHERE message_key=?)
+                   AND state IN (?, ?)""",
+                (
+                    DeliveryState.CANCELLED.value,
+                    self.now(),
+                    message_key,
+                    DeliveryState.PENDING.value,
+                    DeliveryState.RETRY_PENDING.value,
+                ),
+            )
+        return max(int(cursor.rowcount), 0)
+
     def store_consented_message(
         self, message: InboundMessage, retention_seconds: int
     ) -> None:
@@ -1052,8 +1255,9 @@ class Unit1Store:
         changed = int((message.edited_at or message.sent_at).timestamp())
         with self.public.transaction() as connection:
             connection.execute(
-                """INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-                   ON CONFLICT(message_key) DO UPDATE SET update_id=excluded.update_id,
+                """INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                   ON CONFLICT(message_key) DO UPDATE SET
+                   last_update_id=excluded.last_update_id,
                    body=excluded.body, content_updated_at=excluded.content_updated_at,
                    expires_at=excluded.expires_at, deleted_at=NULL""",
                 (
@@ -1064,6 +1268,7 @@ class Unit1Store:
                     subject,
                     message.message_id,
                     message.update_id,
+                    message.update_id,
                     message.text,
                     int(message.sent_at.timestamp()),
                     changed,
@@ -1071,19 +1276,23 @@ class Unit1Store:
                 ),
             )
 
-    def edit_pending(self, message: InboundMessage) -> bool:
+    def edit_pending(
+        self, message: InboundMessage, processing_authorization_version: str
+    ) -> bool:
         key = self.message_key(
             message.connection_id, message.conversation_id, message.message_id
         )
         with self.pending.transaction() as connection:
             cursor = connection.execute(
-                """UPDATE pending_messages SET body=?, content_digest=?, update_id=?
-                   WHERE message_key=? AND state='pending'""",
+                """UPDATE pending_messages SET body=?, content_digest=?, last_update_id=?
+                   WHERE message_key=? AND state='pending'
+                     AND processing_authorization_version=?""",
                 (
                     message.text,
                     self.content_digest(message.text),
                     message.update_id,
                     key,
+                    processing_authorization_version,
                 ),
             )
         return int(cursor.rowcount) == 1
@@ -1095,7 +1304,7 @@ class Unit1Store:
         changed = int((message.edited_at or message.sent_at).timestamp())
         with self.public.transaction() as connection:
             cursor = connection.execute(
-                """UPDATE messages SET body=?, update_id=?, content_updated_at=?,
+                """UPDATE messages SET body=?, last_update_id=?, content_updated_at=?,
                    expires_at=?, deleted_at=NULL WHERE message_key=? AND sender_id=?""",
                 (
                     message.text,
@@ -1121,7 +1330,7 @@ class Unit1Store:
                     (key, now),
                 )
                 source = connection.execute(
-                    "SELECT update_id FROM messages WHERE message_key=?", (key,)
+                    "SELECT source_update_id FROM messages WHERE message_key=?", (key,)
                 ).fetchone()
                 cursor = connection.execute(
                     "UPDATE messages SET body=NULL, deleted_at=? WHERE message_key=? AND deleted_at IS NULL",
@@ -1141,7 +1350,8 @@ class Unit1Store:
                     )
             with self.pending.transaction() as connection:
                 row = connection.execute(
-                    "SELECT update_id FROM pending_messages WHERE message_key=?", (key,)
+                    "SELECT source_update_id FROM pending_messages WHERE message_key=?",
+                    (key,),
                 ).fetchone()
                 cursor = connection.execute(
                     "DELETE FROM pending_messages WHERE message_key=?", (key,)
@@ -1159,6 +1369,7 @@ class Unit1Store:
                             DeliveryState.RETRY_PENDING.value,
                         ),
                     )
+            self.cancel_linked_replies(key)
         return deleted
 
     def create_reply(
@@ -1266,10 +1477,10 @@ class Unit1Store:
         self, reply_id: str, *, owner_id: int, reply_window_seconds: int
     ) -> bool:
         row = self.public.execute(
-            """SELECT r.state, r.inbound_sent_at, c.owner_id, c.enabled, c.can_reply,
-               s.takeover_at FROM replies r LEFT JOIN business_connections c
-               ON c.connection_id=r.connection_id LEFT JOIN chat_state s
-               ON s.connection_id=r.connection_id AND s.conversation_id=r.conversation_id
+            """SELECT r.state, r.inbound_sent_at, r.connection_id,
+               r.conversation_id, c.owner_id, c.enabled, c.can_reply
+               FROM replies r LEFT JOIN business_connections c
+               ON c.connection_id=r.connection_id
                WHERE r.reply_id=?""",
             (reply_id,),
         ).fetchone()
@@ -1280,7 +1491,9 @@ class Unit1Store:
             and row["owner_id"] == owner_id
             and row["enabled"] == 1
             and row["can_reply"] == 1
-            and row["takeover_at"] is None
+            and not self.is_taken_over(
+                str(row["connection_id"]), int(row["conversation_id"])
+            )
             and self.now() - int(row["inbound_sent_at"]) < reply_window_seconds
         )
 
@@ -1346,11 +1559,11 @@ class Unit1Store:
             for table in (
                 "consents",
                 "controls",
-                "chat_state",
                 "messages",
                 "replies",
                 "processed_updates",
                 "rate_admissions",
+                "deletion_links",
             ):
                 connection.execute(
                     f"DELETE FROM {table} WHERE subject_ref=?", (control.subject_ref,)

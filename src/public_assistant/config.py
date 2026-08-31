@@ -85,6 +85,27 @@ def validate_separate_roots(data_dir: Path, backup_dir: Path) -> tuple[Path, Pat
     return data, backup
 
 
+def validate_credential_paths(
+    paths: tuple[Path, ...], data_dir: Path, backup_dir: Path
+) -> tuple[Path, ...]:
+    repository_root = Path(__file__).resolve().parents[2]
+    resolved = tuple(path.resolve() for path in paths)
+    if len(set(resolved)) != len(resolved):
+        raise PublicAssistantConfigurationError(
+            "credential files must use distinct paths"
+        )
+    protected_roots = (data_dir.resolve(), backup_dir.resolve(), repository_root)
+    if any(
+        path == root or path.is_relative_to(root)
+        for path in resolved
+        for root in protected_roots
+    ):
+        raise PublicAssistantConfigurationError(
+            "credential files must be outside data, backup, and repository roots"
+        )
+    return resolved
+
+
 @dataclass(frozen=True)
 class RuntimeCredentials:
     """Ephemeral runtime secrets with a deliberately redacted representation."""
@@ -120,6 +141,17 @@ class PublicAssistantConfig:
     rate_limit_window_seconds: int = 60
 
     def load_runtime_credentials(self) -> RuntimeCredentials:
+        data, backup = validate_separate_roots(self.data_dir, self.backup_dir)
+        validate_credential_paths(
+            (
+                self.bot_token_file,
+                self.pending_database_key_file,
+                self.public_database_key_file,
+                self.pseudonym_key_file,
+            ),
+            data,
+            backup,
+        )
         token = read_credential(self.bot_token_file, "Telegram bot token")
         pending = read_credential(
             self.pending_database_key_file, "pending database key", minimum_bytes=32
@@ -130,9 +162,10 @@ class PublicAssistantConfig:
         pseudonym = read_credential(
             self.pseudonym_key_file, "pseudonym key", minimum_bytes=32
         ).encode("utf-8")
-        if pending == public:
+        material = {token.encode(), pending.encode(), public.encode(), pseudonym}
+        if len(material) != 4:
             raise PublicAssistantConfigurationError(
-                "pending and public database keys must be distinct"
+                "runtime credential material must be distinct"
             )
         return RuntimeCredentials(token, pending, public, pseudonym)
 
@@ -179,17 +212,21 @@ class PublicAssistantConfig:
             Path(_required(env, "PUBLIC_ASSISTANT_DATA_DIR")),
             Path(_required(env, "PUBLIC_ASSISTANT_BACKUP_DIR")),
         )
+        credential_paths = validate_credential_paths(
+            (
+                _credential_path(env, "PUBLIC_ASSISTANT_BOT_TOKEN_FILE"),
+                _credential_path(env, "PUBLIC_ASSISTANT_PENDING_DATABASE_KEY_FILE"),
+                _credential_path(env, "PUBLIC_ASSISTANT_PUBLIC_DATABASE_KEY_FILE"),
+                _credential_path(env, "PUBLIC_ASSISTANT_PSEUDONYM_KEY_FILE"),
+            ),
+            data,
+            backup,
+        )
         return cls(
-            bot_token_file=_credential_path(env, "PUBLIC_ASSISTANT_BOT_TOKEN_FILE"),
-            pending_database_key_file=_credential_path(
-                env, "PUBLIC_ASSISTANT_PENDING_DATABASE_KEY_FILE"
-            ),
-            public_database_key_file=_credential_path(
-                env, "PUBLIC_ASSISTANT_PUBLIC_DATABASE_KEY_FILE"
-            ),
-            pseudonym_key_file=_credential_path(
-                env, "PUBLIC_ASSISTANT_PSEUDONYM_KEY_FILE"
-            ),
+            bot_token_file=credential_paths[0],
+            pending_database_key_file=credential_paths[1],
+            public_database_key_file=credential_paths[2],
+            pseudonym_key_file=credential_paths[3],
             owner_id=owner_id,
             selected_sender_ids=selected,
             data_dir=data,
@@ -222,13 +259,17 @@ class BackupConfig:
             Path(_required(env, "PUBLIC_ASSISTANT_DATA_DIR")),
             Path(_required(env, "PUBLIC_ASSISTANT_BACKUP_DIR")),
         )
+        credential_paths = validate_credential_paths(
+            (
+                _credential_path(env, "PUBLIC_ASSISTANT_PUBLIC_DATABASE_KEY_FILE"),
+                _credential_path(env, "PUBLIC_ASSISTANT_BACKUP_DATABASE_KEY_FILE"),
+            ),
+            data,
+            backup,
+        )
         return cls(
             data_dir=data,
             backup_dir=backup,
-            public_database_key_file=_credential_path(
-                env, "PUBLIC_ASSISTANT_PUBLIC_DATABASE_KEY_FILE"
-            ),
-            backup_database_key_file=_credential_path(
-                env, "PUBLIC_ASSISTANT_BACKUP_DATABASE_KEY_FILE"
-            ),
+            public_database_key_file=credential_paths[0],
+            backup_database_key_file=credential_paths[1],
         )

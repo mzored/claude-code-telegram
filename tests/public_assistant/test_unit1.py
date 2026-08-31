@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import io
 import json
 import logging
 import os
@@ -17,12 +18,17 @@ from typing import Any
 import pytest
 from sqlcipher3 import dbapi2 as sqlcipher
 from telegram import Bot, Update
+from telegram.error import Conflict, NetworkError
 
 from src.public_assistant.backup import export_public_backup
 from src.public_assistant.config import (
     BackupConfig,
     PublicAssistantConfig,
     PublicAssistantConfigurationError,
+)
+from src.public_assistant.main import (
+    CredentialRedactingFormatter,
+    DependencyPrivacyFilter,
 )
 from src.public_assistant.service import (
     DefiniteDeliveryError,
@@ -35,6 +41,7 @@ from src.public_assistant.telegram_adapter import (
     EXPLICIT_ALLOWED_UPDATES,
     DurablePollingRunner,
     TelegramBusinessAdapter,
+    TransientConnectionError,
     build_application,
 )
 from src.public_assistant.types import (
@@ -42,6 +49,7 @@ from src.public_assistant.types import (
     DeleteNotice,
     DeliveryState,
     InboundMessage,
+    OwnerMessage,
 )
 
 OWNER_ID = 101001
@@ -409,6 +417,7 @@ async def test_authoritative_refresh_uses_observation_time_on_admission_and_send
     adapter = TelegramBusinessAdapter(config, service, store, now=clock.now)
     bot = BoundaryBot(clock)
     await adapter.on_business_message(telegram_message(clock), SimpleNamespace(bot=bot))
+    await adapter.deliver_due_replies(bot)
     assert bot.refreshes == 2
     observed = store.public.execute(
         "SELECT observed_at FROM business_connections"
@@ -428,9 +437,10 @@ async def test_connection_lookup_failure_fails_closed_without_storing_body(
         async def get_business_connection(self, connection_id: str) -> Any:
             raise OSError(connection_id)
 
-    await adapter.on_business_message(
-        telegram_message(clock), SimpleNamespace(bot=FailingBot())
-    )
+    with pytest.raises(TransientConnectionError):
+        await adapter.on_business_message(
+            telegram_message(clock), SimpleNamespace(bot=FailingBot())
+        )
     assert store.counts()["pending"] == 0
 
 
@@ -526,10 +536,11 @@ async def test_callback_consent_lookup_failure_answers_neutrally_without_accepti
         answer=answer,
     )
     adapter = TelegramBusinessAdapter(config, service, store, now=clock.now)
-    await adapter.on_callback_query(
-        SimpleNamespace(callback_query=query), SimpleNamespace(bot=FailingBot())
-    )
-    assert answers == ["This control is unavailable."]
+    with pytest.raises(TransientConnectionError):
+        await adapter.on_callback_query(
+            SimpleNamespace(callback_query=query), SimpleNamespace(bot=FailingBot())
+        )
+    assert answers == []
     assert store.counts()["pending"] == 1
 
 
@@ -977,19 +988,21 @@ async def test_handler_failure_never_advances_offset(
     assert store.get_next_update_id() is None
 
 
-def test_offset_cannot_advance_while_source_reply_is_pending_or_sending(
+def test_durable_pending_can_advance_offset_but_sending_cannot(
     service: SecretaryService, store: Unit1Store, clock: Clock
 ) -> None:
     result = service.handle_message(inbound(clock, update_id=70))
     assert result.reply is not None
-    with pytest.raises(RuntimeError, match="unfinished reply"):
-        store.commit_update_offset(70)
-    assert store.mark_reply_sending(result.reply.reply_id)
-    with pytest.raises(RuntimeError, match="unfinished reply"):
-        store.commit_update_offset(70)
-    store.finalize_reply(result.reply.reply_id, DeliveryState.DELIVERY_UNCERTAIN)
     store.commit_update_offset(70)
     assert store.get_next_update_id() == 71
+    sending = service.handle_message(inbound(clock, update_id=72, message_id=82))
+    assert sending.reply is not None
+    assert store.mark_reply_sending(sending.reply.reply_id)
+    with pytest.raises(RuntimeError, match="unfinished reply"):
+        store.commit_update_offset(72)
+    store.finalize_reply(sending.reply.reply_id, DeliveryState.DELIVERY_UNCERTAIN)
+    store.commit_update_offset(72)
+    assert store.get_next_update_id() == 73
 
 
 def test_replay_resumes_incomplete_ingress_ledger(
@@ -1054,6 +1067,10 @@ async def test_custom_polling_lifecycle_dispatches_seeded_pending_before_fetch(
     stopped = asyncio.Event()
 
     class LifecycleBot(PollBot):
+        async def delete_webhook(self, **kwargs: Any) -> bool:
+            self.polls.append(kwargs)
+            return True
+
         async def get_updates(self, **kwargs: Any) -> tuple[Update, ...]:
             self.polls.append(kwargs)
             stopped.set()
@@ -1082,6 +1099,7 @@ async def test_custom_polling_lifecycle_dispatches_seeded_pending_before_fetch(
     runner = DurablePollingRunner(application, adapter, store)  # type: ignore[arg-type]
     await runner.run(stopped)
     assert application.events == ["initialize", "start", "stop", "shutdown"]
+    assert bot.polls[0] == {"drop_pending_updates": False}
     assert len(bot.sent) == 1
 
 
@@ -1150,3 +1168,616 @@ def test_unit1_has_no_model_integration_or_private_agent_imports() -> None:
         not any(name == prefix or name.startswith(prefix + ".") for prefix in forbidden)
         for name in imported
     )
+
+
+def test_dependency_critical_logs_never_render_raw_update_payloads_or_ids() -> None:
+    output = io.StringIO()
+    handler = logging.StreamHandler(output)
+    handler.addFilter(DependencyPrivacyFilter())
+    handler.setFormatter(CredentialRedactingFormatter("%(levelname)s %(message)s"))
+    logger = logging.getLogger("telegram.ext.Application")
+    prior_handlers, prior_propagate = logger.handlers, logger.propagate
+    logger.handlers = [handler]
+    logger.propagate = False
+    try:
+        try:
+            raise ValueError(f"parse failed {BODY} update_id=998877")
+        except ValueError:
+            logger.critical(
+                "Failed to parse raw payload %s sender=%s",
+                BODY,
+                SENDER_ID,
+                exc_info=True,
+            )
+    finally:
+        logger.handlers = prior_handlers
+        logger.propagate = prior_propagate
+    rendered = output.getvalue()
+    assert "dependency diagnostic redacted" in rendered
+    assert BODY not in rendered
+    assert str(SENDER_ID) not in rendered
+    assert "998877" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_queued_takeover_is_drained_before_pending_outbox_delivery(
+    config: PublicAssistantConfig,
+    service: SecretaryService,
+    store: Unit1Store,
+    clock: Clock,
+) -> None:
+    sender_update = telegram_message(clock, update_id=200, message_id=201)
+    takeover_update = telegram_message(
+        clock, update_id=202, message_id=203, sender_id=OWNER_ID, text=None
+    )
+    bot = PollBot(clock, [sender_update, takeover_update])
+    adapter = TelegramBusinessAdapter(config, service, store, now=clock.now)
+    runner = DurablePollingRunner(FakeApplication(bot), adapter, store)  # type: ignore[arg-type]
+    assert await runner.run_once()
+    assert store.get_next_update_id() == 203
+    assert store.is_taken_over(CONNECTION_ID, SENDER_ID)
+    assert bot.sent == []
+    assert store.public.execute("SELECT state FROM replies").fetchone()[0] == (
+        DeliveryState.CANCELLED.value
+    )
+
+
+@pytest.mark.asyncio
+async def test_queued_edit_replaces_and_cancels_original_pending_reply_before_send(
+    config: PublicAssistantConfig,
+    service: SecretaryService,
+    store: Unit1Store,
+    clock: Clock,
+) -> None:
+    authorize(service, store, clock)
+    original = service.handle_message(
+        inbound(clock, update_id=210, message_id=211, text="before edit")
+    )
+    assert original.reply is not None
+    edited_update = Update.de_json(
+        {
+            "update_id": 212,
+            "edited_business_message": {
+                "message_id": 211,
+                "date": int(clock.timestamp()),
+                "edit_date": int(clock.timestamp()),
+                "chat": {"id": SENDER_ID, "type": "private", "first_name": "Pilot"},
+                "from": {"id": SENDER_ID, "is_bot": False, "first_name": "Pilot"},
+                "business_connection_id": CONNECTION_ID,
+                "text": "after edit",
+            },
+        },
+        Bot(BOT_TOKEN),
+    )
+    bot = PollBot(clock, [edited_update])
+    adapter = TelegramBusinessAdapter(config, service, store, now=clock.now)
+    runner = DurablePollingRunner(FakeApplication(bot), adapter, store)  # type: ignore[arg-type]
+    assert await runner.run_once()
+    assert store.get_reply(original.reply.reply_id).state == DeliveryState.CANCELLED
+    assert len(bot.sent) == 1
+    assert (
+        store.public.execute(
+            "SELECT body FROM messages WHERE message_id=211"
+        ).fetchone()[0]
+        == "after edit"
+    )
+
+
+@pytest.mark.asyncio
+async def test_transient_connection_refresh_retries_without_ack_or_cancelling_reply(
+    config: PublicAssistantConfig,
+    service: SecretaryService,
+    store: Unit1Store,
+    clock: Clock,
+) -> None:
+    result = service.handle_message(inbound(clock, update_id=220, message_id=221))
+    assert result.reply is not None
+    sleeps: list[float] = []
+
+    class TransientBot(BoundaryBot):
+        async def get_business_connection(self, connection_id: str) -> Any:
+            self.refreshes += 1
+            raise NetworkError("temporary network failure")
+
+    bot = TransientBot(clock)
+    adapter = TelegramBusinessAdapter(
+        config,
+        service,
+        store,
+        now=clock.now,
+        sleep=lambda seconds: _record_sleep(sleeps, seconds),
+    )
+    await adapter.deliver_due_replies(bot)
+    assert bot.refreshes == 3
+    assert sleeps == [1.0, 2.0]
+    assert store.get_reply(result.reply.reply_id).state == DeliveryState.PENDING
+
+
+async def _record_sleep(values: list[float], seconds: float) -> None:
+    values.append(seconds)
+
+
+def test_edit_under_new_processing_scope_stages_body_without_public_overwrite(
+    config: PublicAssistantConfig,
+    service: SecretaryService,
+    store: Unit1Store,
+    clock: Clock,
+) -> None:
+    authorize(service, store, clock)
+    changed = SecretaryService(
+        replace(config, processing_authorization_version="scope-2"),
+        store,
+        now=clock.now,
+    )
+    edited = changed.handle_edit(
+        inbound(clock, update_id=230, message_id=11, text="new scope body", edited=True)
+    )
+    assert edited.outcome == "awaiting_consent"
+    assert (
+        store.public.execute(
+            "SELECT body FROM messages WHERE message_id=11"
+        ).fetchone()[0]
+        == BODY
+    )
+    pending = store.pending.execute(
+        "SELECT body, processing_authorization_version FROM pending_messages"
+    ).fetchone()
+    assert tuple(pending) == ("new scope body", "scope-2")
+
+
+def test_edit_preserves_source_binding_and_delete_cancels_reprocessed_reply(
+    service: SecretaryService, store: Unit1Store, clock: Clock
+) -> None:
+    authorize(service, store, clock)
+    original = service.handle_message(
+        inbound(clock, update_id=240, message_id=241, text="original")
+    )
+    assert original.reply is not None
+    edited = service.handle_edit(
+        inbound(clock, update_id=242, message_id=241, text="edited", edited=True)
+    )
+    assert edited.reply is not None
+    row = store.public.execute(
+        """SELECT source_update_id, last_update_id FROM messages
+           WHERE message_id=241"""
+    ).fetchone()
+    assert tuple(row) == (240, 242)
+    assert store.get_reply(original.reply.reply_id).state == DeliveryState.CANCELLED
+    assert (
+        service.handle_delete(
+            DeleteNotice(CONNECTION_ID, SENDER_ID, (241,), 243)
+        ).outcome
+        == "deleted"
+    )
+    assert store.get_reply(edited.reply.reply_id).state == DeliveryState.CANCELLED
+    ledger = store.public.execute(
+        """SELECT subject_ref, message_key FROM processed_updates
+           WHERE update_id=243"""
+    ).fetchone()
+    assert ledger[0].startswith("subject_") and ledger[1].startswith("message_")
+
+
+@pytest.mark.parametrize("crash_stage", ["after_tombstone", "after_pending_delete"])
+def test_disconnect_tombstone_purges_unconsented_body_after_crash(
+    config: PublicAssistantConfig,
+    service: SecretaryService,
+    store: Unit1Store,
+    clock: Clock,
+    crash_stage: str,
+) -> None:
+    result = service.handle_message(inbound(clock))
+    assert result.outcome == "awaiting_consent"
+    assert result.reply is not None
+
+    def crash(stage: str) -> None:
+        if stage == crash_stage:
+            raise TransferInterrupted(stage)
+
+    with pytest.raises(TransferInterrupted):
+        store.purge_unconsented_connection(CONNECTION_ID, crash_hook=crash)
+    store.close()
+    reopened = Unit1Store(
+        config.data_dir,
+        PENDING_KEY,
+        PUBLIC_KEY,
+        PSEUDONYM_KEY,
+        clock=clock.timestamp,
+    )
+    assert reopened.counts()["pending"] == 0
+    assert reopened.counts()["messages"] == 0
+    assert reopened.get_reply(result.reply.reply_id).state == DeliveryState.CANCELLED
+    reopened.close()
+
+
+def test_pending_edit_preserves_original_source_update_binding(
+    service: SecretaryService, store: Unit1Store, clock: Clock
+) -> None:
+    assert (
+        service.handle_message(inbound(clock, update_id=245, message_id=246)).outcome
+        == "awaiting_consent"
+    )
+    assert (
+        service.handle_edit(
+            inbound(clock, update_id=247, message_id=246, text="edited", edited=True)
+        ).outcome
+        == "pending_body_replaced"
+    )
+    row = store.pending.execute(
+        """SELECT source_update_id, last_update_id, body FROM pending_messages
+           WHERE message_id=246"""
+    ).fetchone()
+    assert tuple(row) == (245, 247, "edited")
+
+
+@pytest.mark.asyncio
+async def test_disabled_business_connection_update_immediately_purges_pending(
+    config: PublicAssistantConfig,
+    service: SecretaryService,
+    store: Unit1Store,
+    clock: Clock,
+) -> None:
+    assert service.handle_message(inbound(clock)).outcome == "awaiting_consent"
+    update = Update.de_json(
+        {
+            "update_id": 244,
+            "business_connection": {
+                "id": CONNECTION_ID,
+                "user": {"id": OWNER_ID, "is_bot": False, "first_name": "Owner"},
+                "user_chat_id": OWNER_ID + 1,
+                "date": int(clock.timestamp()),
+                "is_enabled": False,
+                "rights": {"can_reply": False},
+            },
+        },
+        Bot(BOT_TOKEN),
+    )
+    adapter = TelegramBusinessAdapter(config, service, store, now=clock.now)
+    await adapter.on_business_connection(update, SimpleNamespace())
+    assert store.counts()["pending"] == 0
+    assert (
+        store.public.execute("SELECT state FROM replies").fetchone()[0]
+        == DeliveryState.CANCELLED.value
+    )
+
+
+def test_consent_and_reconsent_store_canonical_scope_and_policy(
+    config: PublicAssistantConfig,
+    service: SecretaryService,
+    store: Unit1Store,
+    clock: Clock,
+) -> None:
+    authorize(service, store, clock)
+    row = store.public.execute(
+        """SELECT privacy_policy_version, processors, purposes FROM consents"""
+    ).fetchone()
+    assert row[0] == config.privacy_policy_version
+    assert json.loads(row[1]) == ["OpenAI", "Google Calendar", "Todoist"]
+    assert json.loads(row[2]) == [
+        "assistant replies",
+        "meeting actions",
+        "external tasks",
+    ]
+    privacy = service.handle_message(
+        inbound(clock, update_id=250, message_id=251, text="privacy")
+    )
+    assert privacy.reply is not None
+    assert control(service, store, privacy.reply, "Revoke", message_id=252) == "revoked"
+    stopped = service.handle_message(
+        inbound(clock, update_id=253, message_id=254, text="not stored")
+    )
+    assert stopped.reply is not None
+    sent_reply(store, stopped.reply, 255)
+    assert (
+        service.handle_control(
+            callback(stopped.reply, "Enable processing"),
+            actor_id=SENDER_ID,
+            conversation_id=SENDER_ID,
+            connection_id=CONNECTION_ID,
+            origin_message_id=255,
+        )
+        == "accepted"
+    )
+    row = store.public.execute(
+        "SELECT privacy_policy_version, processors, purposes FROM consents"
+    ).fetchone()
+    assert row[0] == config.privacy_policy_version
+    assert json.loads(row[1]) == ["OpenAI", "Google Calendar", "Todoist"]
+
+
+def test_credential_paths_and_material_are_isolated(
+    config: PublicAssistantConfig, tmp_path: Path
+) -> None:
+    environment = {
+        "PUBLIC_ASSISTANT_SELECTED_SENDERS": str(SENDER_ID),
+        "PUBLIC_ASSISTANT_OWNER_ID": str(OWNER_ID),
+        "PUBLIC_ASSISTANT_DATA_DIR": str(tmp_path / "live"),
+        "PUBLIC_ASSISTANT_BACKUP_DIR": str(tmp_path / "backup"),
+        "PUBLIC_ASSISTANT_BOT_TOKEN_FILE": str(config.bot_token_file),
+        "PUBLIC_ASSISTANT_PENDING_DATABASE_KEY_FILE": str(
+            config.pending_database_key_file
+        ),
+        "PUBLIC_ASSISTANT_PUBLIC_DATABASE_KEY_FILE": str(
+            config.public_database_key_file
+        ),
+        "PUBLIC_ASSISTANT_PSEUDONYM_KEY_FILE": str(config.pseudonym_key_file),
+        "PUBLIC_ASSISTANT_PRIVACY_URL": config.privacy_url,
+        "PUBLIC_ASSISTANT_PRIVACY_POLICY_VERSION": "policy",
+        "PUBLIC_ASSISTANT_PROCESSING_AUTHORIZATION_VERSION": "scope",
+    }
+    protected_paths = (
+        tmp_path / "live" / "token",
+        tmp_path / "backup" / "token",
+        Path("pyproject.toml").resolve(),
+    )
+    for protected in protected_paths[:2]:
+        protected.parent.mkdir(exist_ok=True)
+        credential(protected, BOT_TOKEN)
+    for protected in protected_paths:
+        with pytest.raises(PublicAssistantConfigurationError, match="outside"):
+            PublicAssistantConfig.from_environment(
+                environment | {"PUBLIC_ASSISTANT_BOT_TOKEN_FILE": str(protected)}
+            )
+    config.public_database_key_file.write_text(PENDING_KEY)
+    config.public_database_key_file.chmod(0o600)
+    with pytest.raises(PublicAssistantConfigurationError, match="material"):
+        config.load_runtime_credentials()
+
+
+def test_backup_missing_source_fails_without_creating_live_database(
+    config: PublicAssistantConfig, tmp_path: Path
+) -> None:
+    backup_key_file = credential(tmp_path / "separate-backup-key", BACKUP_KEY)
+    missing_data = tmp_path / "missing-live"
+    maintenance = BackupConfig(
+        missing_data,
+        config.backup_dir,
+        config.public_database_key_file,
+        backup_key_file,
+    )
+    with pytest.raises(PublicAssistantConfigurationError, match="does not exist"):
+        export_public_backup(maintenance, config.backup_dir / "missing.db")
+    assert not (missing_data / "public.db").exists()
+
+
+def test_wal_is_bounded_checkpointed_and_rolls_back_crashed_transaction(
+    store: Unit1Store,
+) -> None:
+    assert store.public.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 1000
+    assert store.public.execute("PRAGMA journal_size_limit").fetchone()[0] == 67108864
+    with pytest.raises(RuntimeError, match="crash"):
+        with store.public.transaction() as connection:
+            connection.execute(
+                "INSERT INTO privacy_state VALUES ('crash-subject', 'revoked', 1)"
+            )
+            raise RuntimeError("crash")
+    assert (
+        store.public.execute(
+            "SELECT 1 FROM privacy_state WHERE subject_ref='crash-subject'"
+        ).fetchone()
+        is None
+    )
+    checkpoint = store.public.checkpoint("TRUNCATE")
+    assert len(checkpoint) == 3
+    assert os.path.getsize(store.data_dir / "public.db-wal") == 0
+
+
+def test_deletion_ledger_is_subject_bound_and_removed_by_erasure_and_ttl(
+    config: PublicAssistantConfig, clock: Clock, tmp_path: Path
+) -> None:
+    def build(data_dir: Path) -> tuple[Unit1Store, SecretaryService]:
+        local_store = Unit1Store(
+            data_dir, PENDING_KEY, PUBLIC_KEY, PSEUDONYM_KEY, clock=clock.timestamp
+        )
+        local_service = SecretaryService(config, local_store, now=clock.now)
+        local_service.observe_connection(
+            ConnectionObservation(CONNECTION_ID, OWNER_ID, True, True, clock.now())
+        )
+        return local_store, local_service
+
+    erased_store, erased_service = build(tmp_path / "erasure-ledger")
+    authorize(erased_service, erased_store, clock)
+    privacy = erased_service.handle_message(
+        inbound(clock, update_id=280, message_id=281, text="privacy")
+    )
+    assert privacy.reply is not None
+    sent_reply(erased_store, privacy.reply, 282)
+    assert (
+        erased_service.handle_delete(
+            DeleteNotice(CONNECTION_ID, SENDER_ID, (11,), 283)
+        ).outcome
+        == "deleted"
+    )
+    ledger = erased_store.public.execute(
+        "SELECT subject_ref FROM processed_updates WHERE update_id=283"
+    ).fetchone()
+    assert ledger[0].startswith("subject_")
+    assert (
+        erased_service.handle_control(
+            callback(privacy.reply, "Delete data"),
+            actor_id=SENDER_ID,
+            conversation_id=SENDER_ID,
+            connection_id=CONNECTION_ID,
+            origin_message_id=282,
+        )
+        == "erased"
+    )
+    assert (
+        erased_store.public.execute("SELECT count(*) FROM deletion_links").fetchone()[0]
+        == 0
+    )
+    assert (
+        erased_store.public.execute(
+            "SELECT count(*) FROM processed_updates WHERE update_id=283"
+        ).fetchone()[0]
+        == 0
+    )
+    erased_store.close()
+
+    ttl_store, ttl_service = build(tmp_path / "ttl-ledger")
+    authorize(ttl_service, ttl_store, clock)
+    assert (
+        ttl_service.handle_delete(
+            DeleteNotice(CONNECTION_ID, SENDER_ID, (11,), 284)
+        ).outcome
+        == "deleted"
+    )
+    clock.advance(days=90)
+    assert ttl_store.expire_public(config.retention_seconds) == 1
+    assert (
+        ttl_store.public.execute(
+            "SELECT count(*) FROM deletion_links WHERE update_id=284"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        ttl_store.public.execute(
+            "SELECT count(*) FROM processed_updates WHERE update_id=284"
+        ).fetchone()[0]
+        == 0
+    )
+    ttl_store.close()
+
+
+@pytest.mark.asyncio
+async def test_polling_bootstrap_and_network_retry_are_bounded_but_conflict_is_fast(
+    store: Unit1Store, clock: Clock
+) -> None:
+    sleeps: list[float] = []
+
+    class RetryBot(PollBot):
+        attempts = 0
+
+        async def get_updates(self, **kwargs: Any) -> tuple[Update, ...]:
+            self.attempts += 1
+            if self.attempts < 3:
+                raise NetworkError("temporary")
+            return ()
+
+    bot = RetryBot(clock, [])
+    runner = DurablePollingRunner(
+        FakeApplication(bot),
+        SimpleNamespace(
+            config=SimpleNamespace(retention_seconds=1), deliver_due_replies=_noop_due
+        ),
+        store,  # type: ignore[arg-type]
+        sleep=lambda seconds: _record_sleep(sleeps, seconds),
+    )
+    assert await runner.run_once() is False
+    assert bot.attempts >= 3
+    assert sleeps[:2] == [1.0, 2.0]
+
+    class ConflictBot(PollBot):
+        attempts = 0
+
+        async def get_updates(self, **kwargs: Any) -> tuple[Update, ...]:
+            self.attempts += 1
+            raise Conflict("another poller")
+
+    conflict_bot = ConflictBot(clock, [])
+    conflict_runner = DurablePollingRunner(
+        FakeApplication(conflict_bot),
+        SimpleNamespace(
+            config=SimpleNamespace(retention_seconds=1), deliver_due_replies=_noop_due
+        ),
+        store,  # type: ignore[arg-type]
+        sleep=lambda seconds: _record_sleep(sleeps, seconds),
+    )
+    with pytest.raises(Conflict):
+        await conflict_runner.run_once()
+    assert conflict_bot.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_webhook_bootstrap_retries_network_and_never_drops_updates(
+    config: PublicAssistantConfig,
+    service: SecretaryService,
+    store: Unit1Store,
+    clock: Clock,
+) -> None:
+    sleeps: list[float] = []
+
+    class BootstrapBot(PollBot):
+        webhook_attempts = 0
+
+        async def delete_webhook(self, **kwargs: Any) -> bool:
+            assert kwargs == {"drop_pending_updates": False}
+            self.webhook_attempts += 1
+            if self.webhook_attempts < 3:
+                raise NetworkError("temporary bootstrap failure")
+            return True
+
+    class BootstrapApplication(FakeApplication):
+        events: list[str]
+
+        def __init__(self, bot: PollBot) -> None:
+            super().__init__(bot)
+            self.events = []
+
+        async def initialize(self) -> None:
+            self.events.append("initialize")
+
+        async def start(self) -> None:
+            self.events.append("start")
+
+        async def stop(self) -> None:
+            self.events.append("stop")
+
+        async def shutdown(self) -> None:
+            self.events.append("shutdown")
+
+    stopped = asyncio.Event()
+    stopped.set()
+    bot = BootstrapBot(clock, [])
+    application = BootstrapApplication(bot)
+    adapter = TelegramBusinessAdapter(config, service, store, now=clock.now)
+    runner = DurablePollingRunner(
+        application,
+        adapter,
+        store,  # type: ignore[arg-type]
+        sleep=lambda seconds: _record_sleep(sleeps, seconds),
+    )
+    await runner.run(stopped)
+    assert bot.webhook_attempts == 3
+    assert sleeps == [1.0, 2.0]
+    assert application.events == ["initialize", "start", "stop", "shutdown"]
+
+
+async def _noop_due(bot: Any) -> None:
+    return None
+
+
+@pytest.mark.parametrize("privacy_action", ["Revoke", "Delete data"])
+def test_sender_privacy_actions_preserve_owner_takeover_state(
+    privacy_action: str,
+    service: SecretaryService,
+    store: Unit1Store,
+    clock: Clock,
+) -> None:
+    authorize(service, store, clock)
+    privacy = service.handle_message(
+        inbound(clock, update_id=270, message_id=271, text="privacy")
+    )
+    assert privacy.reply is not None
+    sent_reply(store, privacy.reply, 272)
+    assert (
+        service.handle_owner_message(
+            OwnerMessage(CONNECTION_ID, SENDER_ID, OWNER_ID, 273, 274, None)
+        ).outcome
+        == "owner_takeover"
+    )
+    outcome = service.handle_control(
+        callback(privacy.reply, privacy_action),
+        actor_id=SENDER_ID,
+        conversation_id=SENDER_ID,
+        connection_id=CONNECTION_ID,
+        origin_message_id=272,
+    )
+    assert outcome == ("revoked" if privacy_action == "Revoke" else "erased")
+    assert store.is_taken_over(CONNECTION_ID, SENDER_ID)
+    columns = [
+        str(row[1])
+        for row in store.public.execute("PRAGMA table_info(chat_state)").fetchall()
+    ]
+    assert columns == ["chat_key", "takeover_at"]
+    state = store.public.execute("SELECT chat_key FROM chat_state").fetchone()
+    assert state[0] == store.chat_key(CONNECTION_ID, SENDER_ID)
