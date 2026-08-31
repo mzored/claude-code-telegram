@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from sqlcipher3 import dbapi2 as sqlcipher
 
 from src.policy_gate.executors import ExecutionOutcome, MockExecutor, ReconcileOutcome
 from src.policy_gate.service import PolicyGateService
@@ -78,6 +79,46 @@ def test_default_code_policy_exposes_and_executes_nothing(tmp_path: Path) -> Non
     assert service.submit_action(action).outcome == "denied"
     assert executor.calls == []
     store.close()
+
+
+def test_candidate_provenance_schema_rejects_incomplete_external_link(
+    gate: tuple,
+) -> None:
+    _, store, _ = gate
+    with pytest.raises(sqlcipher.IntegrityError):
+        store.database.execute(
+            """INSERT INTO candidate_actions(
+                   action_id, binding_digest, binding_json, subject_id, created_at,
+                   provenance, external_link_identity, external_source_digest
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "a" * 64,
+                "b" * 64,
+                "{}",
+                "subject-a",
+                1,
+                "external_untrusted",
+                None,
+                None,
+            ),
+        )
+    with pytest.raises(sqlcipher.IntegrityError):
+        store.database.execute(
+            """INSERT INTO candidate_actions(
+                   action_id, binding_digest, binding_json, subject_id, created_at,
+                   provenance, external_link_identity, external_source_digest
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "c" * 64,
+                "d" * 64,
+                "{}",
+                "subject-a",
+                1,
+                "external_untrusted",
+                "e" * 64,
+                "not-a-sha256-digest",
+            ),
+        )
 
 
 def confirm(service: object, draft: AdminDraft, *, preview: int = 900) -> str:

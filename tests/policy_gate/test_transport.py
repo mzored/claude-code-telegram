@@ -38,7 +38,13 @@ def test_socket_group_and_roles_have_fixed_operations(short_run_dir: Path) -> No
     assert authorizer.authorize(501, 7001, "public", "allowed_actions")
     assert authorizer.authorize(501, 7001, "public", "submit_action")
     assert not authorizer.authorize(501, 7001, "public", "prepare_admin")
+    assert not authorizer.authorize(501, 7001, "public", "prepare_external_admin")
     assert authorizer.authorize(502, 9001, "controller", "prepare_admin")
+    assert authorizer.authorize(502, 9001, "controller", "prepare_external_admin")
+    assert authorizer.authorize(502, 9001, "controller", "confirm_external_admin")
+    assert not authorizer.authorize(
+        502, 9001, "controller", "_submit_owner_external_action"
+    )
     assert not authorizer.authorize(502, 9002, "controller", "prepare_admin")
     assert not authorizer.authorize(999, 9001, "controller", "confirm_admin")
 

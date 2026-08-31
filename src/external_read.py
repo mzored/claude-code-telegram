@@ -79,6 +79,24 @@ def source_digest(reference: ExternalRecordRef, content: str) -> str:
     ).hexdigest()
 
 
+def external_link_identity(reference_hash: str, source_digest_value: str) -> str:
+    """Bind one digest-only source locator to its exact observed source bytes."""
+
+    if not isinstance(reference_hash, str) or not _SHA256_HEX.fullmatch(reference_hash):
+        raise ValueError("external reference hash is invalid")
+    if not isinstance(source_digest_value, str) or not _SHA256_HEX.fullmatch(
+        source_digest_value
+    ):
+        raise ValueError("external source digest is invalid")
+    return hashlib.sha256(
+        _DIGEST_PREFIX
+        + b"link\0"
+        + reference_hash.encode("ascii")
+        + b"\0"
+        + source_digest_value.encode("ascii")
+    ).hexdigest()
+
+
 @dataclass(frozen=True)
 class ExternalSourceMetadata:
     """Trusted action envelope fields that contain no source body or title."""
@@ -133,6 +151,11 @@ class ExternalRecord:
             raise ValueError("external record content is required")
         if len(self.content.encode("utf-8")) > 16_000:
             raise ValueError("external record content is too large")
+        if (
+            source_digest(self.metadata.reference, self.content)
+            != self.metadata.source_digest
+        ):
+            raise ValueError("external record source digest does not match content")
 
     @classmethod
     def create(
@@ -202,5 +225,6 @@ __all__ = [
     "ExternalSource",
     "ExternalSourceMetadata",
     "EXTERNAL_SUMMARY_PREFIX",
+    "external_link_identity",
     "source_digest",
 ]

@@ -19,10 +19,13 @@ from src.policy_gate.transport import (
 )
 from src.policy_gate.types import (
     ActionBinding,
+    ActionOrigin,
     ActionResult,
     AdminDraft,
     AdminKind,
     AdminResult,
+    ExternalActionConfirmation,
+    ExternalActionLink,
     Operation,
     PreparedIntent,
     Scope,
@@ -181,9 +184,12 @@ _ACTION_KEYS = frozenset(
         "processing_authorization_version",
         "processing_authorization_revision",
         "processor_purpose",
+        "origin",
     }
 )
 _ACTION_RESULT_KEYS = frozenset({"outcome", "action_id"})
+_EXTERNAL_LINK_KEYS = frozenset({"link_identity", "source_digest"})
+_EXTERNAL_CONFIRMATION_KEYS = frozenset({"link", "confirmation_sequence"})
 _DRAFT_KEYS = frozenset(
     {
         "kind",
@@ -215,8 +221,9 @@ def _action_from_wire(value: object) -> ActionBinding:
     arguments = _object(fields["arguments"])
     try:
         operation = Operation(_text(fields["operation"]))
+        origin = ActionOrigin(_text(fields["origin"]))
     except ValueError as exc:
-        raise GateRpcProtocolError("RPC action operation is invalid") from exc
+        raise GateRpcProtocolError("RPC action origin or operation is invalid") from exc
     return ActionBinding(
         action_id=_text(fields["action_id"]),
         subject_id=_text(fields["subject_id"]),
@@ -233,6 +240,7 @@ def _action_from_wire(value: object) -> ActionBinding:
             fields["processing_authorization_revision"]
         ),
         processor_purpose=_text(fields["processor_purpose"]),
+        origin=origin,
     )
 
 
@@ -246,6 +254,43 @@ def _action_result_from_wire(value: object) -> ActionResult:
         outcome=_text(fields["outcome"]),
         action_id=_text(fields["action_id"], allow_empty=True),
     )
+
+
+def _external_link_to_wire(link: ExternalActionLink) -> dict[str, object]:
+    return {
+        "link_identity": link.link_identity,
+        "source_digest": link.source_digest,
+    }
+
+
+def _external_link_from_wire(value: object) -> ExternalActionLink:
+    fields = _object(value, _EXTERNAL_LINK_KEYS)
+    try:
+        return ExternalActionLink(
+            _text(fields["link_identity"]), _text(fields["source_digest"])
+        )
+    except ValueError as exc:
+        raise GateRpcProtocolError("external action link is invalid") from exc
+
+
+def _external_confirmation_to_wire(
+    confirmation: ExternalActionConfirmation,
+) -> dict[str, object]:
+    return {
+        "link": _external_link_to_wire(confirmation.link),
+        "confirmation_sequence": confirmation.confirmation_sequence,
+    }
+
+
+def _external_confirmation_from_wire(value: object) -> ExternalActionConfirmation:
+    fields = _object(value, _EXTERNAL_CONFIRMATION_KEYS)
+    try:
+        return ExternalActionConfirmation(
+            _external_link_from_wire(fields["link"]),
+            _integer(fields["confirmation_sequence"]),
+        )
+    except ValueError as exc:
+        raise GateRpcProtocolError("external confirmation is invalid") from exc
 
 
 def _draft_to_wire(draft: AdminDraft) -> dict[str, object]:
@@ -433,12 +478,16 @@ class GateRpcDispatcher:
                 return self.service.erase_subject(_text(fields["subject_id"]))
         elif request.role == "controller":
             if operation == "stage_owner_exact_action":
-                fields = _object(payload, frozenset({"request_reference", "binding"}))
+                fields = _object(
+                    payload,
+                    frozenset({"request_reference", "binding", "external_link"}),
+                )
                 return self.service.stage_owner_exact_action(
                     _reference_from_wire(fields["request_reference"]),
                     _action_from_wire(fields["binding"]),
+                    _external_link_from_wire(fields["external_link"]),
                 )
-            if operation == "exact_intent_execution_started":
+            if operation == "external_intent_execution_started":
                 fields = _object(
                     payload,
                     frozenset(
@@ -447,14 +496,46 @@ class GateRpcDispatcher:
                             "owner_id",
                             "control_chat_id",
                             "preview_message_id",
+                            "external_link",
                         }
                     ),
                 )
-                return self.service.exact_intent_execution_started(
+                return self.service.external_intent_execution_started(
                     _text(fields["intent_id"]),
                     owner_id=_integer(fields["owner_id"]),
                     control_chat_id=_integer(fields["control_chat_id"]),
                     preview_message_id=_integer(fields["preview_message_id"]),
+                    external_link=_external_link_from_wire(fields["external_link"]),
+                )
+            if operation == "prepare_external_admin":
+                fields = _object(
+                    payload,
+                    frozenset(
+                        {
+                            "reference",
+                            "draft",
+                            "owner_id",
+                            "control_chat_id",
+                            "preview_message_id",
+                            "external_link",
+                            "minimum_confirmation_sequence",
+                            "ttl_seconds",
+                        }
+                    ),
+                )
+                return _prepared_to_wire(
+                    self.service.prepare_external_admin(
+                        _reference_from_wire(fields["reference"]),
+                        _draft_from_wire(fields["draft"]),
+                        owner_id=_integer(fields["owner_id"]),
+                        control_chat_id=_integer(fields["control_chat_id"]),
+                        preview_message_id=_integer(fields["preview_message_id"]),
+                        external_link=_external_link_from_wire(fields["external_link"]),
+                        minimum_confirmation_sequence=_integer(
+                            fields["minimum_confirmation_sequence"]
+                        ),
+                        ttl_seconds=_integer(fields["ttl_seconds"]),
+                    )
                 )
             if operation == "prepare_admin":
                 fields = _object(
@@ -498,6 +579,30 @@ class GateRpcDispatcher:
                         owner_id=_integer(fields["owner_id"]),
                         control_chat_id=_integer(fields["control_chat_id"]),
                         preview_message_id=_integer(fields["preview_message_id"]),
+                    )
+                )
+            if operation == "confirm_external_admin":
+                fields = _object(
+                    payload,
+                    frozenset(
+                        {
+                            "intent_id",
+                            "owner_id",
+                            "control_chat_id",
+                            "preview_message_id",
+                            "external_confirmation",
+                        }
+                    ),
+                )
+                return _admin_result_to_wire(
+                    self.service.confirm_external_admin(
+                        _text(fields["intent_id"]),
+                        owner_id=_integer(fields["owner_id"]),
+                        control_chat_id=_integer(fields["control_chat_id"]),
+                        preview_message_id=_integer(fields["preview_message_id"]),
+                        external_confirmation=_external_confirmation_from_wire(
+                            fields["external_confirmation"]
+                        ),
                     )
                 )
             if operation == "set_breaker":
@@ -899,37 +1004,101 @@ class ControllerGateRpcClient(_GateRpcClient):
         )
 
     def stage_owner_exact_action(
-        self, request_reference: TrustedReference, binding: ActionBinding
+        self,
+        request_reference: TrustedReference,
+        binding: ActionBinding,
+        external_link: ExternalActionLink,
     ) -> bool:
         """Stage the one exact Unit 4 action the controller may prepare."""
 
+        if not isinstance(external_link, ExternalActionLink):
+            raise ValueError("external action link is invalid")
         return _boolean(
             self._call(
                 "stage_owner_exact_action",
                 {
                     "request_reference": _reference_to_wire(request_reference),
                     "binding": _action_to_wire(binding),
+                    "external_link": _external_link_to_wire(external_link),
                 },
             )
         )
 
-    def exact_intent_execution_started(
+    def prepare_external_admin(
+        self,
+        reference: TrustedReference,
+        draft: AdminDraft,
+        owner_id: int,
+        control_chat_id: int,
+        preview_message_id: int,
+        external_link: ExternalActionLink,
+        minimum_confirmation_sequence: int,
+        ttl_seconds: int = 300,
+    ) -> PreparedIntent:
+        if not isinstance(external_link, ExternalActionLink):
+            raise ValueError("external action link is invalid")
+        return _prepared_from_wire(
+            self._call(
+                "prepare_external_admin",
+                {
+                    "reference": _reference_to_wire(reference),
+                    "draft": _draft_to_wire(draft),
+                    "owner_id": owner_id,
+                    "control_chat_id": control_chat_id,
+                    "preview_message_id": preview_message_id,
+                    "external_link": _external_link_to_wire(external_link),
+                    "minimum_confirmation_sequence": minimum_confirmation_sequence,
+                    "ttl_seconds": ttl_seconds,
+                },
+            )
+        )
+
+    def external_intent_execution_started(
         self,
         intent_id: str,
         owner_id: int,
         control_chat_id: int,
         preview_message_id: int,
+        external_link: ExternalActionLink,
     ) -> bool:
         """Check recovery state without exposing an intent payload."""
 
+        if not isinstance(external_link, ExternalActionLink):
+            raise ValueError("external action link is invalid")
         return _boolean(
             self._call(
-                "exact_intent_execution_started",
+                "external_intent_execution_started",
                 {
                     "intent_id": intent_id,
                     "owner_id": owner_id,
                     "control_chat_id": control_chat_id,
                     "preview_message_id": preview_message_id,
+                    "external_link": _external_link_to_wire(external_link),
+                },
+            )
+        )
+
+    def confirm_external_admin(
+        self,
+        intent_id: str,
+        owner_id: int,
+        control_chat_id: int,
+        preview_message_id: int,
+        external_confirmation: ExternalActionConfirmation,
+    ) -> AdminResult:
+        if not isinstance(external_confirmation, ExternalActionConfirmation):
+            raise ValueError("external confirmation is invalid")
+        return _admin_result_from_wire(
+            self._call(
+                "confirm_external_admin",
+                {
+                    "intent_id": intent_id,
+                    "owner_id": owner_id,
+                    "control_chat_id": control_chat_id,
+                    "preview_message_id": preview_message_id,
+                    "external_confirmation": _external_confirmation_to_wire(
+                        external_confirmation
+                    ),
                 },
             )
         )

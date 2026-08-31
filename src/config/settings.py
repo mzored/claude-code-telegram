@@ -595,27 +595,19 @@ class Settings(BaseSettings):
         allowed_tools = self.claude_allowed_tools
         if allowed_tools is None:
             raise ValueError("external read requires an explicit Claude tool allowlist")
-        forbidden_tools = {"todoread", "todowrite", "todoist"}
+        forbidden_tools = {"todoread", "todowrite"}
         if any(
-            isinstance(tool, str) and tool.casefold() in forbidden_tools
+            isinstance(tool, str)
+            and (tool.casefold() in forbidden_tools or "todoist" in tool.casefold())
             for tool in allowed_tools
         ):
             raise ValueError("external read forbids direct Todoist Claude tools")
-        if self.enable_mcp and self.mcp_config_path is not None:
-            try:
-                payload = self.mcp_config_path.read_text(encoding="utf-8").casefold()
-            except OSError as exc:
-                raise ValueError(
-                    "external read cannot validate MCP configuration"
-                ) from exc
-            if (
-                "todoist" in payload
-                or "todo read" in payload
-                or "todo write" in payload
-            ):
-                raise ValueError(
-                    "external read forbids direct Todoist MCP configuration"
-                )
+        # The Claude SDK's project settings can contribute MCP servers outside the
+        # explicit tool allowlist.  In external-read mode the filtered adapter is
+        # the only permitted Todoist boundary, so every ordinary Claude MCP path
+        # is unavailable rather than trying to recognize server aliases.
+        if self.enable_mcp or self.mcp_config_path is not None:
+            raise ValueError("external read forbids MCP configuration")
 
     @property
     def is_production(self) -> bool:

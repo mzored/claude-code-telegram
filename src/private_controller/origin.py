@@ -9,7 +9,12 @@ from enum import Enum
 from pathlib import Path
 
 from src.encrypted_sqlite import SqlCipherDatabase
-from src.external_read import ExternalRecordRef, ExternalSourceMetadata
+from src.external_read import (
+    ExternalRecordRef,
+    ExternalSourceMetadata,
+    external_link_identity,
+)
+from src.policy_gate.types import ExternalActionLink
 
 
 class RunOrigin(str, Enum):
@@ -337,6 +342,55 @@ class RunOriginLedger:
             is not None
         )
 
+    @staticmethod
+    def _external_link_from_row(row: object) -> ExternalIntentLink:
+        get = getattr(row, "__getitem__")
+        return ExternalIntentLink(
+            intent_id=str(get("intent_id")),
+            source=str(get("source")),
+            reference_hash=str(get("reference_hash")),
+            source_digest=str(get("source_digest")),
+            request_hash=str(get("request_hash")),
+            subject_hash=str(get("subject_hash")),
+            prepare_run_id=str(get("prepare_run_id")),
+            minimum_confirmation_sequence=int(get("minimum_confirmation_sequence")),
+            terminal_at=(
+                None if get("terminal_at") is None else int(get("terminal_at"))
+            ),
+        )
+
+    def external_intent_link(self, intent_id: str) -> ExternalIntentLink:
+        """Load only the digest-only source link for one persisted intent."""
+
+        row = self.database.execute(
+            "SELECT * FROM external_intent_links WHERE intent_id=?", (intent_id,)
+        ).fetchone()
+        if row is None:
+            raise PermissionError("administration intent has no external source link")
+        return self._external_link_from_row(row)
+
+    def external_gate_link(self, intent_id: str) -> ExternalActionLink:
+        """Translate a durable controller link into Gate's strict opaque DTO."""
+
+        link = self.external_intent_link(intent_id)
+        return ExternalActionLink(
+            external_link_identity(link.reference_hash, link.source_digest),
+            link.source_digest,
+        )
+
+    def require_external_reference(
+        self, intent_id: str, reference: ExternalRecordRef
+    ) -> ExternalIntentLink:
+        """Check a supplied opaque ref against the durable link without reading it."""
+
+        link = self.external_intent_link(intent_id)
+        if (
+            link.source != reference.source.value
+            or link.reference_hash != reference.reference_hash()
+        ):
+            raise PermissionError("external source reference does not match preview")
+        return link
+
     def require_external_source_link(
         self,
         intent_id: str,
@@ -345,33 +399,14 @@ class RunOriginLedger:
     ) -> ExternalIntentLink:
         """Reject any source substitution or source-byte change before execution."""
 
-        row = self.database.execute(
-            "SELECT * FROM external_intent_links WHERE intent_id=?", (intent_id,)
-        ).fetchone()
-        if row is None:
-            raise PermissionError("administration intent has no external source link")
-        if (
-            str(row["source"]) != reference.source.value
-            or str(row["reference_hash"]) != reference.reference_hash()
-            or str(row["request_hash"]) != self._hash("request", metadata.request_id)
-            or str(row["subject_hash"]) != self._hash("subject", metadata.subject_id)
-        ):
+        link = self.require_external_reference(intent_id, reference)
+        if link.request_hash != self._hash(
+            "request", metadata.request_id
+        ) or link.subject_hash != self._hash("subject", metadata.subject_id):
             raise PermissionError("external source reference does not match preview")
-        if str(row["source_digest"]) != metadata.source_digest:
+        if link.source_digest != metadata.source_digest:
             raise PermissionError("external source changed after preview")
-        return ExternalIntentLink(
-            intent_id=str(row["intent_id"]),
-            source=str(row["source"]),
-            reference_hash=str(row["reference_hash"]),
-            source_digest=str(row["source_digest"]),
-            request_hash=str(row["request_hash"]),
-            subject_hash=str(row["subject_hash"]),
-            prepare_run_id=str(row["prepare_run_id"]),
-            minimum_confirmation_sequence=int(row["minimum_confirmation_sequence"]),
-            terminal_at=(
-                None if row["terminal_at"] is None else int(row["terminal_at"])
-            ),
-        )
+        return link
 
     def mark_external_terminal(self, intent_id: str) -> None:
         """Record only the time an exact external action reached Gate terminal state."""

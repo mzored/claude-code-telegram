@@ -10,14 +10,14 @@ from typing import Callable
 from src.encrypted_sqlite import EncryptedStoreError, SqlCipherDatabase
 from src.policy_gate.types import Operation
 
-GATE_SCHEMA_VERSION = 1
+GATE_SCHEMA_VERSION = 3
 
 GATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS gate_schema_meta (
     version INTEGER NOT NULL
 );
 INSERT INTO gate_schema_meta(version)
-SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM gate_schema_meta);
+SELECT 3 WHERE NOT EXISTS (SELECT 1 FROM gate_schema_meta);
 CREATE TABLE IF NOT EXISTS subjects (
     subject_id TEXT PRIMARY KEY,
     blocked INTEGER NOT NULL DEFAULT 0 CHECK(blocked IN (0, 1)),
@@ -83,9 +83,30 @@ CREATE TABLE IF NOT EXISTS administration_intents (
     preview_message_id INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
+    provenance TEXT NOT NULL CHECK(provenance IN
+        ('ordinary_public', 'external_untrusted')),
+    external_link_identity TEXT,
+    external_source_digest TEXT,
+    external_minimum_confirmation_sequence INTEGER,
     state TEXT NOT NULL CHECK(state IN
         ('prepared', 'executing', 'applied', 'expired', 'stale')),
     consumed_at INTEGER,
+    CHECK(
+        (provenance = 'ordinary_public'
+         AND external_link_identity IS NULL
+         AND external_source_digest IS NULL
+         AND external_minimum_confirmation_sequence IS NULL)
+        OR
+        (provenance = 'external_untrusted'
+         AND typeof(external_link_identity) = 'text'
+         AND length(external_link_identity) = 64
+         AND external_link_identity NOT GLOB '*[^0-9a-f]*'
+         AND typeof(external_source_digest) = 'text'
+         AND length(external_source_digest) = 64
+         AND external_source_digest NOT GLOB '*[^0-9a-f]*'
+         AND typeof(external_minimum_confirmation_sequence) = 'integer'
+         AND external_minimum_confirmation_sequence > 0)
+    ),
     FOREIGN KEY(subject_id) REFERENCES subjects(subject_id)
 );
 CREATE TABLE IF NOT EXISTS administration_audit (
@@ -101,6 +122,23 @@ CREATE TABLE IF NOT EXISTS candidate_actions (
     binding_json TEXT NOT NULL,
     subject_id TEXT NOT NULL,
     created_at INTEGER NOT NULL,
+    provenance TEXT NOT NULL CHECK(provenance IN
+        ('ordinary_public', 'external_untrusted')),
+    external_link_identity TEXT,
+    external_source_digest TEXT,
+    CHECK(
+        (provenance = 'ordinary_public'
+         AND external_link_identity IS NULL
+         AND external_source_digest IS NULL)
+        OR
+        (provenance = 'external_untrusted'
+         AND typeof(external_link_identity) = 'text'
+         AND length(external_link_identity) = 64
+         AND external_link_identity NOT GLOB '*[^0-9a-f]*'
+         AND typeof(external_source_digest) = 'text'
+         AND length(external_source_digest) = 64
+         AND external_source_digest NOT GLOB '*[^0-9a-f]*')
+    ),
     FOREIGN KEY(subject_id) REFERENCES subjects(subject_id)
 );
 CREATE TABLE IF NOT EXISTS action_journal (
@@ -109,6 +147,7 @@ CREATE TABLE IF NOT EXISTS action_journal (
     binding_json TEXT NOT NULL,
     subject_id TEXT NOT NULL,
     operation TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK(origin IN ('public_sender', 'owner_external')),
     state TEXT NOT NULL CHECK(state IN
         ('claimed', 'succeeded', 'definite_failure', 'uncertain', 'cancelled')),
     authority_id TEXT,
@@ -162,9 +201,156 @@ class GateStore:
         if version > GATE_SCHEMA_VERSION:
             self.database.close()
             raise EncryptedStoreError("gate database schema is newer than this binary")
+        if version == 1:
+            self._migrate_v1_to_v2()
+            version = int(
+                self.database.execute(
+                    "SELECT version FROM gate_schema_meta"
+                ).fetchone()[0]
+            )
+        if version == 2:
+            self._migrate_v2_to_v3()
+            version = int(
+                self.database.execute(
+                    "SELECT version FROM gate_schema_meta"
+                ).fetchone()[0]
+            )
         if version != GATE_SCHEMA_VERSION:
             self.database.close()
             raise EncryptedStoreError("gate database schema migration is incomplete")
+
+    def _migrate_v1_to_v2(self) -> None:
+        """Fail closed when legacy candidates have no durable provenance class."""
+
+        with self.database.transaction() as connection:
+            # Candidate actions are only unapproved proposals.  A v1 row cannot
+            # prove whether it originated on the ordinary public path or on the
+            # Unit 4 hostile-data path, so it is deliberately discarded.
+            connection.execute("DELETE FROM candidate_actions")
+            # An uncommitted legacy intent likewise has no source evidence that a
+            # new Gate can validate.  Preserve applied audit history, but make
+            # every potentially executable legacy intent fail closed.
+            connection.execute(
+                """UPDATE administration_intents SET state='stale'
+                   WHERE state IN ('prepared', 'executing')"""
+            )
+            connection.execute(
+                """CREATE TABLE candidate_actions_v2 (
+                    action_id TEXT PRIMARY KEY,
+                    binding_digest TEXT NOT NULL,
+                    binding_json TEXT NOT NULL,
+                    subject_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    provenance TEXT NOT NULL CHECK(provenance IN
+                        ('ordinary_public', 'external_untrusted')),
+                    external_link_identity TEXT,
+                    external_source_digest TEXT,
+                    CHECK(
+                        (provenance = 'ordinary_public'
+                         AND external_link_identity IS NULL
+                         AND external_source_digest IS NULL)
+                        OR
+                        (provenance = 'external_untrusted'
+                         AND typeof(external_link_identity) = 'text'
+                         AND length(external_link_identity) = 64
+                         AND external_link_identity NOT GLOB '*[^0-9a-f]*'
+                         AND typeof(external_source_digest) = 'text'
+                         AND length(external_source_digest) = 64
+                         AND external_source_digest NOT GLOB '*[^0-9a-f]*')
+                    ),
+                    FOREIGN KEY(subject_id) REFERENCES subjects(subject_id)
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE administration_intents_v2 (
+                    intent_id TEXT PRIMARY KEY,
+                    subject_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    old_state_json TEXT NOT NULL,
+                    new_state_json TEXT NOT NULL,
+                    base_subject_revision INTEGER NOT NULL,
+                    owner_id INTEGER NOT NULL,
+                    control_chat_id INTEGER NOT NULL,
+                    preview_message_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    provenance TEXT NOT NULL CHECK(provenance IN
+                        ('ordinary_public', 'external_untrusted')),
+                    external_link_identity TEXT,
+                    external_source_digest TEXT,
+                    external_minimum_confirmation_sequence INTEGER,
+                    state TEXT NOT NULL CHECK(state IN
+                        ('prepared', 'executing', 'applied', 'expired', 'stale')),
+                    consumed_at INTEGER,
+                    CHECK(
+                        (provenance = 'ordinary_public'
+                         AND external_link_identity IS NULL
+                         AND external_source_digest IS NULL
+                         AND external_minimum_confirmation_sequence IS NULL)
+                        OR
+                        (provenance = 'external_untrusted'
+                         AND typeof(external_link_identity) = 'text'
+                         AND length(external_link_identity) = 64
+                         AND external_link_identity NOT GLOB '*[^0-9a-f]*'
+                         AND typeof(external_source_digest) = 'text'
+                         AND length(external_source_digest) = 64
+                         AND external_source_digest NOT GLOB '*[^0-9a-f]*'
+                         AND typeof(external_minimum_confirmation_sequence) = 'integer'
+                         AND external_minimum_confirmation_sequence > 0)
+                    ),
+                    FOREIGN KEY(subject_id) REFERENCES subjects(subject_id)
+                )"""
+            )
+            connection.execute(
+                """INSERT INTO administration_intents_v2(
+                       intent_id, subject_id, kind, payload_json, old_state_json,
+                       new_state_json, base_subject_revision, owner_id,
+                       control_chat_id, preview_message_id, created_at, expires_at,
+                       provenance, external_link_identity, external_source_digest,
+                       external_minimum_confirmation_sequence, state, consumed_at
+                   )
+                   SELECT intent_id, subject_id, kind, payload_json, old_state_json,
+                          new_state_json, base_subject_revision, owner_id,
+                          control_chat_id, preview_message_id, created_at, expires_at,
+                          'ordinary_public', NULL, NULL, NULL, state, consumed_at
+                   FROM administration_intents"""
+            )
+            connection.execute("DROP TABLE candidate_actions")
+            connection.execute(
+                "ALTER TABLE candidate_actions_v2 RENAME TO candidate_actions"
+            )
+            connection.execute("DROP TABLE administration_intents")
+            connection.execute(
+                "ALTER TABLE administration_intents_v2 RENAME TO administration_intents"
+            )
+            connection.execute("UPDATE gate_schema_meta SET version=2")
+
+    def _migrate_v2_to_v3(self) -> None:
+        """Fail closed until every runnable action carries a canonical origin."""
+
+        with self.database.transaction() as connection:
+            connection.execute("DELETE FROM candidate_actions")
+            connection.execute(
+                """UPDATE administration_intents SET state='stale'
+                   WHERE state IN ('prepared', 'executing')"""
+            )
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(action_journal)"
+                ).fetchall()
+            }
+            if "origin" not in columns:
+                # Existing journals have no canonical origin.  Marking them
+                # owner_external makes public replay/reconciliation fail closed;
+                # their old binding bytes cannot be promoted into a new origin.
+                connection.execute(
+                    """ALTER TABLE action_journal
+                       ADD COLUMN origin TEXT NOT NULL DEFAULT 'owner_external'
+                       CHECK(origin IN ('public_sender', 'owner_external'))"""
+                )
+            connection.execute("UPDATE gate_schema_meta SET version=3")
 
     def now(self) -> int:
         return int(self._clock())

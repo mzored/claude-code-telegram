@@ -358,7 +358,15 @@ class ClaudeSDKManager:
                     "excludedCommands": self.config.sandbox_excluded_commands or [],
                 },
                 system_prompt=base_prompt,
-                setting_sources=["project"],
+                # Project settings may register MCP servers whose aliases are not
+                # represented in the explicit tool allowlist.  The external-read
+                # boundary therefore opts out of all project settings; ordinary
+                # non-external sessions retain the established project behavior.
+                setting_sources=(
+                    []
+                    if self.config.private_controller_external_read_enabled
+                    else ["project"]
+                ),
                 stderr=_stderr_callback,
             )
 

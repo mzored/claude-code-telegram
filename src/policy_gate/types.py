@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import unicodedata
 from dataclasses import dataclass
 from enum import Enum
@@ -35,6 +36,56 @@ class JournalState(str, Enum):
     DEFINITE_FAILURE = "definite_failure"
     UNCERTAIN = "uncertain"
     CANCELLED = "cancelled"
+
+
+class CandidateProvenance(str, Enum):
+    """The code-owned origin class for a staged immutable action."""
+
+    ORDINARY_PUBLIC = "ordinary_public"
+    EXTERNAL_UNTRUSTED = "external_untrusted"
+
+
+class ActionOrigin(str, Enum):
+    """Immutable execution origin carried by every canonical action binding."""
+
+    PUBLIC_SENDER = "public_sender"
+    OWNER_EXTERNAL = "owner_external"
+
+
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True)
+class ExternalActionLink:
+    """Digest-only identity that binds an external candidate to its source."""
+
+    link_identity: str
+    source_digest: str
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, str) or not _SHA256_HEX.fullmatch(value)
+            for value in (self.link_identity, self.source_digest)
+        ):
+            raise ValueError("external action link must contain SHA-256 digests")
+
+
+@dataclass(frozen=True)
+class ExternalActionConfirmation:
+    """Controller evidence that one newer owner control revalidated a source."""
+
+    link: ExternalActionLink
+    confirmation_sequence: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.link, ExternalActionLink):
+            raise ValueError("external action confirmation link is invalid")
+        if (
+            not isinstance(self.confirmation_sequence, int)
+            or isinstance(self.confirmation_sequence, bool)
+            or self.confirmation_sequence <= 0
+        ):
+            raise ValueError("external confirmation sequence is invalid")
 
 
 JsonValue = None | bool | int | str | list["JsonValue"] | dict[str, "JsonValue"]
@@ -102,6 +153,7 @@ class ActionBinding:
     processing_authorization_version: str
     processing_authorization_revision: int
     processor_purpose: str
+    origin: ActionOrigin = ActionOrigin.PUBLIC_SENDER
 
     @classmethod
     def create(
@@ -117,6 +169,7 @@ class ActionBinding:
         processing_authorization_version: str,
         processing_authorization_revision: int,
         processor_purpose: str,
+        origin: ActionOrigin = ActionOrigin.PUBLIC_SENDER,
     ) -> "ActionBinding":
         if (
             not isinstance(processing_authorization_revision, int)
@@ -124,6 +177,8 @@ class ActionBinding:
             or processing_authorization_revision <= 0
         ):
             raise ValueError("processing authorization revision must be positive")
+        if not isinstance(origin, ActionOrigin):
+            raise ValueError("action origin is invalid")
         fields: dict[str, object] = {
             "subject_id": subject_id,
             "connection_id": connection_id,
@@ -135,6 +190,7 @@ class ActionBinding:
             "processing_authorization_version": processing_authorization_version,
             "processing_authorization_revision": processing_authorization_revision,
             "processor_purpose": processor_purpose,
+            "origin": origin.value,
         }
         return cls(
             action_id=digest(fields),
@@ -148,6 +204,7 @@ class ActionBinding:
             processing_authorization_version=processing_authorization_version,
             processing_authorization_revision=processing_authorization_revision,
             processor_purpose=processor_purpose,
+            origin=origin,
         )
 
     @property
@@ -173,6 +230,7 @@ class ActionBinding:
             "processing_authorization_version": self.processing_authorization_version,
             "processing_authorization_revision": self.processing_authorization_revision,
             "processor_purpose": self.processor_purpose,
+            "origin": self.origin.value,
         }
         if include_action_id:
             value["action_id"] = self.action_id
@@ -194,6 +252,10 @@ class ActionBinding:
             or authorization_revision <= 0
         ):
             raise ValueError("stored action authorization revision is invalid")
+        try:
+            origin = ActionOrigin(str(value["origin"]))
+        except (KeyError, ValueError) as exc:
+            raise ValueError("stored action origin is invalid") from exc
         return cls(
             action_id=str(value["action_id"]),
             subject_id=str(value["subject_id"]),
@@ -208,6 +270,7 @@ class ActionBinding:
             ),
             processing_authorization_revision=authorization_revision,
             processor_purpose=str(value["processor_purpose"]),
+            origin=origin,
         )
 
 

@@ -20,11 +20,21 @@ from src.external_read import (
     ExternalSource,
     ExternalSourceMetadata,
 )
-from src.policy_gate.executors import MockExecutor
+from src.policy_gate.executors import ExecutionOutcome, MockExecutor
 from src.policy_gate.service import PolicyConfig, PolicyGateService
 from src.policy_gate.store import GateStore
-from src.policy_gate.types import AdminDraft, Operation
+from src.policy_gate.types import (
+    ActionBinding,
+    ActionOrigin,
+    AdminDraft,
+    AdminKind,
+    ExternalActionConfirmation,
+    Operation,
+    Scope,
+    TrustedReference,
+)
 from src.private_controller.handler import external_control
+from src.private_controller.interpreter import DeterministicIntentInterpreter
 from src.private_controller.origin import RunOriginLedger, RunSource, RunTrigger
 from src.private_controller.service import PrivateControllerService
 from src.private_controller.todoist_adapter import (
@@ -161,6 +171,12 @@ def test_external_prepare_stores_owner_fields_not_hostile_source_text(
     finally:
         ledger.close()
         gate_store.close()
+
+
+def test_external_record_refuses_content_with_a_stale_digest() -> None:
+    metadata = replace(_metadata(), source_digest="f" * 64)
+    with pytest.raises(ValueError, match="source digest"):
+        ExternalRecord(metadata, HOSTILE)
 
 
 def test_non_owner_external_control_denies_before_any_resolver_call(
@@ -313,6 +329,257 @@ def test_generic_confirmation_cannot_bypass_external_source_link(
         gate_store.close()
 
 
+def test_gate_rejects_generic_exact_prepare_and_confirm_for_external_candidate(
+    tmp_path: Path,
+) -> None:
+    gate, executor, gate_store, ledger, controller, _ = _controller(tmp_path)
+    try:
+        prepared = controller.prepare_external(
+            _direct_run(ledger, 1, 11),
+            _metadata().reference,
+            "Owner-written task title",
+            preview_message_id=71,
+        )
+        binding = prepared.preview["exact_binding"]
+        assert isinstance(binding, dict)
+        action_id = binding["action_id"]
+        assert isinstance(action_id, str)
+        generic_controller = PrivateControllerService(
+            gate,
+            ledger,
+            DeterministicIntentInterpreter(),
+            owner_id=101,
+            control_chat_id=101,
+        )
+
+        with pytest.raises(ValueError, match="external action"):
+            generic_controller.prepare(
+                _direct_run(ledger, 2, 12),
+                TrustedReference("action", action_id),
+                "approve exact action",
+                preview_message_id=72,
+            )
+        with pytest.raises(ValueError, match="external action"):
+            gate.prepare_admin(
+                TrustedReference("request", _metadata().request_id),
+                AdminDraft(
+                    AdminKind.GRANT,
+                    operation=Operation.TASK_CREATE,
+                    scope=Scope.EXACT,
+                    exact_binding=ActionBinding.from_dict(binding),
+                ),
+                owner_id=101,
+                control_chat_id=101,
+                preview_message_id=73,
+            )
+        assert gate_store.pending_intent_count() == 1
+        assert gate.confirm_admin(prepared.intent_id, 101, 101, 71).outcome == "denied"
+        assert executor.calls == []
+    finally:
+        ledger.close()
+        gate_store.close()
+
+
+@pytest.mark.parametrize(
+    ("scope", "remaining_uses"),
+    ((Scope.BOUNDED, 2), (Scope.STANDING, None)),
+)
+def test_external_origin_cannot_use_generic_or_delegated_execution(
+    tmp_path: Path, scope: Scope, remaining_uses: int | None
+) -> None:
+    """External authority remains exact even if every generic route is tried."""
+
+    gate, executor, gate_store, ledger, controller, _ = _controller(tmp_path)
+    try:
+        ordinary = gate.prepare_admin(
+            TrustedReference("request", _metadata().request_id),
+            AdminDraft(
+                AdminKind.GRANT,
+                operation=Operation.TASK_CREATE,
+                scope=scope,
+                remaining_uses=remaining_uses,
+            ),
+            owner_id=101,
+            control_chat_id=101,
+            preview_message_id=50,
+        )
+        assert gate.confirm_admin(ordinary.intent_id, 101, 101, 50).outcome == "applied"
+        metadata = _metadata()
+        public_binding = ActionBinding.create(
+            subject_id=metadata.subject_id,
+            connection_id=metadata.connection_id,
+            conversation_id=metadata.conversation_id,
+            update_id=99,
+            request_id=metadata.request_id,
+            operation=Operation.TASK_CREATE,
+            arguments={"title": "Public delegated task", "due_date": None},
+            processing_authorization_version=metadata.processing_authorization_version,
+            processing_authorization_revision=(
+                metadata.processing_authorization_revision
+            ),
+            processor_purpose="external task creation",
+        )
+        assert gate.submit_action(public_binding).outcome == "verified_success"
+        assert len(executor.calls) == 1
+
+        prepared = controller.prepare_external(
+            _direct_run(ledger, 1, 11),
+            _metadata().reference,
+            "Owner-written task title",
+            preview_message_id=71,
+        )
+        preview_binding = prepared.preview["exact_binding"]
+        assert isinstance(preview_binding, dict)
+        external_binding = ActionBinding.from_dict(preview_binding)
+        assert external_binding.origin is ActionOrigin.OWNER_EXTERNAL
+
+        # The public stage/submit APIs fail before ordinary delegation lookup.
+        assert not gate.stage_action(external_binding)
+        assert gate.submit_action(external_binding).outcome == "denied"
+        assert len(executor.calls) == 1
+
+        # An origin flip cannot retain the external action's canonical identity.
+        tampered_origin = replace(external_binding, origin=ActionOrigin.PUBLIC_SENDER)
+        assert not tampered_origin.verify()
+        assert gate.submit_action(tampered_origin).outcome == "binding_mismatch"
+
+        # A corrupted candidate provenance cannot make the generic exact route
+        # accept an owner-external canonical binding.
+        with gate_store.database.transaction() as connection:
+            connection.execute(
+                """UPDATE candidate_actions SET provenance='ordinary_public',
+                   external_link_identity=NULL, external_source_digest=NULL
+                   WHERE action_id=?""",
+                (external_binding.action_id,),
+            )
+        with pytest.raises(ValueError, match="provenance"):
+            gate.prepare_admin(
+                TrustedReference("action", external_binding.action_id),
+                AdminDraft(AdminKind.GRANT, scope=Scope.EXACT),
+                owner_id=101,
+                control_chat_id=101,
+                preview_message_id=72,
+            )
+        assert gate.confirm_admin(prepared.intent_id, 101, 101, 71).outcome == "denied"
+        assert len(executor.calls) == 1
+
+        # Only the fresh external route may consume the exact owner authority.
+        result = controller.confirm(
+            _direct_run(ledger, 2, 12),
+            prepared.intent_id,
+            71,
+            external_reference=_metadata().reference,
+        )
+        assert result.outcome == "executed"
+        assert result.action_result is not None
+        assert result.action_result.outcome == "verified_success"
+        assert len(executor.calls) == 2
+        journal = gate_store.database.execute(
+            "SELECT origin FROM action_journal WHERE action_id=?",
+            (external_binding.action_id,),
+        ).fetchone()
+        assert journal is not None
+        assert journal["origin"] == ActionOrigin.OWNER_EXTERNAL.value
+
+        # Generic replay remains incapable of reusing the external journal.
+        assert gate.submit_action(external_binding).outcome == "denied"
+        assert len(executor.calls) == 2
+    finally:
+        ledger.close()
+        gate_store.close()
+
+
+def test_external_intent_database_type_mismatch_fails_closed(tmp_path: Path) -> None:
+    """A persisted row cannot relabel an external exact grant as another control."""
+
+    gate, executor, gate_store, ledger, controller, _ = _controller(tmp_path)
+    try:
+        prepared = controller.prepare_external(
+            _direct_run(ledger, 1, 11),
+            _metadata().reference,
+            "Owner-written task title",
+            preview_message_id=71,
+        )
+        with gate_store.database.transaction() as connection:
+            connection.execute(
+                "UPDATE administration_intents SET kind='block' WHERE intent_id=?",
+                (prepared.intent_id,),
+            )
+        result = gate.confirm_external_admin(
+            prepared.intent_id,
+            101,
+            101,
+            71,
+            ExternalActionConfirmation(
+                ledger.external_gate_link(prepared.intent_id), 2
+            ),
+        )
+        assert result.outcome == "denied"
+        assert executor.calls == []
+        state = gate_store.database.execute(
+            "SELECT state FROM administration_intents WHERE intent_id=?",
+            (prepared.intent_id,),
+        ).fetchone()
+        assert state is not None and state["state"] == "prepared"
+    finally:
+        ledger.close()
+        gate_store.close()
+
+
+def test_generic_reconciliation_and_erasure_preserve_external_origin(
+    tmp_path: Path,
+) -> None:
+    """An uncertain external action never becomes generic reconciliation work."""
+
+    gate, executor, gate_store, ledger, controller, _ = _controller(tmp_path)
+    try:
+        executor.queue(ExecutionOutcome.UNCERTAIN)
+        prepared = controller.prepare_external(
+            _direct_run(ledger, 1, 11),
+            _metadata().reference,
+            "Owner-written task title",
+            preview_message_id=71,
+        )
+        preview_binding = prepared.preview["exact_binding"]
+        assert isinstance(preview_binding, dict)
+        external_binding = ActionBinding.from_dict(preview_binding)
+        result = controller.confirm(
+            _direct_run(ledger, 2, 12),
+            prepared.intent_id,
+            71,
+            external_reference=_metadata().reference,
+        )
+        assert result.outcome == "executed"
+        assert result.action_result is not None
+        assert result.action_result.outcome == "uncertain"
+        assert gate.reconcile_action(external_binding.action_id).outcome == "denied"
+        # A database-origin flip cannot make this external binding eligible for
+        # the generic reconciliation path.  Its canonical binding still says
+        # owner_external and the journal must agree with it.
+        with gate_store.database.transaction() as connection:
+            connection.execute(
+                "UPDATE action_journal SET origin='public_sender' WHERE action_id=?",
+                (external_binding.action_id,),
+            )
+        assert gate.reconcile_action(external_binding.action_id).outcome == "denied"
+        with gate_store.database.transaction() as connection:
+            connection.execute(
+                "UPDATE action_journal SET origin='owner_external' WHERE action_id=?",
+                (external_binding.action_id,),
+            )
+        assert gate.erase_subject("subject-a") == "pending_reconciliation"
+        journal = gate_store.database.execute(
+            "SELECT origin FROM action_journal WHERE action_id=?",
+            (external_binding.action_id,),
+        ).fetchone()
+        assert journal is not None
+        assert journal["origin"] == ActionOrigin.OWNER_EXTERNAL.value
+        assert len(executor.calls) == 1
+    finally:
+        ledger.close()
+        gate_store.close()
+
+
 def test_replayed_external_confirmation_stops_before_source_validation(
     tmp_path: Path,
 ) -> None:
@@ -416,19 +683,24 @@ def test_committed_exact_intent_recovers_without_reparsing_changed_source(
             "Owner-written task title",
             preview_message_id=71,
         )
+        gate_link = ledger.external_gate_link(prepared.intent_id)
         with pytest.raises(RuntimeError, match="simulated gate crash"):
-            gate.confirm_admin(
+            gate.confirm_external_admin(
                 prepared.intent_id,
                 101,
                 101,
                 71,
+                ExternalActionConfirmation(gate_link, 2),
                 crash_hook=lambda phase: (
                     (_ for _ in ()).throw(RuntimeError("simulated gate crash"))
                     if phase == "after_exact_intent_committed"
                     else None
                 ),
             )
-        assert gate.exact_intent_execution_started(prepared.intent_id, 101, 101, 71)
+        assert gate.external_intent_execution_started(
+            prepared.intent_id, 101, 101, 71, gate_link
+        )
+        validation_count = reads.validations
         reads.metadata = replace(reads.metadata, source_digest="f" * 64)
 
         recovered = controller.confirm(
@@ -443,6 +715,12 @@ def test_committed_exact_intent_recovers_without_reparsing_changed_source(
             "title": "Owner-written task title",
             "due_date": None,
         }
+        assert reads.validations == validation_count
+        terminal = ledger.database.execute(
+            "SELECT terminal_at FROM external_intent_links WHERE intent_id=?",
+            (prepared.intent_id,),
+        ).fetchone()
+        assert terminal is not None and terminal["terminal_at"] is not None
     finally:
         ledger.close()
         gate_store.close()

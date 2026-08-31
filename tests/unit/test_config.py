@@ -133,19 +133,28 @@ def test_external_read_requires_the_filtered_adapter_and_no_direct_todoist_path(
         Settings(**base, disable_tool_validation=True)
     with pytest.raises(ValueError, match="direct Todoist Claude tools"):
         Settings(**{**base, "claude_allowed_tools": ["Read", "TodoRead"]})
+    with pytest.raises(ValueError, match="direct Todoist Claude tools"):
+        Settings(
+            **{
+                **base,
+                "claude_allowed_tools": ["Read", "mcp__todoist__list_tasks"],
+            }
+        )
     with pytest.raises(ValueError, match="filtered Todoist adapter"):
         Settings(**{**base, "private_controller_todoist_adapter_enabled": False})
-    direct_mcp = tmp_path / "direct-todoist.json"
+    direct_mcp = tmp_path / "unrelated-mcp.json"
     direct_mcp.write_text(
-        '{"mcpServers":{"todoist":{"command":"todoist-mcp"}}}',
+        '{"mcpServers":{"unrelated":{"command":"unrelated-mcp"}}}',
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="direct Todoist MCP"):
+    with pytest.raises(ValueError, match="forbids MCP"):
         Settings(
             **base,
             enable_mcp=True,
             mcp_config_path=direct_mcp,
         )
+    with pytest.raises(ValueError, match="forbids MCP"):
+        Settings(**base, mcp_config_path=direct_mcp)
 
 
 def test_security_relaxation_settings_defaults_and_overrides():

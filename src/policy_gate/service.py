@@ -18,10 +18,14 @@ from src.policy_gate.executors import (
 from src.policy_gate.store import GateStore
 from src.policy_gate.types import (
     ActionBinding,
+    ActionOrigin,
     ActionResult,
     AdminDraft,
     AdminKind,
     AdminResult,
+    CandidateProvenance,
+    ExternalActionConfirmation,
+    ExternalActionLink,
     Operation,
     PreparedIntent,
     Scope,
@@ -152,10 +156,31 @@ class PolicyGateService:
             raise ValueError("invalid trusted subject reference")
         return str(row[0])
 
-    def stage_action(self, binding: ActionBinding) -> bool:
-        """Persist one immutable public proposal for possible exact approval."""
+    def _stage_candidate(
+        self,
+        binding: ActionBinding,
+        provenance: CandidateProvenance,
+        external_link: ExternalActionLink | None = None,
+    ) -> bool:
+        """Persist one immutable action with a provenance that cannot be relabelled."""
 
-        if not binding.verify() or not self._validate_arguments(binding):
+        if (
+            not isinstance(provenance, CandidateProvenance)
+            or not isinstance(binding.origin, ActionOrigin)
+            or not binding.verify()
+            or not self._validate_arguments(binding)
+        ):
+            return False
+        if provenance is CandidateProvenance.ORDINARY_PUBLIC:
+            if (
+                external_link is not None
+                or binding.origin is not ActionOrigin.PUBLIC_SENDER
+            ):
+                return False
+        elif (
+            not isinstance(external_link, ExternalActionLink)
+            or binding.origin is not ActionOrigin.OWNER_EXTERNAL
+        ):
             return False
         with self.store.database.transaction() as connection:
             subject = connection.execute(
@@ -182,25 +207,54 @@ class PolicyGateService:
             ):
                 return False
             existing = connection.execute(
-                "SELECT binding_digest FROM candidate_actions WHERE action_id=?",
+                """SELECT binding_digest, provenance, external_link_identity,
+                          external_source_digest
+                   FROM candidate_actions WHERE action_id=?""",
                 (binding.action_id,),
             ).fetchone()
             if existing is not None:
-                return str(existing["binding_digest"]) == binding.binding_digest
+                return (
+                    str(existing["binding_digest"]) == binding.binding_digest
+                    and str(existing["provenance"]) == provenance.value
+                    and (
+                        provenance is CandidateProvenance.ORDINARY_PUBLIC
+                        or (
+                            external_link is not None
+                            and str(existing["external_link_identity"])
+                            == external_link.link_identity
+                            and str(existing["external_source_digest"])
+                            == external_link.source_digest
+                        )
+                    )
+                )
             connection.execute(
-                "INSERT INTO candidate_actions VALUES (?, ?, ?, ?, ?)",
+                """INSERT INTO candidate_actions(
+                       action_id, binding_digest, binding_json, subject_id, created_at,
+                       provenance, external_link_identity, external_source_digest
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     binding.action_id,
                     binding.binding_digest,
                     canonical_json(binding.as_dict()),
                     binding.subject_id,
                     self.now(),
+                    provenance.value,
+                    None if external_link is None else external_link.link_identity,
+                    None if external_link is None else external_link.source_digest,
                 ),
             )
         return True
 
+    def stage_action(self, binding: ActionBinding) -> bool:
+        """Persist one immutable public proposal for possible exact approval."""
+
+        return self._stage_candidate(binding, CandidateProvenance.ORDINARY_PUBLIC)
+
     def stage_owner_exact_action(
-        self, request_reference: TrustedReference, binding: ActionBinding
+        self,
+        request_reference: TrustedReference,
+        binding: ActionBinding,
+        external_link: ExternalActionLink,
     ) -> bool:
         """Stage one owner-authored Unit 4 task from an existing request reference.
 
@@ -213,6 +267,8 @@ class PolicyGateService:
             request_reference.kind != "request"
             or binding.operation is not Operation.TASK_CREATE
             or binding.request_id != request_reference.value
+            or not isinstance(external_link, ExternalActionLink)
+            or binding.origin is not ActionOrigin.OWNER_EXTERNAL
             or not binding.verify()
             or not self._validate_arguments(binding)
         ):
@@ -230,7 +286,48 @@ class PolicyGateService:
             )
         except ValueError:
             return False
-        return self.stage_action(binding)
+        return self._stage_candidate(
+            binding,
+            CandidateProvenance.EXTERNAL_UNTRUSTED,
+            external_link,
+        )
+
+    def _candidate_exact(
+        self, reference: TrustedReference, subject_id: str
+    ) -> tuple[ActionBinding, CandidateProvenance, ExternalActionLink | None]:
+        row = self.store.database.execute(
+            """SELECT binding_json, provenance, external_link_identity,
+                      external_source_digest
+               FROM candidate_actions WHERE action_id=? AND subject_id=?""",
+            (reference.value, subject_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("exact action reference is not staged")
+        try:
+            provenance = CandidateProvenance(str(row["provenance"]))
+            binding = ActionBinding.from_dict(json.loads(str(row["binding_json"])))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("staged exact action is invalid") from exc
+        if not binding.verify() or binding.subject_id != subject_id:
+            raise ValueError("staged exact action binding is invalid")
+        if provenance is CandidateProvenance.ORDINARY_PUBLIC:
+            if (
+                row["external_link_identity"] is not None
+                or row["external_source_digest"] is not None
+                or binding.origin is not ActionOrigin.PUBLIC_SENDER
+            ):
+                raise ValueError("ordinary action provenance is invalid")
+            return binding, provenance, None
+        if binding.origin is not ActionOrigin.OWNER_EXTERNAL:
+            raise ValueError("external action origin is invalid")
+        try:
+            external_link = ExternalActionLink(
+                str(row["external_link_identity"]),
+                str(row["external_source_digest"]),
+            )
+        except ValueError as exc:
+            raise ValueError("external action provenance is invalid") from exc
+        return binding, provenance, external_link
 
     def _hydrate_exact_draft(
         self, reference: TrustedReference, subject_id: str, draft: AdminDraft
@@ -243,17 +340,82 @@ class PolicyGateService:
             and reference.kind == "action"
         ):
             return draft
-        row = self.store.database.execute(
-            """SELECT binding_json FROM candidate_actions
-               WHERE action_id=? AND subject_id=?""",
-            (reference.value, subject_id),
-        ).fetchone()
-        if row is None:
-            raise ValueError("exact action reference is not staged")
-        binding = ActionBinding.from_dict(json.loads(str(row["binding_json"])))
-        if not binding.verify() or binding.subject_id != subject_id:
-            raise ValueError("staged exact action binding is invalid")
+        binding, provenance, _ = self._candidate_exact(reference, subject_id)
+        if provenance is not CandidateProvenance.ORDINARY_PUBLIC:
+            raise ValueError("external action requires external controller preparation")
         return replace(draft, operation=binding.operation, exact_binding=binding)
+
+    def _hydrate_external_exact_draft(
+        self,
+        reference: TrustedReference,
+        subject_id: str,
+        draft: AdminDraft,
+        external_link: ExternalActionLink,
+    ) -> AdminDraft:
+        """Hydrate only a matching externally staged immutable task binding."""
+
+        if not isinstance(external_link, ExternalActionLink):
+            raise ValueError("external action link is invalid")
+        if not (
+            draft.kind is AdminKind.GRANT
+            and draft.scope is Scope.EXACT
+            and draft.operation is None
+            and draft.exact_binding is None
+            and reference.kind == "action"
+        ):
+            raise ValueError("external route requires one exact action")
+        binding, provenance, staged_link = self._candidate_exact(reference, subject_id)
+        if (
+            provenance is not CandidateProvenance.EXTERNAL_UNTRUSTED
+            or staged_link != external_link
+        ):
+            raise ValueError("external action provenance does not match")
+        return replace(draft, operation=binding.operation, exact_binding=binding)
+
+    def _external_exact_binding_from_payload(
+        self, payload: object, subject_id: str
+    ) -> ActionBinding | None:
+        """Recover only the narrow immutable payload that Unit 4 may execute.
+
+        This is deliberately independent of the normal administration-draft
+        parser.  An encrypted-row mismatch must not turn an external intent
+        into a block, a general delegation, or a public-origin exact action.
+        """
+
+        if not isinstance(payload, dict) or set(payload) != {
+            "kind",
+            "operation",
+            "scope",
+            "constraints",
+            "expires_at",
+            "remaining_uses",
+            "exact_binding",
+        }:
+            return None
+        exact = payload.get("exact_binding")
+        if (
+            payload.get("kind") != AdminKind.GRANT.value
+            or payload.get("operation") != Operation.TASK_CREATE.value
+            or payload.get("scope") != Scope.EXACT.value
+            or payload.get("constraints") != {}
+            or payload.get("expires_at") is not None
+            or payload.get("remaining_uses") is not None
+            or not isinstance(exact, dict)
+        ):
+            return None
+        try:
+            binding = ActionBinding.from_dict(exact)
+        except (TypeError, ValueError):
+            return None
+        if (
+            binding.subject_id != subject_id
+            or binding.operation is not Operation.TASK_CREATE
+            or binding.origin is not ActionOrigin.OWNER_EXTERNAL
+            or not binding.verify()
+            or not self._validate_arguments(binding)
+        ):
+            return None
+        return binding
 
     def activate_receipt(
         self,
@@ -493,12 +655,95 @@ class PolicyGateService:
         preview_message_id: int,
         ttl_seconds: int = 300,
     ) -> PreparedIntent:
+        """Prepare only an ordinary-public administration intent."""
+
+        return self._prepare_admin(
+            reference,
+            draft,
+            owner_id,
+            control_chat_id,
+            preview_message_id,
+            ttl_seconds,
+            CandidateProvenance.ORDINARY_PUBLIC,
+        )
+
+    def prepare_external_admin(
+        self,
+        reference: TrustedReference,
+        draft: AdminDraft,
+        owner_id: int,
+        control_chat_id: int,
+        preview_message_id: int,
+        external_link: ExternalActionLink,
+        minimum_confirmation_sequence: int,
+        ttl_seconds: int = 300,
+    ) -> PreparedIntent:
+        """Prepare one controller-only external-untrusted exact intent."""
+
+        if not isinstance(external_link, ExternalActionLink):
+            raise ValueError("external action link is invalid")
+        if (
+            not isinstance(minimum_confirmation_sequence, int)
+            or isinstance(minimum_confirmation_sequence, bool)
+            or minimum_confirmation_sequence <= 0
+        ):
+            raise ValueError("external confirmation sequence is invalid")
+        return self._prepare_admin(
+            reference,
+            draft,
+            owner_id,
+            control_chat_id,
+            preview_message_id,
+            ttl_seconds,
+            CandidateProvenance.EXTERNAL_UNTRUSTED,
+            external_link,
+            minimum_confirmation_sequence,
+        )
+
+    def _prepare_admin(
+        self,
+        reference: TrustedReference,
+        draft: AdminDraft,
+        owner_id: int,
+        control_chat_id: int,
+        preview_message_id: int,
+        ttl_seconds: int,
+        provenance: CandidateProvenance,
+        external_link: ExternalActionLink | None = None,
+        minimum_confirmation_sequence: int | None = None,
+    ) -> PreparedIntent:
         if owner_id <= 0 or control_chat_id <= 0 or preview_message_id <= 0:
             raise ValueError("owner preview binding is incomplete")
         if ttl_seconds <= 0 or ttl_seconds > 900:
             raise ValueError("administration preview TTL is invalid")
         subject_id = self._resolve(reference)
-        draft = self._hydrate_exact_draft(reference, subject_id, draft)
+        if provenance is CandidateProvenance.ORDINARY_PUBLIC:
+            if external_link is not None or minimum_confirmation_sequence is not None:
+                raise ValueError("ordinary preparation cannot carry external evidence")
+            draft = self._hydrate_exact_draft(reference, subject_id, draft)
+            if draft.exact_binding is not None:
+                if draft.exact_binding.origin is not ActionOrigin.PUBLIC_SENDER:
+                    raise ValueError(
+                        "external action requires external controller preparation"
+                    )
+                existing = self.store.database.execute(
+                    "SELECT provenance FROM candidate_actions WHERE action_id=?",
+                    (draft.exact_binding.action_id,),
+                ).fetchone()
+                if existing is not None and str(existing["provenance"]) != (
+                    CandidateProvenance.ORDINARY_PUBLIC.value
+                ):
+                    raise ValueError(
+                        "external action requires external controller preparation"
+                    )
+        elif provenance is CandidateProvenance.EXTERNAL_UNTRUSTED:
+            if external_link is None or minimum_confirmation_sequence is None:
+                raise ValueError("external preparation evidence is incomplete")
+            draft = self._hydrate_external_exact_draft(
+                reference, subject_id, draft, external_link
+            )
+        else:
+            raise ValueError("administration provenance is invalid")
         self._validate_draft(draft)
         if (
             draft.exact_binding is not None
@@ -556,8 +801,13 @@ class PolicyGateService:
                 **payload,
             }
             connection.execute(
-                """INSERT INTO administration_intents VALUES
-                   (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL)""",
+                """INSERT INTO administration_intents(
+                       intent_id, subject_id, kind, payload_json, old_state_json,
+                       new_state_json, base_subject_revision, owner_id,
+                       control_chat_id, preview_message_id, created_at, expires_at,
+                       provenance, external_link_identity, external_source_digest,
+                       external_minimum_confirmation_sequence, state, consumed_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL)""",
                 (
                     intent_id,
                     subject_id,
@@ -571,6 +821,10 @@ class PolicyGateService:
                     preview_message_id,
                     now,
                     expires,
+                    provenance.value,
+                    None if external_link is None else external_link.link_identity,
+                    None if external_link is None else external_link.source_digest,
+                    minimum_confirmation_sequence,
                 ),
             )
         return PreparedIntent(intent_id, preview, expires)
@@ -582,6 +836,51 @@ class PolicyGateService:
         control_chat_id: int,
         preview_message_id: int,
         *,
+        crash_hook: Callable[[str], None] | None = None,
+    ) -> AdminResult:
+        """Confirm only an ordinary-public administration intent."""
+
+        return self._confirm_admin(
+            intent_id,
+            owner_id,
+            control_chat_id,
+            preview_message_id,
+            CandidateProvenance.ORDINARY_PUBLIC,
+            crash_hook=crash_hook,
+        )
+
+    def confirm_external_admin(
+        self,
+        intent_id: str,
+        owner_id: int,
+        control_chat_id: int,
+        preview_message_id: int,
+        external_confirmation: ExternalActionConfirmation,
+        *,
+        crash_hook: Callable[[str], None] | None = None,
+    ) -> AdminResult:
+        """Confirm one revalidated external-untrusted exact intent."""
+
+        if not isinstance(external_confirmation, ExternalActionConfirmation):
+            return AdminResult("denied")
+        return self._confirm_admin(
+            intent_id,
+            owner_id,
+            control_chat_id,
+            preview_message_id,
+            CandidateProvenance.EXTERNAL_UNTRUSTED,
+            external_confirmation,
+            crash_hook,
+        )
+
+    def _confirm_admin(
+        self,
+        intent_id: str,
+        owner_id: int,
+        control_chat_id: int,
+        preview_message_id: int,
+        expected_provenance: CandidateProvenance,
+        external_confirmation: ExternalActionConfirmation | None = None,
         crash_hook: Callable[[str], None] | None = None,
     ) -> AdminResult:
         exact_binding: ActionBinding | None = None
@@ -599,21 +898,77 @@ class PolicyGateService:
                 or int(row["preview_message_id"]) != preview_message_id
             ):
                 return AdminResult("denied")
+            try:
+                provenance = CandidateProvenance(str(row["provenance"]))
+            except ValueError:
+                return AdminResult("denied")
+            if provenance is not expected_provenance:
+                return AdminResult("denied")
+            if provenance is CandidateProvenance.ORDINARY_PUBLIC:
+                if (
+                    row["external_link_identity"] is not None
+                    or row["external_source_digest"] is not None
+                    or row["external_minimum_confirmation_sequence"] is not None
+                ):
+                    return AdminResult("denied")
+            else:
+                if external_confirmation is None:
+                    return AdminResult("denied")
+                try:
+                    minimum_sequence = int(
+                        row["external_minimum_confirmation_sequence"]
+                    )
+                except (TypeError, ValueError):
+                    return AdminResult("denied")
+                if (
+                    str(row["external_link_identity"])
+                    != external_confirmation.link.link_identity
+                    or str(row["external_source_digest"])
+                    != external_confirmation.link.source_digest
+                    or external_confirmation.confirmation_sequence <= minimum_sequence
+                ):
+                    return AdminResult("denied")
+            try:
+                payload = json.loads(str(row["payload_json"]))
+                kind = AdminKind(str(row["kind"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return AdminResult("denied")
+            if not isinstance(payload, dict):
+                return AdminResult("denied")
+            external_exact_binding: ActionBinding | None = None
+            if provenance is CandidateProvenance.EXTERNAL_UNTRUSTED:
+                external_exact_binding = self._external_exact_binding_from_payload(
+                    payload, str(row["subject_id"])
+                )
+                if kind is not AdminKind.GRANT or external_exact_binding is None:
+                    return AdminResult("denied")
             if row["state"] == "applied":
                 return AdminResult("replayed")
             if row["state"] in {"expired", "stale"}:
                 return AdminResult(str(row["state"]))
-            payload = json.loads(str(row["payload_json"]))
-            kind = AdminKind(str(row["kind"]))
             if row["state"] == "executing":
-                if kind is not AdminKind.GRANT or payload["scope"] != Scope.EXACT.value:
-                    return AdminResult("denied")
-                exact = payload["exact_binding"]
-                if exact is None:
-                    return AdminResult("denied")
-                exact_binding = ActionBinding.from_dict(exact)
-                if exact_binding.subject_id != str(row["subject_id"]):
-                    return AdminResult("denied")
+                if provenance is CandidateProvenance.EXTERNAL_UNTRUSTED:
+                    exact_binding = external_exact_binding
+                else:
+                    if (
+                        kind is not AdminKind.GRANT
+                        or payload.get("scope") != Scope.EXACT.value
+                    ):
+                        return AdminResult("denied")
+                    exact = payload.get("exact_binding")
+                    if not isinstance(exact, dict):
+                        return AdminResult("denied")
+                    try:
+                        exact_binding = ActionBinding.from_dict(exact)
+                    except (TypeError, ValueError):
+                        return AdminResult("denied")
+                    if (
+                        exact_binding.subject_id != str(row["subject_id"])
+                        or exact_binding.origin is not ActionOrigin.PUBLIC_SENDER
+                        or not exact_binding.verify()
+                        or not self._validate_arguments(exact_binding)
+                    ):
+                        return AdminResult("denied")
             else:
                 exact_is_new = True
             # An executing exact intent already committed its authority mutation;
@@ -656,13 +1011,30 @@ class PolicyGateService:
                     )
                 else:
                     delegation_id = "DEL-" + secrets.token_urlsafe(18)
-                    exact = payload["exact_binding"]
-                    exact_binding = (
-                        None if exact is None else ActionBinding.from_dict(exact)
-                    )
-                    if (
-                        exact_binding is not None
-                        and exact_binding.subject_id != subject_id
+                    if provenance is CandidateProvenance.EXTERNAL_UNTRUSTED:
+                        exact_binding = external_exact_binding
+                    else:
+                        exact = payload.get("exact_binding")
+                        try:
+                            exact_binding = (
+                                None
+                                if exact is None
+                                else ActionBinding.from_dict(exact)
+                            )
+                        except (TypeError, ValueError):
+                            return AdminResult("denied")
+                    if exact_binding is not None and (
+                        exact_binding.subject_id != subject_id
+                        or not exact_binding.verify()
+                        or not self._validate_arguments(exact_binding)
+                        or (
+                            provenance is CandidateProvenance.ORDINARY_PUBLIC
+                            and exact_binding.origin is not ActionOrigin.PUBLIC_SENDER
+                        )
+                        or (
+                            provenance is CandidateProvenance.EXTERNAL_UNTRUSTED
+                            and exact_binding.origin is not ActionOrigin.OWNER_EXTERNAL
+                        )
                     ):
                         return AdminResult("denied")
                     connection.execute(
@@ -719,7 +1091,11 @@ class PolicyGateService:
         if exact_binding is not None:
             if exact_is_new and crash_hook is not None:
                 crash_hook("after_exact_intent_committed")
-            action_result = self.submit_action(exact_binding)
+            action_result = (
+                self._submit_owner_external_action(exact_binding)
+                if expected_provenance is CandidateProvenance.EXTERNAL_UNTRUSTED
+                else self.submit_action(exact_binding)
+            )
             if action_result.outcome in {"verified_success", "replayed_success"}:
                 with self.store.database.transaction() as connection:
                     connection.execute(
@@ -730,18 +1106,23 @@ class PolicyGateService:
             return AdminResult("executed", action_result)
         return AdminResult("applied")
 
-    def exact_intent_execution_started(
+    def external_intent_execution_started(
         self,
         intent_id: str,
         owner_id: int,
         control_chat_id: int,
         preview_message_id: int,
+        external_link: ExternalActionLink,
     ) -> bool:
-        """Report only whether one exact intent crossed its immutable commit point."""
+        """Report only whether one matching external intent crossed commit."""
+
+        if not isinstance(external_link, ExternalActionLink):
+            return False
 
         row = self.store.database.execute(
-            """SELECT kind, payload_json, state, owner_id, control_chat_id,
-                      preview_message_id
+            """SELECT subject_id, kind, payload_json, state, owner_id, control_chat_id,
+                      preview_message_id, provenance, external_link_identity,
+                      external_source_digest
                FROM administration_intents WHERE intent_id=?""",
             (intent_id,),
         ).fetchone()
@@ -751,6 +1132,9 @@ class PolicyGateService:
             or int(row["preview_message_id"]) != preview_message_id
             or str(row["kind"]) != AdminKind.GRANT.value
             or str(row["state"]) not in {"executing", "applied"}
+            or str(row["provenance"]) != CandidateProvenance.EXTERNAL_UNTRUSTED.value
+            or str(row["external_link_identity"]) != external_link.link_identity
+            or str(row["external_source_digest"]) != external_link.source_digest
         ):
             return False
         try:
@@ -758,9 +1142,8 @@ class PolicyGateService:
         except (TypeError, json.JSONDecodeError):
             return False
         return (
-            isinstance(payload, dict)
-            and payload.get("scope") == Scope.EXACT.value
-            and isinstance(payload.get("exact_binding"), dict)
+            self._external_exact_binding_from_payload(payload, str(row["subject_id"]))
+            is not None
         )
 
     def subject_blocked(self, subject_id: str) -> bool:
@@ -1126,7 +1509,10 @@ class PolicyGateService:
                 ):
                     return row
                 continue
-            if self._constraints_allow(row, binding):
+            if (
+                binding.origin is ActionOrigin.PUBLIC_SENDER
+                and self._constraints_allow(row, binding)
+            ):
                 return row
         return False
 
@@ -1136,15 +1522,34 @@ class PolicyGateService:
         *,
         crash_hook: Callable[[str], None] | None = None,
     ) -> ActionResult:
+        """Public RPC execution accepts only public-sender bindings."""
+
+        if binding.origin is not ActionOrigin.PUBLIC_SENDER:
+            return ActionResult("denied", binding.action_id)
         with self._action_lock(binding.action_id):
-            return self._submit_locked(binding, crash_hook)
+            return self._submit_locked(binding, ActionOrigin.PUBLIC_SENDER, crash_hook)
+
+    def _submit_owner_external_action(self, binding: ActionBinding) -> ActionResult:
+        """Execute only from a confirmed external exact-intent commit path."""
+
+        if binding.origin is not ActionOrigin.OWNER_EXTERNAL:
+            return ActionResult("denied", binding.action_id)
+        with self._action_lock(binding.action_id):
+            return self._submit_locked(
+                binding, ActionOrigin.OWNER_EXTERNAL, crash_hook=None
+            )
 
     def _submit_locked(
         self,
         binding: ActionBinding,
+        expected_origin: ActionOrigin,
         crash_hook: Callable[[str], None] | None,
     ) -> ActionResult:
-        if not binding.verify() or not self._validate_arguments(binding):
+        if (
+            binding.origin is not expected_origin
+            or not binding.verify()
+            or not self._validate_arguments(binding)
+        ):
             return ActionResult("binding_mismatch", binding.action_id)
         now = self.now()
         authority_id: str | None = None
@@ -1154,7 +1559,10 @@ class PolicyGateService:
                 "SELECT * FROM action_journal WHERE action_id=?", (binding.action_id,)
             ).fetchone()
             if existing is not None:
-                if str(existing["binding_digest"]) != binding.binding_digest:
+                if (
+                    str(existing["binding_digest"]) != binding.binding_digest
+                    or str(existing["origin"]) != binding.origin.value
+                ):
                     return ActionResult("binding_mismatch", binding.action_id)
                 if existing["state"] == "succeeded":
                     return ActionResult("replayed_success", binding.action_id)
@@ -1179,14 +1587,18 @@ class PolicyGateService:
             binding_json = canonical_json(binding.as_dict())
             if existing is None:
                 connection.execute(
-                    """INSERT INTO action_journal VALUES
-                       (?, ?, ?, ?, ?, 'claimed', ?, ?, NULL, ?, ?)""",
+                    """INSERT INTO action_journal(
+                           action_id, binding_digest, binding_json, subject_id,
+                           operation, origin, state, authority_id, claim_token,
+                           outcome, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, NULL, ?, ?)""",
                     (
                         binding.action_id,
                         binding.binding_digest,
                         binding_json,
                         binding.subject_id,
                         binding.operation.value,
+                        binding.origin.value,
                         authority_id,
                         claim_token,
                         now,
@@ -1337,9 +1749,26 @@ class PolicyGateService:
             row = self.store.database.execute(
                 "SELECT * FROM action_journal WHERE action_id=?", (action_id,)
             ).fetchone()
-            if row is None or row["state"] != "uncertain":
+            if (
+                row is None
+                or row["state"] != "uncertain"
+                or str(row["origin"]) != ActionOrigin.PUBLIC_SENDER.value
+            ):
                 return ActionResult("denied", action_id)
-            binding = ActionBinding.from_dict(json.loads(str(row["binding_json"])))
+            try:
+                binding = ActionBinding.from_dict(json.loads(str(row["binding_json"])))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return ActionResult("denied", action_id)
+            if (
+                binding.origin is not ActionOrigin.PUBLIC_SENDER
+                or binding.action_id != action_id
+                or binding.binding_digest != str(row["binding_digest"])
+                or binding.subject_id != str(row["subject_id"])
+                or binding.operation.value != str(row["operation"])
+                or not binding.verify()
+                or not self._validate_arguments(binding)
+            ):
+                return ActionResult("denied", action_id)
             outcome = self.executor.reconcile(binding)
             if outcome is ReconcileOutcome.UNRESOLVED:
                 return ActionResult("uncertain", action_id)
