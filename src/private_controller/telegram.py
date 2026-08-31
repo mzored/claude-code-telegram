@@ -57,7 +57,7 @@ def telegram_callback_run_trigger(
         & ((1 << 63) - 1)
     ) or 1
     return RunTrigger(
-        source=RunSource.TELEGRAM,
+        source=RunSource.TELEGRAM_CALLBACK,
         actor_id=int(actor.id),
         chat_id=int(chat.id),
         update_id=callback_update_id,

@@ -31,7 +31,11 @@ PUBLIC_OPERATIONS = frozenset(
 CONTROLLER_OPERATIONS = frozenset(
     {
         "open_controller_session",
+        "stage_owner_exact_action",
+        "external_intent_execution_started",
+        "prepare_external_admin",
         "prepare_admin",
+        "confirm_external_admin",
         "confirm_admin",
         "set_breaker",
     }

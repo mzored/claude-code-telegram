@@ -1,6 +1,7 @@
 """Test Claude SDK integration."""
 
 import asyncio
+import json
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -157,6 +158,128 @@ class TestClaudeSDKManager:
             # Restore original env var
             if original_api_key:
                 os.environ["ANTHROPIC_API_KEY"] = original_api_key
+
+    def test_sdk_rechecks_unit4_todoist_lockdown_before_constructing_client(
+        self, tmp_path
+    ):
+        config = Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            private_controller_enabled=True,
+            private_controller_owner_id=123,
+            private_controller_control_chat_id=123,
+            private_controller_gate_socket_path=tmp_path / "gate.sock",
+            private_controller_external_read_enabled=True,
+            private_controller_external_read_socket_path=tmp_path / "external.sock",
+            private_controller_external_erasure_socket_path=tmp_path
+            / "external-erase.sock",
+            private_controller_external_erasure_public_uid=1,
+            private_controller_external_erasure_public_pid=1,
+            private_controller_external_erasure_client_gid=1,
+            private_controller_todoist_adapter_enabled=True,
+            allowed_users=[123],
+            claude_allowed_tools=["Read", "Grep"],
+        )
+        object.__setattr__(config, "disable_tool_validation", True)
+
+        with pytest.raises(ValueError, match="disable_tool_validation"):
+            ClaudeSDKManager(config)
+
+    def test_sdk_rejects_a_mutated_namespaced_todoist_tool(self, tmp_path):
+        config = Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            private_controller_enabled=True,
+            private_controller_owner_id=123,
+            private_controller_control_chat_id=123,
+            private_controller_gate_socket_path=tmp_path / "gate.sock",
+            private_controller_external_read_enabled=True,
+            private_controller_external_read_socket_path=tmp_path / "external.sock",
+            private_controller_external_erasure_socket_path=tmp_path
+            / "external-erase.sock",
+            private_controller_external_erasure_public_uid=1,
+            private_controller_external_erasure_public_pid=1,
+            private_controller_external_erasure_client_gid=1,
+            private_controller_todoist_adapter_enabled=True,
+            allowed_users=[123],
+            claude_allowed_tools=["Read", "Grep"],
+        )
+        object.__setattr__(
+            config,
+            "claude_allowed_tools",
+            ["Read", "mcp__todoist__list_tasks"],
+        )
+
+        with pytest.raises(ValueError, match="direct Todoist Claude tools"):
+            ClaudeSDKManager(config)
+
+    async def test_sdk_rejects_mcp_reintroduced_after_startup(self, tmp_path):
+        mcp_path = tmp_path / "mcp.json"
+        mcp_path.write_text(
+            json.dumps({"mcpServers": {"safe": {"command": "safe-mcp"}}}),
+            encoding="utf-8",
+        )
+        config = Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            private_controller_enabled=True,
+            private_controller_owner_id=123,
+            private_controller_control_chat_id=123,
+            private_controller_gate_socket_path=tmp_path / "gate.sock",
+            private_controller_external_read_enabled=True,
+            private_controller_external_read_socket_path=tmp_path / "external.sock",
+            private_controller_external_erasure_socket_path=tmp_path
+            / "external-erase.sock",
+            private_controller_external_erasure_public_uid=1,
+            private_controller_external_erasure_public_pid=1,
+            private_controller_external_erasure_client_gid=1,
+            private_controller_todoist_adapter_enabled=True,
+            allowed_users=[123],
+            claude_allowed_tools=["Read", "Grep"],
+        )
+        manager = ClaudeSDKManager(config)
+        object.__setattr__(config, "enable_mcp", True)
+        object.__setattr__(config, "mcp_config_path", mcp_path)
+
+        with pytest.raises(ValueError, match="forbids MCP"):
+            await manager.execute_command("safe", tmp_path)
+
+    async def test_external_read_uses_no_project_setting_sources(self, tmp_path):
+        config = Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            private_controller_enabled=True,
+            private_controller_owner_id=123,
+            private_controller_control_chat_id=123,
+            private_controller_gate_socket_path=tmp_path / "gate.sock",
+            private_controller_external_read_enabled=True,
+            private_controller_external_read_socket_path=tmp_path / "external.sock",
+            private_controller_external_erasure_socket_path=tmp_path
+            / "external-erase.sock",
+            private_controller_external_erasure_public_uid=1,
+            private_controller_external_erasure_public_pid=1,
+            private_controller_external_erasure_client_gid=1,
+            private_controller_todoist_adapter_enabled=True,
+            allowed_users=[123],
+            claude_allowed_tools=["Read", "Grep"],
+        )
+        captured: list = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("ok"),
+            _make_result_message(),
+            capture_options=captured,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await ClaudeSDKManager(config).execute_command("safe", tmp_path)
+
+        assert captured[0].setting_sources == []
 
     async def test_execute_command_success(self, sdk_manager):
         """Test successful command execution."""

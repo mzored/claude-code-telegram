@@ -319,7 +319,7 @@ class MessageOrchestrator:
 
     def _register_agentic_handlers(self, app: Application) -> None:
         """Register agentic handlers: commands + text/file/photo."""
-        from ..private_controller.handler import policy_control
+        from ..private_controller.handler import external_control, policy_control
         from .handlers import command
 
         # Commands
@@ -335,6 +335,8 @@ class MessageOrchestrator:
             handlers.append(("sync_threads", command.sync_threads))
         if self.settings.private_controller_enabled:
             handlers.append(("policy", policy_control))
+        if self.settings.private_controller_external_read_enabled:
+            handlers.append(("external", external_control))
 
         # Derive known commands dynamically — avoids drift when new commands are added
         self._known_commands: frozenset[str] = frozenset(cmd for cmd, _ in handlers)
@@ -404,7 +406,7 @@ class MessageOrchestrator:
 
     def _register_classic_handlers(self, app: Application) -> None:
         """Register full classic handler set (moved from core.py)."""
-        from ..private_controller.handler import policy_control
+        from ..private_controller.handler import external_control, policy_control
         from .handlers import callback, command, message
 
         handlers = [
@@ -427,6 +429,8 @@ class MessageOrchestrator:
             handlers.append(("sync_threads", command.sync_threads))
         if self.settings.private_controller_enabled:
             handlers.append(("policy", policy_control))
+        if self.settings.private_controller_external_read_enabled:
+            handlers.append(("external", external_control))
 
         for cmd, handler in handlers:
             app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
@@ -473,6 +477,8 @@ class MessageOrchestrator:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
             if self.settings.private_controller_enabled:
                 commands.append(BotCommand("policy", "Manage public-assistant policy"))
+            if self.settings.private_controller_external_read_enabled:
+                commands.append(BotCommand("external", "Inspect external requests"))
             return commands
         else:
             commands = [
@@ -495,6 +501,8 @@ class MessageOrchestrator:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
             if self.settings.private_controller_enabled:
                 commands.append(BotCommand("policy", "Manage public-assistant policy"))
+            if self.settings.private_controller_external_read_enabled:
+                commands.append(BotCommand("external", "Inspect external requests"))
             return commands
 
     # --- Agentic handlers ---

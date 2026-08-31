@@ -485,6 +485,13 @@ class DurablePollingRunner:
         self.store.expire_pending()
         self.store.expire_public(self.adapter.config.retention_seconds)
         self.store.prune_restrictive_tombstones()
+        reconcile_erasures = getattr(
+            getattr(self.adapter, "service", None), "reconcile_erasures", None
+        )
+        if callable(reconcile_erasures):
+            # Fixed, idempotent retries converge a controller-link deletion
+            # after a crash or a temporarily unavailable private endpoint.
+            reconcile_erasures()
         updates = await self._fetch(0)
         if not updates:
             await self.adapter.deliver_due_replies(self.application.bot)

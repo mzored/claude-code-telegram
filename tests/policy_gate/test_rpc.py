@@ -18,18 +18,25 @@ from src.policy_gate.rpc import (
     MAX_FRAME_BYTES,
     ControllerGateRpcClient,
     GateRpcAuthorizationError,
+    GateRpcProtocolError,
+    GateRpcRejectedError,
     PublicGateRpcClient,
+    _action_from_wire,
 )
 from src.policy_gate.service import PolicyConfig, PolicyGateService
 from src.policy_gate.store import GateStore
 from src.policy_gate.types import (
     ActionBinding,
+    ActionOrigin,
     AdminDraft,
     AdminKind,
+    ExternalActionConfirmation,
+    ExternalActionLink,
     Operation,
     Scope,
     TrustedReference,
     canonical_json,
+    digest,
 )
 
 GATE_KEY = "rpc-gate-key-" + "r" * 40
@@ -117,6 +124,34 @@ def _raw_request(path: Path, wire: bytes) -> dict[str, object]:
 def test_canonical_json_rejects_duplicate_keys_after_unicode_normalization() -> None:
     with pytest.raises(ValueError, match="normalization"):
         canonical_json({"\u00e9": 1, "e\u0301": 2})
+
+
+def test_legacy_public_wire_requires_the_narrow_public_compatibility_path() -> None:
+    current = ActionBinding.create(
+        subject_id="subject-legacy-rpc",
+        connection_id="connection-rpc",
+        conversation_id=202002,
+        update_id=51,
+        request_id="REQ-LEGACY-RPC",
+        operation=Operation.TASK_CREATE,
+        arguments={"title": "Recover old public action", "due_date": None},
+        processing_authorization_version="integration-v2",
+        processing_authorization_revision=2,
+        processor_purpose="external task creation",
+    )
+    fields = current.as_dict(include_action_id=False)
+    fields.pop("origin")
+    legacy_wire = {"action_id": digest(fields), **fields}
+
+    # Controller/external routes use the default strict parser and cannot
+    # interpret a missing origin as owner_external.
+    with pytest.raises(GateRpcProtocolError):
+        _action_from_wire(legacy_wire)
+
+    recovered = _action_from_wire(legacy_wire, allow_legacy_public=True)
+    assert recovered.uses_legacy_public_identity
+    assert recovered.origin is ActionOrigin.PUBLIC_SENDER
+    assert recovered.as_dict() == legacy_wire
 
 
 def test_mocked_gate_process_enforces_rpc_and_peer_boundary(tmp_path: Path) -> None:
@@ -266,3 +301,187 @@ def test_mocked_gate_process_enforces_rpc_and_peer_boundary(tmp_path: Path) -> N
             assert results.get(timeout=3) == 1
         except Empty:
             pytest.fail("Policy Gate process did not report executor calls")
+
+
+def test_exact_external_stage_is_controller_only_and_preserves_binding(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    stop = context.Event()
+    results = context.Queue()
+    with tempfile.TemporaryDirectory(
+        prefix="pg-u4-", dir=str(Path("/tmp").resolve())
+    ) as run_dir:
+        socket_path = (Path(run_dir) / "g.sock").resolve(strict=False)
+        process = context.Process(
+            target=_serve_gate_process,
+            args=(
+                str(socket_path),
+                str(tmp_path / "rpc-gate-u4.db"),
+                os.getpid(),
+                os.getgid(),
+                ready,
+                stop,
+                results,
+            ),
+        )
+        process.start()
+        try:
+            assert ready.wait(10), "Policy Gate did not bind its Unix socket"
+            public = PublicGateRpcClient(socket_path)
+            public.register_subject(
+                "subject-u4",
+                {"request": "REQ-EXTERNAL-RPC-A"},
+            )
+            assert public.activate_receipt(
+                "subject-u4",
+                "integration-v2",
+                2,
+                {"Todoist": ("external task creation",)},
+            )
+            binding = ActionBinding.create(
+                subject_id="subject-u4",
+                connection_id="connection-u4",
+                conversation_id=202002,
+                update_id=41,
+                request_id="REQ-EXTERNAL-RPC-A",
+                operation=Operation.TASK_CREATE,
+                arguments={"title": "Owner-only exact task", "due_date": None},
+                processing_authorization_version="integration-v2",
+                processing_authorization_revision=2,
+                processor_purpose="external task creation",
+                origin=ActionOrigin.OWNER_EXTERNAL,
+            )
+            # The generic public RPC never stages or submits an owner-external
+            # binding, even before an external candidate exists.
+            assert not public.stage_action(binding)
+            assert public.submit_action(binding).outcome == "denied"
+            rejected_public = {
+                "version": 1,
+                "role": "public",
+                "operation": "stage_owner_exact_action",
+                "payload": {
+                    "request_reference": {
+                        "kind": "request",
+                        "value": "REQ-EXTERNAL-RPC-A",
+                    },
+                    "binding": binding.as_dict(),
+                },
+            }
+            assert _raw_request(
+                socket_path,
+                canonical_json(rejected_public).encode("utf-8") + b"\n",
+            ) == {"error": "unauthorized", "ok": False}
+
+            rejected_internal = {
+                "version": 1,
+                "role": "public",
+                "operation": "_submit_owner_external_action",
+                "payload": {"binding": binding.as_dict()},
+            }
+            assert _raw_request(
+                socket_path,
+                canonical_json(rejected_internal).encode("utf-8") + b"\n",
+            ) == {"error": "unauthorized", "ok": False}
+
+            malformed_public = {
+                "version": 1,
+                "role": "public",
+                "operation": "stage_action",
+                "payload": {
+                    "binding": binding.as_dict(),
+                    "external_link": {
+                        "link_identity": "a" * 64,
+                        "source_digest": "b" * 64,
+                    },
+                },
+            }
+            assert _raw_request(
+                socket_path,
+                canonical_json(malformed_public).encode("utf-8") + b"\n",
+            ) == {"error": "invalid_request", "ok": False}
+
+            origin_flip = binding.as_dict()
+            origin_flip["origin"] = ActionOrigin.PUBLIC_SENDER.value
+            assert _raw_request(
+                socket_path,
+                canonical_json(
+                    {
+                        "version": 1,
+                        "role": "public",
+                        "operation": "submit_action",
+                        "payload": {"binding": origin_flip},
+                    }
+                ).encode("utf-8")
+                + b"\n",
+            ) == {
+                "ok": True,
+                "result": {
+                    "action_id": binding.action_id,
+                    "outcome": "binding_mismatch",
+                },
+            }
+
+            controller = ControllerGateRpcClient(socket_path)
+            external_link = ExternalActionLink("a" * 64, "b" * 64)
+            assert controller.stage_owner_exact_action(
+                TrustedReference("request", "REQ-EXTERNAL-RPC-A"),
+                binding,
+                external_link,
+            )
+            with pytest.raises(GateRpcRejectedError):
+                controller.prepare_admin(
+                    TrustedReference("action", binding.action_id),
+                    AdminDraft(AdminKind.GRANT, scope=Scope.EXACT),
+                    owner_id=101001,
+                    control_chat_id=101001,
+                    preview_message_id=90,
+                )
+            preview = controller.prepare_external_admin(
+                TrustedReference("action", binding.action_id),
+                AdminDraft(AdminKind.GRANT, scope=Scope.EXACT),
+                owner_id=101001,
+                control_chat_id=101001,
+                preview_message_id=90,
+                external_link=external_link,
+                minimum_confirmation_sequence=1,
+            )
+            assert (
+                controller.confirm_admin(
+                    preview.intent_id,
+                    owner_id=101001,
+                    control_chat_id=101001,
+                    preview_message_id=90,
+                ).outcome
+                == "denied"
+            )
+            result = controller.confirm_external_admin(
+                preview.intent_id,
+                owner_id=101001,
+                control_chat_id=101001,
+                preview_message_id=90,
+                external_confirmation=ExternalActionConfirmation(external_link, 2),
+            )
+            assert result.outcome == "executed"
+            assert public.submit_action(binding).outcome == "denied"
+            with pytest.raises(GateRpcProtocolError):
+                controller._call(
+                    "confirm_external_admin",
+                    {
+                        "intent_id": preview.intent_id,
+                        "owner_id": 101001,
+                        "control_chat_id": 101001,
+                        "preview_message_id": 90,
+                        "external_confirmation": "not-an-external-confirmation",
+                    },
+                )
+            controller.close()
+        finally:
+            stop.set()
+            process.join(10)
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+        assert process.exitcode == 0
+        assert results.get(timeout=3) == 1

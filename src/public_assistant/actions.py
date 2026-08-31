@@ -12,6 +12,11 @@ from src.policy_gate.types import (
     ActionSchema,
     Operation,
 )
+from src.private_controller.erasure import (
+    ExternalIntentLinkEraser,
+    ExternalIntentLinkEraseRequest,
+)
+from src.private_controller.origin import external_subject_hash
 from src.public_assistant.action_store import IntegrationAuthorization, Unit3Store
 from src.public_assistant.config import PublicAssistantConfig, Unit2Config
 from src.public_assistant.conversation import (
@@ -72,9 +77,16 @@ class ActionDiscovery:
 class ActionCoordinator:
     """Persist the trusted binding before asking Gate to claim it."""
 
-    def __init__(self, store: Unit3Store, gate: PublicGateClient) -> None:
+    def __init__(
+        self,
+        store: Unit3Store,
+        gate: PublicGateClient,
+        *,
+        external_link_eraser: ExternalIntentLinkEraser | None = None,
+    ) -> None:
         self.store = store
         self.gate = gate
+        self.external_link_eraser = external_link_eraser
         self._locks_guard = threading.Lock()
         self._subject_locks: dict[str, threading.Lock] = {}
 
@@ -155,9 +167,21 @@ class ActionCoordinator:
         )
 
     def erase_subject(self, subject_id: str) -> str:
-        """Converge a durable public erasure with the separate Gate store."""
+        """Converge public, Gate, then digest-only controller link erasure."""
 
-        return self.gate.erase_subject(subject_id)
+        result = self.gate.erase_subject(subject_id)
+        if result != "erased" or self.external_link_eraser is None:
+            return result
+        try:
+            self.external_link_eraser.erase_external_links(
+                ExternalIntentLinkEraseRequest(external_subject_hash(subject_id))
+            )
+        except Exception:
+            # The public tombstone is deliberately retained and the polling loop
+            # retries this fixed deletion; neither the raw subject nor a source
+            # reference is persisted in a new public recovery record.
+            return "pending_private_erasure"
+        return "erased"
 
     def submit(
         self,

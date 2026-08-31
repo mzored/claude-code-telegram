@@ -18,7 +18,11 @@ from src.policy_gate.types import (
     Operation,
     Scope,
     TrustedReference,
+    canonical_json,
+    digest,
 )
+from src.private_controller.erasure import ExternalIntentLinkEraseRequest
+from src.private_controller.origin import external_subject_hash
 from src.public_assistant.action_store import Unit3Store
 from src.public_assistant.actions import ActionCoordinator
 from src.public_assistant.config import (
@@ -531,6 +535,82 @@ def test_erasure_converges_gate_receipts_and_delegations_without_revival(
     gate_store.close()
 
 
+def test_public_erasure_retries_fixed_controller_link_deletion_after_gate_terminal(
+    tmp_path: Path,
+) -> None:
+    class FlakyExternalLinkEraser:
+        def __init__(self) -> None:
+            self.requests: list[ExternalIntentLinkEraseRequest] = []
+            self.remaining_failures = 1
+
+        def erase_external_links(self, request: ExternalIntentLinkEraseRequest) -> None:
+            self.requests.append(request)
+            if self.remaining_failures:
+                self.remaining_failures -= 1
+                raise RuntimeError("controller unavailable after Gate terminal erase")
+
+    public = Unit3Store(tmp_path / "public", PENDING_KEY, PUBLIC_KEY, PSEUDONYM_KEY)
+    message = inbound(16)
+    subject = public.subject_ref(
+        message.connection_id, message.conversation_id, message.sender_id
+    )
+    gate_store = GateStore(tmp_path / "gate.db", "g" * 40)
+    gate = PolicyGateService(gate_store, MockExecutor())
+    gate.register_subject(subject, {"managed_chat": "MCHAT-ERASURE-RETRY"})
+    eraser = FlakyExternalLinkEraser()
+    coordinator = ActionCoordinator(public, gate, external_link_eraser=eraser)
+    try:
+        with public.erasure.transaction() as connection:
+            connection.execute(
+                "INSERT INTO erasure_tombstones VALUES (?, ?, ?)",
+                (subject, public.now(), public.now() + 3600),
+            )
+        erase_subject_from_public_store(public.public, subject, public.now())
+        assert coordinator.erase_subject(subject) == "pending_private_erasure"
+        assert public.active_erasure_subjects() == (subject,)
+        assert eraser.requests == [
+            ExternalIntentLinkEraseRequest(external_subject_hash(subject))
+        ]
+
+        assert coordinator.erase_subject(subject) == "erased"
+        assert eraser.requests == [
+            ExternalIntentLinkEraseRequest(external_subject_hash(subject)),
+            ExternalIntentLinkEraseRequest(external_subject_hash(subject)),
+        ]
+    finally:
+        public.close()
+        gate_store.close()
+
+
+def test_public_erasure_does_not_contact_controller_before_gate_is_terminal(
+    tmp_path: Path,
+) -> None:
+    class PendingGate:
+        def erase_subject(self, subject_id: str) -> str:
+            assert subject_id == "subject-a"
+            return "pending_reconciliation"
+
+    class RecordingEraser:
+        def __init__(self) -> None:
+            self.requests: list[ExternalIntentLinkEraseRequest] = []
+
+        def erase_external_links(self, request: ExternalIntentLinkEraseRequest) -> None:
+            self.requests.append(request)
+
+    public = Unit3Store(tmp_path / "public", PENDING_KEY, PUBLIC_KEY, PSEUDONYM_KEY)
+    eraser = RecordingEraser()
+    try:
+        coordinator = ActionCoordinator(
+            public,
+            PendingGate(),  # type: ignore[arg-type]
+            external_link_eraser=eraser,
+        )
+        assert coordinator.erase_subject("subject-a") == "pending_reconciliation"
+        assert eraser.requests == []
+    finally:
+        public.close()
+
+
 def test_unit3_additive_schema_is_unit2_readable_and_erasure_removes_actions(
     tmp_path: Path,
 ) -> None:
@@ -612,6 +692,73 @@ def test_public_action_state_converges_after_retry_and_unresolved_is_retained(
     assert store.action_state(action.action_id) == "succeeded"
     assert store.expire_unit3() == 0
     store.close()
+
+
+def test_preorigin_public_intent_reuses_its_exact_legacy_binding(
+    tmp_path: Path,
+) -> None:
+    """A Unit 3 retry must not change the durable action identity after upgrade."""
+
+    store = Unit3Store(tmp_path / "public", PENDING_KEY, PUBLIC_KEY, PSEUDONYM_KEY)
+    message = inbound(44)
+    request_id = "REQ-LEGACY-RETRY"
+    arguments = {"title": "Recover existing Unit 3 action", "due_date": None}
+    subject = store.subject_ref(
+        message.connection_id, message.conversation_id, message.sender_id
+    )
+    current = ActionBinding.create(
+        subject_id=subject,
+        connection_id=message.connection_id,
+        conversation_id=message.conversation_id,
+        update_id=message.update_id,
+        request_id=request_id,
+        operation=Operation.TASK_CREATE,
+        arguments=arguments,
+        processing_authorization_version="integration-v2",
+        processing_authorization_revision=2,
+        processor_purpose="external task creation",
+    )
+    legacy_fields = current.as_dict(include_action_id=False)
+    legacy_fields.pop("origin")
+    legacy_id = digest(legacy_fields)
+    legacy = ActionBinding.from_legacy_public_dict(
+        {"action_id": legacy_id, **legacy_fields}
+    )
+    now = store.now()
+    try:
+        with store.public.transaction() as connection:
+            connection.execute(
+                """INSERT INTO public_action_intents VALUES
+                   (?, ?, ?, ?, ?, ?, ?, ?, ?, 'uncertain', 'uncertain', ?, ?, ?)""",
+                (
+                    legacy.action_id,
+                    message.update_id,
+                    subject,
+                    request_id,
+                    Operation.TASK_CREATE.value,
+                    canonical_json(arguments),
+                    "integration-v2",
+                    2,
+                    legacy.processor_purpose,
+                    now,
+                    now,
+                    now + 3600,
+                ),
+            )
+        recovered = store.prepare_action(
+            message,
+            request_id,
+            Operation.TASK_CREATE,
+            arguments,
+            "integration-v2",
+            2,
+            3600,
+        )
+        assert recovered.uses_legacy_public_identity
+        assert recovered.action_id == legacy.action_id
+        assert recovered.as_dict() == legacy.as_dict()
+    finally:
+        store.close()
 
 
 def test_unit3_runtime_boundary_is_disabled_by_default(tmp_path: Path) -> None:

@@ -61,6 +61,35 @@ class Settings(BaseSettings):
     private_controller_gate_socket_path: Optional[Path] = Field(
         None, description="Resolved Unix socket for the isolated Policy Gate"
     )
+    private_controller_external_read_enabled: bool = Field(
+        False,
+        description="Enable the isolated Public Assistant external-read broker",
+    )
+    private_controller_external_read_socket_path: Optional[Path] = Field(
+        None, description="Resolved Unix socket for the isolated external-read broker"
+    )
+    private_controller_external_erasure_socket_path: Optional[Path] = Field(
+        None,
+        description=(
+            "Resolved Unix socket for the controller-owned external-link erasure sink"
+        ),
+    )
+    private_controller_external_erasure_public_uid: Optional[int] = Field(
+        None,
+        description="Pinned Public Assistant OS UID for external-link erasure",
+    )
+    private_controller_external_erasure_public_pid: Optional[int] = Field(
+        None,
+        description="Pinned Public Assistant PID for external-link erasure",
+    )
+    private_controller_external_erasure_client_gid: Optional[int] = Field(
+        None,
+        description="Public Assistant group granted access to the erasure socket",
+    )
+    private_controller_todoist_adapter_enabled: bool = Field(
+        False,
+        description="Require the fixed filtered Todoist adapter for ordinary reads",
+    )
     enable_token_auth: bool = Field(
         False, description="Enable token-based authentication"
     )
@@ -536,6 +565,52 @@ class Settings(BaseSettings):
                 "private controller socket requires the controller to be enabled"
             )
 
+        if self.private_controller_external_read_enabled:
+            if not self.private_controller_enabled:
+                raise ValueError("external read requires the private controller")
+            if self.private_controller_external_read_socket_path is None:
+                raise ValueError("external read requires a Public Assistant socket")
+            if not self.private_controller_external_read_socket_path.is_absolute():
+                raise ValueError("external read socket must be absolute")
+            if self.private_controller_external_erasure_socket_path is None:
+                raise ValueError("external read requires an external erasure socket")
+            if not self.private_controller_external_erasure_socket_path.is_absolute():
+                raise ValueError("external erasure socket must be absolute")
+            if (
+                self.private_controller_external_erasure_socket_path
+                == self.private_controller_external_read_socket_path
+            ):
+                raise ValueError("external erasure socket must differ from read socket")
+            if (
+                self.private_controller_external_erasure_public_uid is None
+                or self.private_controller_external_erasure_public_uid < 0
+            ):
+                raise ValueError("external erasure requires a public UID")
+            if (
+                self.private_controller_external_erasure_public_pid is None
+                or self.private_controller_external_erasure_public_pid <= 0
+            ):
+                raise ValueError("external erasure requires a public PID")
+            if (
+                self.private_controller_external_erasure_client_gid is None
+                or self.private_controller_external_erasure_client_gid < 0
+            ):
+                raise ValueError("external erasure requires a public client group")
+            if not self.private_controller_todoist_adapter_enabled:
+                raise ValueError("external read requires the filtered Todoist adapter")
+            self.assert_external_read_lockdown()
+        elif (
+            self.private_controller_external_read_socket_path is not None
+            or self.private_controller_external_erasure_socket_path is not None
+            or self.private_controller_external_erasure_public_uid is not None
+            or self.private_controller_external_erasure_public_pid is not None
+            or self.private_controller_external_erasure_client_gid is not None
+            or self.private_controller_todoist_adapter_enabled
+        ):
+            raise ValueError(
+                "external read settings require external read to be enabled"
+            )
+
         # Check MCP requirements
         if self.enable_mcp and not self.mcp_config_path:
             raise ValueError("mcp_config_path required when enable_mcp is True")
@@ -555,6 +630,30 @@ class Settings(BaseSettings):
                 )
 
         return self
+
+    def assert_external_read_lockdown(self) -> None:
+        """Refuse every configuration path that could expose raw Todoist output."""
+
+        if not self.private_controller_external_read_enabled:
+            return
+        if self.disable_tool_validation:
+            raise ValueError("external read forbids disable_tool_validation")
+        allowed_tools = self.claude_allowed_tools
+        if allowed_tools is None:
+            raise ValueError("external read requires an explicit Claude tool allowlist")
+        forbidden_tools = {"todoread", "todowrite"}
+        if any(
+            isinstance(tool, str)
+            and (tool.casefold() in forbidden_tools or "todoist" in tool.casefold())
+            for tool in allowed_tools
+        ):
+            raise ValueError("external read forbids direct Todoist Claude tools")
+        # The Claude SDK's project settings can contribute MCP servers outside the
+        # explicit tool allowlist.  In external-read mode the filtered adapter is
+        # the only permitted Todoist boundary, so every ordinary Claude MCP path
+        # is unavailable rather than trying to recognize server aliases.
+        if self.enable_mcp or self.mcp_config_path is not None:
+            raise ValueError("external read forbids MCP configuration")
 
     @property
     def is_production(self) -> bool:
