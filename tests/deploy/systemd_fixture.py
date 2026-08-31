@@ -98,7 +98,8 @@ def exercise(home: Path) -> None:
         or state.previous is not None
     ):
         raise AssertionError(
-            "real systemd activation did not restore the prior release"
+            "real systemd activation did not restore the prior release: "
+            f"{state.to_dict()}"
         )
     if paths.request_file.exists():
         raise AssertionError("completed rollback left its activation request")
