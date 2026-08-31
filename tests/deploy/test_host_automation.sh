@@ -40,14 +40,23 @@ git -C "$repo" config user.email deploy-test@example.invalid
 git -C "$repo" config user.name deploy-test
 git -C "$repo" checkout -q --detach HEAD
 old_sha=$(git -C "$repo" rev-parse HEAD)
-git -C "$repo" cat-file -e "${pre_automation_sha}^{commit}" || fail "pre-automation main is unavailable"
-expect_failure git -C "$repo" cat-file -e "${pre_automation_sha}:ops/sync-production-env.sh"
-expect_failure git -C "$repo" cat-file -e "${pre_automation_sha}:ops/systemd/assist-ai-bot.service"
+if git -C "$repo" cat-file -e "${pre_automation_sha}^{commit}" 2>/dev/null; then
+    expect_failure git -C "$repo" cat-file -e "${pre_automation_sha}:ops/sync-production-env.sh"
+    expect_failure git -C "$repo" cat-file -e "${pre_automation_sha}:ops/systemd/assist-ai-bot.service"
+else
+    git -C "$repo" rm -q ops/sync-production-env.sh ops/systemd/assist-ai-bot.service
+    git -C "$repo" commit -qm shallow-pre-automation-fixture
+    pre_automation_sha=$(git -C "$repo" rev-parse HEAD)
+fi
 git -C "$repo" remote set-url origin https://github.com/mzored/claude-code-telegram.git
 rm -rf "$repo/.venv" "$repo/.cache" "$repo/data"
 mkdir -p "$repo/data"
 printf 'TOKEN=test\n' >"$repo/.env"
 
+if [[ ! -f $repo/ops/systemd/assist-ai-bot.service ]]; then
+    git -C "$repo" show "$old_sha:ops/systemd/assist-ai-bot.service" >"$repo/ops/systemd/assist-ai-bot.service"
+    git -C "$repo" show "$old_sha:ops/sync-production-env.sh" >"$repo/ops/sync-production-env.sh"
+fi
 sed -i.bak 's/Description=.*/Description=delayed-failure-unit/' "$repo/ops/systemd/assist-ai-bot.service"
 rm "$repo/ops/systemd/assist-ai-bot.service.bak"
 cat >"$repo/ops/sync-production-env.sh" <<'EOF'
