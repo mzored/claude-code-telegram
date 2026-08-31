@@ -54,6 +54,7 @@ mkdir -p "$repo/data"
 printf 'TOKEN=test\n' >"$repo/.env"
 
 if [[ ! -f $repo/ops/systemd/assist-ai-bot.service ]]; then
+    mkdir -p "$repo/ops/systemd"
     git -C "$repo" show "$old_sha:ops/systemd/assist-ai-bot.service" >"$repo/ops/systemd/assist-ai-bot.service"
     git -C "$repo" show "$old_sha:ops/sync-production-env.sh" >"$repo/ops/sync-production-env.sh"
 fi
